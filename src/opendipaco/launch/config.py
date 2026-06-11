@@ -83,6 +83,9 @@ class TransportCfg:
     port: int = 29500
     auth_key: str | None = None
     accept_keys: list[str] = field(default_factory=list)
+    # Sharded mode: secret shared by the scheduler + parameter servers (NOT workers)
+    # that signs commit grants, so workers can't forge push weights.
+    grant_key: str | None = None
     max_msg_bytes: int | None = None
     heartbeat_timeout: float = 30.0
     heartbeat_interval: float = 3.0

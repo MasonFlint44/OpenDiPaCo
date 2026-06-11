@@ -24,9 +24,12 @@ warm, so optimizer/private/shard state stays cached. Fault tolerance is unchange
 ships it the current private modules). New workers connect any time; a worker
 whose connection blips **reconnects** and resumes (its warm caches survive).
 
-Wire format: each message is an 8-byte big-endian length followed by a
-``torch.save`` payload (so tensors travel natively). NOTE: ``torch.load`` unpickles,
-so only run this between mutually trusting hosts on a trusted network.
+Wire format: the pickle-free framed codec in ``wire.py`` (8-byte length prefix,
+JSON structure + raw tensor blobs decoded against a dtype allowlist -- nothing on
+the wire is unpickled). Every lease carries a unique token that the worker must
+echo on submit/nack/heartbeat; a submission whose token doesn't match the current
+lease is dropped, so a reclaimed-and-re-leased path can't be hijacked by a zombie
+worker (and the fresher result silently discarded).
 """
 
 from __future__ import annotations
@@ -45,7 +48,7 @@ from ..backend.local import LocalBackend
 from ..checkpoint import latest_checkpoint, load_checkpoint, save_checkpoint
 from ..optim.diloco import apply_outer_grads, make_outer_optimizer
 from ..topology import is_private_key
-from ..train.loop import _state_to_cpu
+from ..train.loop import _optimizer_state_to_cpu, _state_to_cpu
 from .reactor import TransportMetrics, _ReactorServer  # noqa: F401 (re-exported)
 from .scheduler import AsyncScheduler
 from .wire import DEFAULT_MAX_MSG_BYTES, client_handshake, recv_msg, send_msg
@@ -114,6 +117,7 @@ class CoordinatorServer(_ReactorServer):
         self._completed: dict = {}
         self._inflight: dict = {}           # path -> heartbeat deadline (one lease per path)
         self._issued: dict = {}             # path -> _T at lease time (for staleness)
+        self._lease: dict = {}              # path -> current lease token (fences submits)
         self._outer_opts: dict = {}         # shared key -> per-module SGD+Nesterov
 
     def _handle(self, msg: dict, nbytes: int):
@@ -158,9 +162,11 @@ class CoordinatorServer(_ReactorServer):
             if not eligible:
                 return {"type": "idle"}
             path = min(eligible, key=lambda p: (self._completed[p], p not in warm, p))
+            lease = uuid.uuid4().hex  # unique per lease; fences submit/nack/heartbeat
             self._owner[path] = wid
             self._inflight[path] = time.monotonic() + self.heartbeat_timeout
             self._issued[path] = self._T
+            self._lease[path] = lease
             generation = self._completed[path]
             versions = dict(self._versions)
             shared_keys = [k for k in e.topology.path_module_keys(path) if not is_private_key(k)]
@@ -177,7 +183,8 @@ class CoordinatorServer(_ReactorServer):
         shard = self.corpus.shard(e.topology.path_index(path)) if path not in cached else None
         return {
             "type": "task",
-            "gen_id": generation,            # echoed by the worker; ignored by the async coordinator
+            "gen_id": generation,            # this path's update count (informational)
+            "lease": lease,                  # echoed on submit/nack/heartbeat; fences the lease
             "generation": generation,        # this path's update count -> inner LR schedule
             "path": path,
             "shared_weights": shared_weights,
@@ -193,14 +200,14 @@ class CoordinatorServer(_ReactorServer):
         path = msg["path"]
         e = self.engine
         with self._lock:  # serialize with scheduling + other outer steps
-            if path not in self._inflight:
-                return  # stale / duplicate / already reclaimed
+            if path not in self._inflight or msg.get("lease") != self._lease.get(path):
+                return  # stale / duplicate / reclaimed / not the current lease holder
             staleness = self._T - self._issued.get(path, self._T)
-            if staleness > self.staleness_bound:
-                self._inflight.pop(path, None)  # too stale -> discard, re-eligible
-                self.metrics.record_stale_reject()
-                return
             self._inflight.pop(path, None)
+            self._lease.pop(path, None)
+            if staleness > self.staleness_bound:
+                self.metrics.record_stale_reject()  # too stale -> discard, re-eligible
+                return
             self._T += 1
             self._completed[path] = self._completed.get(path, 0) + 1
             # Apply the (damped) per-contribution outer step for this path.
@@ -221,13 +228,16 @@ class CoordinatorServer(_ReactorServer):
     def _nack(self, msg: dict) -> None:
         path = msg["path"]
         with self._lock:
+            if msg.get("lease") != self._lease.get(path):
+                return  # a stale nack must not free someone else's live lease
             self.sched.errors[path] = msg.get("error", "worker nack")
             self._inflight.pop(path, None)  # free the lease; the path becomes re-eligible
+            self._lease.pop(path, None)
 
     def _heartbeat(self, msg: dict) -> None:
         path = msg["path"]
         with self._lock:
-            if path in self._inflight and self._owner.get(path) == msg.get("worker_id"):
+            if path in self._inflight and msg.get("lease") == self._lease.get(path):
                 self._inflight[path] = time.monotonic() + self.heartbeat_timeout
 
     def _reclaim_inflight_locked(self) -> None:
@@ -236,6 +246,7 @@ class CoordinatorServer(_ReactorServer):
         for path, deadline in list(self._inflight.items()):
             if now >= deadline:
                 del self._inflight[path]
+                self._lease.pop(path, None)  # invalidate the token: zombies can't submit
                 self._owner[path] = None
                 self.metrics.reclaims += 1
 
@@ -261,8 +272,9 @@ class CoordinatorServer(_ReactorServer):
         and ``resume`` work as before; the bank is always current.
         """
         e = self.engine
+        restore = None
         if resume and checkpoint_dir and latest_checkpoint(checkpoint_dir):
-            load_checkpoint(e, latest_checkpoint(checkpoint_dir))
+            restore = load_checkpoint(e, latest_checkpoint(checkpoint_dir)).get("extra")
 
         if total_generations is not None:
             e.total_rounds = total_generations
@@ -277,6 +289,19 @@ class CoordinatorServer(_ReactorServer):
             k: make_outer_optimizer({k: e.bank[k]}, e.diloco)
             for k in self._versions
         }
+        # Restore the coordinator's own state alongside the engine's: the async
+        # clock and per-path counts (so the inner LR schedule continues rather
+        # than restarting at generation 0), the shared-module versions (so warm
+        # workers' caches stay meaningful), and the per-key outer Nesterov
+        # momentum (``engine.outer_opt`` is unused on the async path).
+        if restore is not None:
+            with self._lock:
+                self._T = restore["T"]
+                self._completed = dict(restore["completed"])
+                self._versions.update(restore["versions"])
+            for k, sd in restore["outer_opts"].items():
+                if k in self._outer_opts:
+                    self._outer_opts[k].load_state_dict(sd)
         with self._lock:
             self._completed = {p: self._completed.get(p, 0) for p in paths}
             self._inflight = {}
@@ -293,10 +318,9 @@ class CoordinatorServer(_ReactorServer):
             if done or self._stop or self._dead:
                 break
             if checkpoint_dir and checkpoint_every and (self._T - last_ckpt) >= checkpoint_every:
-                save_checkpoint(e, os.path.join(checkpoint_dir, f"upd{self._T:08d}"))
-                last_ckpt = self._T
+                last_ckpt = self._save_cluster_checkpoint(checkpoint_dir)
                 if log_every:
-                    print(f"[async] T={self._T}/{self._target} "
+                    print(f"[async] T={last_ckpt}/{self._target} "
                           f"{self.metrics.report().splitlines()[0]}", flush=True)
             time.sleep(reclaim_interval)
 
@@ -304,8 +328,30 @@ class CoordinatorServer(_ReactorServer):
             self._serving = False
         self.metrics._wall += time.monotonic() - t0
         if checkpoint_dir and checkpoint_every:
-            save_checkpoint(e, os.path.join(checkpoint_dir, f"upd{self._T:08d}"))
+            self._save_cluster_checkpoint(checkpoint_dir)
         return dict(self._completed)
+
+    def _save_cluster_checkpoint(self, checkpoint_dir: str) -> int:
+        """Checkpoint the engine plus the coordinator's async state, consistently.
+
+        Held under ``_lock`` so the snapshot can't interleave with a concurrent
+        ``_receive`` outer step (serving pauses for the duration of the write).
+        Returns the clock value the checkpoint captured.
+        """
+        with self._lock:
+            extra = {
+                "T": self._T,
+                "completed": dict(self._completed),
+                "versions": dict(self._versions),
+                "outer_opts": {
+                    k: _optimizer_state_to_cpu(o.state_dict())
+                    for k, o in self._outer_opts.items()
+                },
+            }
+            save_checkpoint(
+                self.engine, os.path.join(checkpoint_dir, f"upd{self._T:08d}"), extra=extra
+            )
+            return self._T
 
 
 # -- worker ------------------------------------------------------------------
@@ -417,13 +463,14 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
             continue
 
         path = msg["path"]
+        lease = msg.get("lease")
         worker.seed = msg["seed"]
         engine.total_rounds = msg["total_rounds"]
         # Heartbeat this lease while the (possibly long) task runs.
         stop_beat = threading.Event()
         beat = threading.Thread(
             target=_heartbeat_loop,
-            args=(safe_send, stop_beat, heartbeat_interval, wid, msg["gen_id"], path),
+            args=(safe_send, stop_beat, heartbeat_interval, wid, lease, path),
             daemon=True,
         )
         beat.start()
@@ -442,7 +489,7 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
             beat.join(timeout=1)
             try:
                 safe_send({
-                    "type": "nack", "gen_id": msg["gen_id"],
+                    "type": "nack", "gen_id": msg["gen_id"], "lease": lease,
                     "path": path, "error": repr(e),
                 })
             except OSError:
@@ -452,7 +499,7 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
         beat.join(timeout=1)
         try:
             safe_send({
-                "type": "submit", "gen_id": msg["gen_id"], "path": path,
+                "type": "submit", "gen_id": msg["gen_id"], "lease": lease, "path": path,
                 "loss": contrib.loss, "empty": contrib.empty,
                 "shared_grad": contrib.shared_delta,
                 "private_weights": contrib.private_state,
@@ -465,11 +512,11 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
             return True
 
 
-def _heartbeat_loop(safe_send, stop_beat, interval, wid, gen_id, path) -> None:
+def _heartbeat_loop(safe_send, stop_beat, interval, wid, lease, path) -> None:
     """Ping the coordinator until the task ends or the socket dies."""
     while not stop_beat.wait(interval):
         try:
-            safe_send({"type": "heartbeat", "gen_id": gen_id, "path": path, "worker_id": wid})
+            safe_send({"type": "heartbeat", "lease": lease, "path": path, "worker_id": wid})
         except OSError:
             return
 

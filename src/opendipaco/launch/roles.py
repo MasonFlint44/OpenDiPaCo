@@ -158,7 +158,7 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None):
         staleness_bound=cfg.transport.staleness_bound,
         staleness_weight=cfg.transport.staleness_weight,
         heartbeat_timeout=cfg.transport.heartbeat_timeout,
-        ps_tls=build_tls_client(cfg), **_server_kw(cfg))
+        ps_tls=build_tls_client(cfg), grant_key=cfg.transport.grant_key, **_server_kw(cfg))
     scheduler.start()
     _attach_metrics(scheduler, cfg)
     if on_start:
@@ -189,7 +189,7 @@ def run_parameter_server(cfg: LaunchConfig, shard_id: int, *, port=None,
     owned = [k for k, s in assignment.items() if s == shard_id]
     ps = ParameterServer(
         model, owned, diloco, host=cfg.transport.host, port=_ps_port(cfg, shard_id, port),
-        device=cfg.run.device,
+        device=cfg.run.device, grant_key=cfg.transport.grant_key,
         resume_dir=cfg.run.checkpoint_dir if cfg.run.resume else None, **_server_kw(cfg))
     ps.start()
     _attach_metrics(ps, cfg)
