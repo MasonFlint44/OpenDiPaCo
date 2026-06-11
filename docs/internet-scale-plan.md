@@ -30,18 +30,27 @@ Each finding is also tagged **[design]** (a gap in the architecture) or **[bug]*
 HMAC/TLS proves a worker holds a key; it says nothing about what the worker *does*.
 Once authenticated:
 
-- `CoordinatorServer._receive` (`schedule/distributed.py:192-219`) applies whatever
-  pseudo-gradient arrives — no NaN/Inf check, no norm cap, no plausibility check
-  against the reported loss. One malicious (or merely overclocked / bad-RAM — common
-  on consumer rigs) worker submitting NaNs **permanently poisons the bank** for
-  everyone.
-- **Private modules (embedding, head) are loaded verbatim from worker pushes**
-  (`distributed.py:208-209`, `sharded.py:117-119`). A volunteer can overwrite the
-  embedding table with anything; no aggregation softens it.
+- ~~`CoordinatorServer._receive` applies whatever pseudo-gradient arrives — no
+  NaN/Inf check, no norm cap, no plausibility check against the reported loss.~~
+  **✅ The cheap half is done (`schedule/guard.py`)**: every server now rejects
+  non-finite contributions outright (pseudo-gradient, private weights, *and*
+  reported loss — always on, no knob), an optional `max_update_norm` clips
+  oversized pseudo-gradients per module (plumbed through
+  `TransportCfg.max_update_norm`), the sharded scheduler refuses a push grant for
+  a non-finite loss at commit, and bogus/mistyped module keys are filtered (an
+  unknown key can't crash the server; a "private" payload can't overwrite a
+  shared module). Rejections/clips are counted in `TransportMetrics`
+  (`invalid_rejected`, `norm_clipped`). Verified by `tests/test_update_guard.py`.
+  This bounds *damage from faulty hardware*, not malice.
+- **Private modules (embedding, head) are still loaded verbatim from worker
+  pushes** (now finite-checked and type-checked, but a volunteer can still
+  overwrite the embedding table with arbitrary *finite* values; no aggregation
+  softens it).
 - No redundant execution, no cross-checking, no reputation, no outlier rejection.
   A path is computed by exactly one worker per generation, so a single bad actor
   owns that path's update entirely. Volunteer systems (BOINC, Petals-style swarms)
-  all need at least replicated tasks + agreement.
+  all need at least replicated tasks + agreement. **This — Phase 3 — remains the
+  real trust wall.**
 
 #### 1.2 Bandwidth: full fp32 tensors both ways, every generation, no compression · [design]
 
@@ -296,7 +305,7 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
 | Order | Work | Findings addressed | Size |
 |---|---|---|---|
 | ~~0a~~ ✅ | ~~Protocol bug fixes (fencing, commit grants, async checkpoint)~~ | **Done** — 1.5, 1.6, 1.7 (+ the 1.12 docstring) | S |
-| 0b | Update validation (NaN/norm/loss) | 1.1 (partial) | S |
+| ~~0b~~ ✅ | ~~Update validation (NaN/norm/loss)~~ | **Done** — 1.1 (the faulty-hardware half; malice needs Phase 3) | S |
 | 0c | Compression (bf16 + int8 grads + error feedback) | 1.2 | M |
 | 0d | Data decentralization (shard ids + worker-side ingest + local routing) | 1.3 | M |
 | 0e | bf16 inner loop, capability negotiation, idle backoff, hygiene | 1.10, 1.9 (partial), 1.11, 1.12 | S–M |

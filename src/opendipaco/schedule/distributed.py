@@ -49,6 +49,7 @@ from ..checkpoint import latest_checkpoint, load_checkpoint, save_checkpoint
 from ..optim.diloco import apply_outer_grads, make_outer_optimizer
 from ..topology import is_private_key
 from ..train.loop import _optimizer_state_to_cpu, _state_to_cpu
+from .guard import clip_norm_, contribution_ok
 from .reactor import TransportMetrics, _ReactorServer  # noqa: F401 (re-exported)
 from .scheduler import AsyncScheduler
 from .wire import DEFAULT_MAX_MSG_BYTES, client_handshake, recv_msg, send_msg
@@ -83,6 +84,7 @@ class CoordinatorServer(_ReactorServer):
         staleness_bound: int | None = None,
         staleness_weight: str = "inverse",
         rescale_by_sqrt_sharing: bool = False,
+        max_update_norm: float | None = None,
         io_threads: int = 4,
         max_connections: int = 1024,
         tls=None,
@@ -102,6 +104,10 @@ class CoordinatorServer(_ReactorServer):
         self.staleness_bound = staleness_bound if staleness_bound is not None else 2 * n_paths
         self.staleness_weight = staleness_weight
         self.rescale_by_sqrt_sharing = rescale_by_sqrt_sharing
+        # Guard rails on what a worker may apply to the bank: non-finite
+        # contributions are always rejected; a norm cap (off by default) clips
+        # oversized pseudo-gradients per module (see ``guard.py``).
+        self.max_update_norm = max_update_norm
         self.heartbeat_timeout = (
             heartbeat_timeout if heartbeat_timeout is not None else scheduler.lease_timeout
         )
@@ -208,14 +214,30 @@ class CoordinatorServer(_ReactorServer):
             if staleness > self.staleness_bound:
                 self.metrics.record_stale_reject()  # too stale -> discard, re-eligible
                 return
+            # Validate before touching the bank: one applied NaN poisons it
+            # permanently (faulty consumer hardware produces them; see guard.py).
+            # Keys are filtered to what they claim to be -- an unknown key must
+            # not crash the server, and a "private" payload must not be able to
+            # overwrite a shared module.
+            shared = {k: v for k, v in (msg.get("shared_grad") or {}).items()
+                      if k in self._versions}
+            private = {k: v for k, v in (msg.get("private_weights") or {}).items()
+                       if is_private_key(k) and k in e.bank}
+            if not contribution_ok(msg.get("loss"), msg.get("empty"), shared, private):
+                self.metrics.record_invalid_reject()  # dropped; the path is re-eligible
+                return
+            if self.max_update_norm is not None:
+                for delta in shared.values():
+                    if clip_norm_(delta, self.max_update_norm) > self.max_update_norm:
+                        self.metrics.record_norm_clip()
             self._T += 1
             self._completed[path] = self._completed.get(path, 0) + 1
             # Apply the (damped) per-contribution outer step for this path.
             damp = 1.0 / (1.0 + staleness) if self.staleness_weight == "inverse" else 1.0
-            for key, sd in (msg.get("private_weights") or {}).items():
+            for key, sd in private.items():
                 e.bank[key].load_state_dict({n: v.to(e.device) for n, v in sd.items()})
             path_idx = e.topology.path_index(path)
-            for key, delta in (msg.get("shared_grad") or {}).items():
+            for key, delta in shared.items():
                 w = e._outer_weight(key, path_idx, self.corpus) * damp
                 if self.rescale_by_sqrt_sharing:
                     w *= math.sqrt(e.topology.sharing_count(key))

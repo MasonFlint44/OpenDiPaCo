@@ -131,7 +131,8 @@ def run_coordinator(cfg: LaunchConfig, *, on_start=None):
         host=cfg.transport.host, port=cfg.transport.port,
         heartbeat_timeout=cfg.transport.heartbeat_timeout,
         staleness_bound=cfg.transport.staleness_bound,
-        staleness_weight=cfg.transport.staleness_weight, **_server_kw(cfg))
+        staleness_weight=cfg.transport.staleness_weight,
+        max_update_norm=cfg.transport.max_update_norm, **_server_kw(cfg))
     server.start()
     _attach_metrics(server, cfg)
     if on_start:
@@ -190,6 +191,7 @@ def run_parameter_server(cfg: LaunchConfig, shard_id: int, *, port=None,
     ps = ParameterServer(
         model, owned, diloco, host=cfg.transport.host, port=_ps_port(cfg, shard_id, port),
         device=cfg.run.device, grant_key=cfg.transport.grant_key,
+        max_update_norm=cfg.transport.max_update_norm,
         resume_dir=cfg.run.checkpoint_dir if cfg.run.resume else None, **_server_kw(cfg))
     ps.start()
     _attach_metrics(ps, cfg)

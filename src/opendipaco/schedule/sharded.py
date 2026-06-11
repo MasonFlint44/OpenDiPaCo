@@ -44,6 +44,7 @@ from ..optim.diloco import apply_outer_grads, make_outer_optimizer
 from ..topology import is_private_key
 from ..train.loop import _optimizer_state_to_cpu, _state_to_cpu
 from .distributed import _build_worker_engine, _load_into, _load_private
+from .guard import all_finite, clip_norm_, loss_ok
 from .reactor import DEFAULT_MAX_MSG_BYTES, _ReactorServer
 from .scheduler import AsyncScheduler
 from .wire import _key_bytes, client_handshake, recv_msg, send_msg
@@ -118,13 +119,16 @@ class ParameterServer(_ReactorServer):
 
     def __init__(self, config, owned_keys, diloco, *, host="0.0.0.0", port=0,
                  auth_key=None, device="cpu", resume_dir=None, grant_key=None,
-                 **reactor_kw):
+                 max_update_norm=None, **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.config = config
         self.diloco = diloco
         self.device = torch.device(device)
         self.owned_keys = set(owned_keys)
         self.grant_key = grant_key
+        # Non-finite pushes are always refused; the optional norm cap clips
+        # oversized pseudo-gradients per module (see ``guard.py``).
+        self.max_update_norm = max_update_norm
         self._seen_grants: collections.OrderedDict = collections.OrderedDict()
         # Build the full bank deterministically, then keep only this shard's keys.
         full = build_module_bank(config)
@@ -169,22 +173,31 @@ class ParameterServer(_ReactorServer):
         grant = msg.get("grant")
         if not verify_grant(grant, self.grant_key):
             return {"type": "ack", "applied": False}  # no/forged grant -> refuse
+        updates = msg.get("updates") or {}
+        private = msg.get("private") or {}
         weight = float(grant["weight"])
         allowed = set(grant["keys"])
         with self._lock:
             if grant["token"] in self._seen_grants:
                 return {"type": "ack", "applied": False}  # replay -> refuse
-            self._seen_grants[grant["token"]] = True
+            self._seen_grants[grant["token"]] = True  # consumed even if invalid below
             while len(self._seen_grants) > self._SEEN_GRANTS_MAX:
                 self._seen_grants.popitem(last=False)
-            for k, upd in (msg.get("updates") or {}).items():
+            # Validate before touching the shard: one applied NaN poisons it.
+            if not (all_finite(updates) and all_finite(private)):
+                self.metrics.record_invalid_reject()
+                return {"type": "ack", "applied": False}
+            for k, upd in updates.items():
                 if k not in self.owned_keys or is_private_key(k) or k not in allowed:
                     continue
+                if self.max_update_norm is not None:
+                    if clip_norm_(upd["grad"], self.max_update_norm) > self.max_update_norm:
+                        self.metrics.record_norm_clip()
                 apply_outer_grads(self.bank[k], [weight * g.to(self.device) for g in upd["grad"]])
                 self._outer_opts[k].step()
                 self._outer_opts[k].zero_grad(set_to_none=True)
                 self._versions[k] += 1
-            for k, sd in (msg.get("private") or {}).items():
+            for k, sd in private.items():
                 if k in self.owned_keys and k in allowed:
                     _load_into(self, k, sd)  # store latest private (authoritative-local)
         return {"type": "ack", "applied": True}
@@ -323,6 +336,12 @@ class Scheduler(_ReactorServer):
             self._lease.pop(path, None)
             if staleness > self.staleness_bound:
                 self.metrics.record_stale_reject()
+                return {"type": "commit_ack", "accepted": False}
+            # A non-finite inner loss means the worker's training diverged (or its
+            # hardware is faulty) -- don't grant a push for it. The empty-shard
+            # no-op convention (loss=NaN, nothing to push) stays accepted.
+            if not loss_ok(msg.get("loss"), empty=bool(msg.get("empty"))):
+                self.metrics.record_invalid_reject()
                 return {"type": "commit_ack", "accepted": False}
             self._T += 1
             self._completed[path] = self._completed.get(path, 0) + 1
@@ -552,7 +571,8 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
             beat.join(timeout=1)
 
         ack = _rpc_send(sch, send_lock, max_msg_bytes,
-                        {"type": "commit", "path": path, "worker_id": wid, "lease": lease})
+                        {"type": "commit", "path": path, "worker_id": wid, "lease": lease,
+                         "loss": contrib.loss, "empty": contrib.empty})
         if ack is None:
             raise OSError("scheduler disconnected during commit")
         if ack.get("accepted"):
