@@ -46,6 +46,7 @@ import torch
 
 from ..backend.local import LocalBackend
 from ..checkpoint import latest_checkpoint, load_checkpoint, save_checkpoint
+from ..data.spec import materialize_shard
 from ..optim.diloco import apply_outer_grads, make_outer_optimizer
 from ..topology import is_private_key
 from ..train.loop import _optimizer_state_to_cpu, _state_to_cpu
@@ -199,7 +200,15 @@ class CoordinatorServer(_ReactorServer):
                  for k in private_keys}
                 if path not in warm else None
             )
-        shard = self.corpus.shard(e.topology.path_index(path)) if path not in cached else None
+        # Data plane: ship the shard bytes -- or, for a spec corpus, just the
+        # recipe (the worker materializes the shard locally; see data/spec.py).
+        shard, shard_spec = None, None
+        if path not in cached:
+            if hasattr(self.corpus, "spec"):
+                shard_spec = {"path_index": e.topology.path_index(path),
+                              "spec": self.corpus.spec}
+            else:
+                shard = self.corpus.shard(e.topology.path_index(path))
         return {
             "type": "task",
             "gen_id": generation,            # this path's update count (informational)
@@ -211,6 +220,7 @@ class CoordinatorServer(_ReactorServer):
             "shared_versions": {k: versions[k] for k in shared_keys},
             "private_weights": private_weights,
             "shard": compress_shard(shard, self.compress),
+            "shard_spec": shard_spec,
             "batch_size": self.batch_size,
             "total_rounds": e.total_rounds,
             "seed": self.sched.seed,
@@ -419,6 +429,9 @@ def run_worker(
     fault_hook=None,
     tls=None,
     tls_hostname: str | None = None,
+    data_dir: str | None = None,
+    data_source=None,
+    data_tokenizer=None,
 ):
     """Connect to a coordinator and train leased path-tasks until told to stop.
 
@@ -437,6 +450,12 @@ def run_worker(
     ``max_tasks`` makes the worker leave cleanly after that many tasks (elastic
     membership). ``reconnect`` retries a dropped connection (e.g. a coordinator
     restart) for up to ``reconnect_timeout``; warm caches survive reconnects.
+
+    When the coordinator serves a *spec* corpus, tasks carry a shard recipe
+    instead of bytes and the worker materializes its shard locally (see
+    ``data/spec.py``): ``data_dir`` keeps materialized shards on disk across
+    restarts; ``data_source`` / ``data_tokenizer`` override the spec's stream
+    and tokenizer (tests, non-C4 corpora).
     """
     engine = _build_worker_engine(config, diloco, device, seed)
     worker = AsyncScheduler(engine, num_workers=1)
@@ -446,6 +465,7 @@ def run_worker(
     versions: dict = {}      # shared key -> version currently held
     attempts: dict = {}
     residuals: dict = {}     # path -> {key: [tensors]}: compression error feedback
+    data_ctx = {"dir": data_dir, "source": data_source, "tokenizer": data_tokenizer}
     state = {"done": 0}
 
     first = True
@@ -463,8 +483,8 @@ def run_worker(
         try:
             done = _serve_connection(
                 conn, engine, worker, wid, warm, shard_cache, versions, attempts,
-                residuals, state, poll_interval, heartbeat_interval, max_msg_bytes,
-                max_tasks, fault_hook,
+                residuals, data_ctx, state, poll_interval, heartbeat_interval,
+                max_msg_bytes, max_tasks, fault_hook,
             )
         finally:
             try:
@@ -478,8 +498,8 @@ def run_worker(
 
 
 def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
-                      attempts, residuals, state, poll_interval, heartbeat_interval,
-                      max_msg_bytes, max_tasks, fault_hook) -> bool:
+                      attempts, residuals, data_ctx, state, poll_interval,
+                      heartbeat_interval, max_msg_bytes, max_tasks, fault_hook) -> bool:
     """Serve tasks on one connection. Returns True on a clean finish (stop /
     budget reached), False on a disconnect (caller may reconnect)."""
     send_lock = threading.Lock()  # heartbeat thread + main thread share the socket
@@ -522,7 +542,8 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
             if fault_hook is not None:
                 attempts[path] = attempts.get(path, 0) + 1
                 fault_hook(path, attempts[path])
-            shard = _apply_task(engine, msg, shard_cache, versions, warm, residuals)
+            shard = _apply_task(engine, msg, shard_cache, versions, warm, residuals,
+                                data_ctx)
             contrib = worker._train_path(path, shard, msg["batch_size"], msg["generation"])
             # Warm-back: keep this path's Adam state + private modules for next gen.
             engine._opt_state[path] = contrib.opt_state
@@ -598,7 +619,8 @@ def _compress_contribution(contrib, mode, residuals, path):
     return shared_payload, private_payload
 
 
-def _apply_task(engine, msg, shard_cache, versions, warm, residuals) -> torch.Tensor:
+def _apply_task(engine, msg, shard_cache, versions, warm, residuals,
+                data_ctx=None) -> torch.Tensor:
     """Load a task's shipped (delta) state into the worker bank; return the shard."""
     path = msg["path"]
     for key, sd in msg.get("shared_weights", {}).items():
@@ -611,7 +633,19 @@ def _apply_task(engine, msg, shard_cache, versions, warm, residuals) -> torch.Te
         residuals.pop(path, None)          # and drop any stale error-feedback carry
     if msg.get("shard") is not None:
         shard_cache[path] = restore_shard(msg["shard"])
+    elif msg.get("shard_spec") is not None and path not in shard_cache:
+        shard_cache[path] = _materialize_from_spec(msg["shard_spec"], data_ctx)
     return shard_cache[path]
+
+
+def _materialize_from_spec(shard_spec, data_ctx) -> torch.Tensor:
+    """Build the shard locally from the shipped recipe (no corpus bytes on the wire)."""
+    ctx = data_ctx or {}
+    return materialize_shard(
+        shard_spec["spec"], shard_spec["path_index"],
+        source=ctx.get("source"), tokenizer=ctx.get("tokenizer"),
+        cache_dir=ctx.get("dir"),
+    )
 
 
 def _load_private(engine, private_state) -> None:

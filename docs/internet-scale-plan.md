@@ -76,16 +76,27 @@ impact of quantization must be part of the §0f WAN validation. For a paper-scal
 150M-param path the per-generation traffic is now roughly ~300 MB down + ~150 MB
 up — better, but a 20 Mbps uplink still spends ~10 min/round uploading.
 
-#### 1.3 The data plane is fully centralized and in-RAM · [design]
+#### 1.3 The data plane is fully centralized and in-RAM · [design] · ◑ shard shipping done
 
-`ShardedCorpus` holds the entire tokenized corpus as in-memory tensors on the
-coordinator/scheduler, and `_next_task` ships the whole shard tensor over the wire
-(`distributed.py:177`). Routing (featurize + k-means) and EM re-sharding also happen
-centrally with the full corpus. The streaming/resumable ingestion in
-`data/streaming.py` exists but **is not wired into the task flow** — the scheduler
-still serves bytes from RAM. (`remaining-gaps.md` marks data pre-distribution
-"P2 · deliberate"; for this goal it's P0.) Worker-side, `shard_cache` grows
-unboundedly (one full shard per path ever touched).
+**✅ Servers can now ship recipes instead of bytes (`data/spec.py`)**: with
+`data.ship: spec`, the coordinator/scheduler holds a `SpecCorpus` — a shard
+*spec* (document source + k-means centroids + the deterministic featurizer's
+parameters + packing rules, a few KB) plus per-path token counts (the alpha
+basis) — and **no sequence tensors at all** (`SpecCorpus.shard()` refuses).
+Workers materialize their own shards locally: regenerate (synthetic) or stream
+(C4) the documents, route them with the shipped router, keep their path's, pack
+— bounded memory, optional on-disk cache (`data_dir=` /
+`data.shard_cache_dir`). Materialization is **bit-identical** to the shards the
+bytes path would have shipped (parity-tested against `ShardedCorpus`), and the
+end-to-end tests assert `bytes_shard == 0`. Verified by `tests/test_data_spec.py`.
+
+**Still open:** the server still touches the corpus *once at startup* to fit the
+k-means router and compute token counts (a streaming pass; it keeps nothing);
+EM re-sharding remains central; spec mode has no per-path validation split (so
+per-path early stopping is off); and a cold C4 worker re-streams the corpus
+prefix rather than reusing `ingest_c4_shard`'s resumable bulk path. Worker-side
+`shard_cache` is still unbounded in RAM (the disk cache bounds *re-streaming*,
+not memory).
 
 #### 1.4 Async convergence is unvalidated — and it's the only mode that fits the internet · [design]
 
@@ -316,7 +327,7 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
 | ~~0a~~ ✅ | ~~Protocol bug fixes (fencing, commit grants, async checkpoint)~~ | **Done** — 1.5, 1.6, 1.7 (+ the 1.12 docstring) | S |
 | ~~0b~~ ✅ | ~~Update validation (NaN/norm/loss)~~ | **Done** — 1.1 (the faulty-hardware half; malice needs Phase 3) | S |
 | ~~0c~~ ✅ | ~~Compression (bf16 + int8 grads + error feedback)~~ | **Done** — 1.2 (2× down / 4× up measured; delta-encoding + convergence validation remain) | M |
-| 0d | Data decentralization (shard ids + worker-side ingest + local routing) | 1.3 | M |
+| ~~0d~~ ✅ | ~~Data decentralization (shard ids + worker-side ingest + local routing)~~ | **Done** — 1.3 (`data.ship: spec`; router fitting + EM still central) | M |
 | 0e | bf16 inner loop, capability negotiation, idle backoff, hygiene | 1.10, 1.9 (partial), 1.11, 1.12 | S–M |
 | 0f | WAN validation run of the async path | 1.4 | M (mostly wall-clock) |
 | 1 | Peer identity + tracker + reachability tiers | 1.13, 1.8 (prereq) | M |

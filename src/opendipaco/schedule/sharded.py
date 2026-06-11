@@ -55,6 +55,7 @@ from .distributed import (
     _compress_contribution,
     _load_into,
     _load_private,
+    _materialize_from_spec,
 )
 from .guard import all_finite, clip_norm_, loss_ok
 from .reactor import DEFAULT_MAX_MSG_BYTES, _ReactorServer
@@ -337,7 +338,14 @@ class Scheduler(_ReactorServer):
             generation = self._completed[path]
             keys = self.topology.path_module_keys(path)
             routing = {k: self._routing[k] for k in keys}
-        shard = self.corpus.shard(self.topology.path_index(path)) if path not in cached else None
+        # Data plane: shard bytes, or just the recipe for a spec corpus.
+        shard, shard_spec = None, None
+        if path not in cached:
+            if hasattr(self.corpus, "spec"):
+                shard_spec = {"path_index": self.topology.path_index(path),
+                              "spec": self.corpus.spec}
+            else:
+                shard = self.corpus.shard(self.topology.path_index(path))
         return {
             "type": "task",
             "gen_id": generation,
@@ -346,6 +354,7 @@ class Scheduler(_ReactorServer):
             "routing": routing,
             "compress": self.compress,  # uplink encoding the worker should use
             "shard": compress_shard(shard, self.compress),
+            "shard_spec": shard_spec,
             "batch_size": self.batch_size,
             "total_rounds": self.total_rounds,
             "seed": self.seed,
@@ -473,7 +482,8 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
                        auth_key=None, max_tasks=None, heartbeat_interval=3.0,
                        poll_interval=0.02, max_msg_bytes=DEFAULT_MAX_MSG_BYTES,
                        connect_timeout=10.0, reconnect=False, reconnect_timeout=30.0,
-                       fault_hook=None, tls=None, tls_hostname=None):
+                       fault_hook=None, tls=None, tls_hostname=None,
+                       data_dir=None, data_source=None, data_tokenizer=None):
     """Train path-tasks for a sharded scheduler + parameter servers.
 
     Per task: lease from the scheduler, fetch the path's modules from the owning
@@ -481,6 +491,10 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
     pseudo-gradients to the owning servers. Warm caches (private modules, Adam
     state, shard) persist across tasks. With ``reconnect`` a dropped scheduler/PS
     connection is retried (e.g. a coordinator restart); warm caches survive.
+
+    With a spec corpus on the scheduler, tasks carry a shard recipe instead of
+    bytes and the worker materializes its shard locally (``data/spec.py``);
+    ``data_dir`` / ``data_source`` / ``data_tokenizer`` as in ``run_worker``.
     """
     engine = _build_worker_engine(config, diloco, device, seed)
     worker = AsyncScheduler(engine, num_workers=1)
@@ -490,6 +504,7 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
     versions: dict = {}          # shared key -> held version
     ps_conns: dict = {}          # (host, port) -> connected socket
     residuals: dict = {}         # path -> {key: [tensors]}: compression error feedback
+    data_ctx = {"dir": data_dir, "source": data_source, "tokenizer": data_tokenizer}
     state = {"done": 0}
 
     first = True
@@ -505,9 +520,9 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
         clean = False
         try:
             clean = _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions,
-                                   ps_conns, residuals, state, auth_key, max_msg_bytes,
-                                   connect_timeout, heartbeat_interval, poll_interval,
-                                   max_tasks, fault_hook, tls=tls)
+                                   ps_conns, residuals, data_ctx, state, auth_key,
+                                   max_msg_bytes, connect_timeout, heartbeat_interval,
+                                   poll_interval, max_tasks, fault_hook, tls=tls)
         except (OSError, ConnectionError):
             clean = False  # disconnected -> reconnect (if enabled)
         finally:
@@ -534,7 +549,7 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
 
 
 def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_conns,
-                   residuals, state, auth_key, max_msg_bytes, connect_timeout,
+                   residuals, data_ctx, state, auth_key, max_msg_bytes, connect_timeout,
                    heartbeat_interval, poll_interval, max_tasks, fault_hook,
                    *, tls=None) -> bool:
     """One scheduler connection: serve tasks. Returns True on a clean finish (stop /
@@ -594,6 +609,8 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
                 residuals.pop(path, None)          # and any stale error-feedback carry
             if task.get("shard") is not None:
                 shard_cache[path] = restore_shard(task["shard"])
+            elif task.get("shard_spec") is not None and path not in shard_cache:
+                shard_cache[path] = _materialize_from_spec(task["shard_spec"], data_ctx)
             shard = shard_cache[path]
             contrib = worker._train_path(path, shard, task["batch_size"], task["gen_id"])
         finally:

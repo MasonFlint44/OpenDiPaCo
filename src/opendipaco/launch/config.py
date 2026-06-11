@@ -61,6 +61,10 @@ class DataCfg:
     shard_cache_dir: str | None = None # directory for sharded resumable ingestion
     routing: str = "kmeans"            # "kmeans" | "round_robin"
     router_seed: int = 0
+    # "bytes": the server holds the corpus and ships packed shards (default).
+    # "spec": the server ships a shard *recipe*; workers materialize shards
+    # locally from the public source (data/spec.py). No per-path val split.
+    ship: str = "bytes"
     synthetic_topics: int = 4
     synthetic_doc_len: int = 80
 
