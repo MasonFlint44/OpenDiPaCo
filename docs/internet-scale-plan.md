@@ -52,20 +52,29 @@ Once authenticated:
   all need at least replicated tasks + agreement. **This — Phase 3 — remains the
   real trust wall.**
 
-#### 1.2 Bandwidth: full fp32 tensors both ways, every generation, no compression · [design]
+#### 1.2 Bandwidth: full fp32 tensors both ways, every generation, no compression · [design] · ◑ compression done
 
-The "ship only stale versions" cache (`distributed.py:169-172`) is structurally
-defeated in async mode: every accepted contribution bumps `_versions` for all modules
-it touched, and modules are shared across paths *by design*, so a worker's cached
-versions are essentially always stale → full shared weights re-ship nearly every
-task. The pseudo-gradient returns as dense fp32.
+**✅ Wire compression is in (`schedule/compress.py`)**: `compress="int8"` (a server
+policy stamped on each task; `TransportCfg.compress`) ships weights down as bf16,
+shards as int32, and pseudo-gradients up as per-tensor symmetric **int8 with
+worker-side error feedback** (the quantization residual is carried per
+(path, module) and folded into the next generation's delta, reset on cold start;
+in the sharded path the residual is updated only after the commit is accepted, so
+it always reflects an update that was actually pushed). Payloads are
+self-describing (`{"q", "s"}` markers; bf16 state dicts auto-cast on
+`load_state_dict`), so receivers need no mode config and reject malformed
+encodings via the §0b guards. Measured on the CLI smoke run: **down 68.6 → 34.3 MB
+(2×), up 68.3 → 17.1 MB (4×)**. Verified by `tests/test_compress.py`, including a
+loss-tracking test that int8 training stays in the fp32 run's ballpark.
 
-For a paper-scale 150M-param path: roughly **600 MB down + 600 MB up per generation
-per worker**. On a 20 Mbps consumer uplink that's ~40 minutes of upload per round —
-the GPU sits idle. The wire format already supports fp16/bf16/int8
-(`schedule/wire.py:47-51`); nothing uses them. No quantization, sparsification,
-error feedback, or delta encoding. This is the gap DiLoCo-descendant internet
-projects (OpenDiLoCo, INTELLECT-1) spent most of their engineering on.
+**Still open:** the "ship only stale versions" cache (`distributed.py`) remains
+structurally defeated in async mode — every accepted contribution bumps
+`_versions` for modules shared across paths, so full (now bf16) weights still
+re-ship nearly every task. Closing the rest of the gap needs **delta encoding
+against the worker's held version** and/or sparsification, and the convergence
+impact of quantization must be part of the §0f WAN validation. For a paper-scale
+150M-param path the per-generation traffic is now roughly ~300 MB down + ~150 MB
+up — better, but a 20 Mbps uplink still spends ~10 min/round uploading.
 
 #### 1.3 The data plane is fully centralized and in-RAM · [design]
 
@@ -306,7 +315,7 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
 |---|---|---|---|
 | ~~0a~~ ✅ | ~~Protocol bug fixes (fencing, commit grants, async checkpoint)~~ | **Done** — 1.5, 1.6, 1.7 (+ the 1.12 docstring) | S |
 | ~~0b~~ ✅ | ~~Update validation (NaN/norm/loss)~~ | **Done** — 1.1 (the faulty-hardware half; malice needs Phase 3) | S |
-| 0c | Compression (bf16 + int8 grads + error feedback) | 1.2 | M |
+| ~~0c~~ ✅ | ~~Compression (bf16 + int8 grads + error feedback)~~ | **Done** — 1.2 (2× down / 4× up measured; delta-encoding + convergence validation remain) | M |
 | 0d | Data decentralization (shard ids + worker-side ingest + local routing) | 1.3 | M |
 | 0e | bf16 inner loop, capability negotiation, idle backoff, hygiene | 1.10, 1.9 (partial), 1.11, 1.12 | S–M |
 | 0f | WAN validation run of the async path | 1.4 | M (mostly wall-clock) |

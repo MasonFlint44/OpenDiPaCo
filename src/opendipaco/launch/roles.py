@@ -132,7 +132,8 @@ def run_coordinator(cfg: LaunchConfig, *, on_start=None):
         heartbeat_timeout=cfg.transport.heartbeat_timeout,
         staleness_bound=cfg.transport.staleness_bound,
         staleness_weight=cfg.transport.staleness_weight,
-        max_update_norm=cfg.transport.max_update_norm, **_server_kw(cfg))
+        max_update_norm=cfg.transport.max_update_norm,
+        compress=cfg.transport.compress, **_server_kw(cfg))
     server.start()
     _attach_metrics(server, cfg)
     if on_start:
@@ -159,7 +160,8 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None):
         staleness_bound=cfg.transport.staleness_bound,
         staleness_weight=cfg.transport.staleness_weight,
         heartbeat_timeout=cfg.transport.heartbeat_timeout,
-        ps_tls=build_tls_client(cfg), grant_key=cfg.transport.grant_key, **_server_kw(cfg))
+        ps_tls=build_tls_client(cfg), grant_key=cfg.transport.grant_key,
+        compress=cfg.transport.compress, **_server_kw(cfg))
     scheduler.start()
     _attach_metrics(scheduler, cfg)
     if on_start:
@@ -191,7 +193,7 @@ def run_parameter_server(cfg: LaunchConfig, shard_id: int, *, port=None,
     ps = ParameterServer(
         model, owned, diloco, host=cfg.transport.host, port=_ps_port(cfg, shard_id, port),
         device=cfg.run.device, grant_key=cfg.transport.grant_key,
-        max_update_norm=cfg.transport.max_update_norm,
+        max_update_norm=cfg.transport.max_update_norm, compress=cfg.transport.compress,
         resume_dir=cfg.run.checkpoint_dir if cfg.run.resume else None, **_server_kw(cfg))
     ps.start()
     _attach_metrics(ps, cfg)

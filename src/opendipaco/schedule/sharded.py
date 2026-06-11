@@ -43,7 +43,19 @@ from ..model import build_module_bank
 from ..optim.diloco import apply_outer_grads, make_outer_optimizer
 from ..topology import is_private_key
 from ..train.loop import _optimizer_state_to_cpu, _state_to_cpu
-from .distributed import _build_worker_engine, _load_into, _load_private
+from .compress import (
+    check_mode,
+    compress_shard,
+    compress_state,
+    maybe_dequantize,
+    restore_shard,
+)
+from .distributed import (
+    _build_worker_engine,
+    _compress_contribution,
+    _load_into,
+    _load_private,
+)
 from .guard import all_finite, clip_norm_, loss_ok
 from .reactor import DEFAULT_MAX_MSG_BYTES, _ReactorServer
 from .scheduler import AsyncScheduler
@@ -119,7 +131,7 @@ class ParameterServer(_ReactorServer):
 
     def __init__(self, config, owned_keys, diloco, *, host="0.0.0.0", port=0,
                  auth_key=None, device="cpu", resume_dir=None, grant_key=None,
-                 max_update_norm=None, **reactor_kw):
+                 max_update_norm=None, compress="none", **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.config = config
         self.diloco = diloco
@@ -129,6 +141,8 @@ class ParameterServer(_ReactorServer):
         # Non-finite pushes are always refused; the optional norm cap clips
         # oversized pseudo-gradients per module (see ``guard.py``).
         self.max_update_norm = max_update_norm
+        # Downlink (fetch) compression; pushes are decoded self-describingly.
+        self.compress = check_mode(compress)
         self._seen_grants: collections.OrderedDict = collections.OrderedDict()
         # Build the full bank deterministically, then keep only this shard's keys.
         full = build_module_bank(config)
@@ -162,18 +176,28 @@ class ParameterServer(_ReactorServer):
                     continue
                 if is_private_key(k):
                     if cold:  # ship the path's private modules only on a cold start
-                        weights[k] = _state_to_cpu(self.bank[k].state_dict())
+                        weights[k] = compress_state(
+                            _state_to_cpu(self.bank[k].state_dict()), self.compress)
                 else:
                     versions[k] = self._versions[k]
                     if have.get(k) != self._versions[k]:  # ship only what's stale
-                        weights[k] = _state_to_cpu(self.bank[k].state_dict())
+                        weights[k] = compress_state(
+                            _state_to_cpu(self.bank[k].state_dict()), self.compress)
         return {"type": "weights", "weights": weights, "versions": versions}
 
     def _push(self, msg: dict) -> dict:
         grant = msg.get("grant")
         if not verify_grant(grant, self.grant_key):
             return {"type": "ack", "applied": False}  # no/forged grant -> refuse
-        updates = msg.get("updates") or {}
+        # Decode (possibly quantized) gradients outside the lock; a malformed
+        # encoding refuses the push rather than crashing the server.
+        try:
+            updates = {k: maybe_dequantize(u["grad"])
+                       for k, u in (msg.get("updates") or {}).items()
+                       if isinstance(u, dict)}
+        except (TypeError, KeyError, ValueError):
+            self.metrics.record_invalid_reject()
+            return {"type": "ack", "applied": False}
         private = msg.get("private") or {}
         weight = float(grant["weight"])
         allowed = set(grant["keys"])
@@ -187,13 +211,13 @@ class ParameterServer(_ReactorServer):
             if not (all_finite(updates) and all_finite(private)):
                 self.metrics.record_invalid_reject()
                 return {"type": "ack", "applied": False}
-            for k, upd in updates.items():
+            for k, grad in updates.items():
                 if k not in self.owned_keys or is_private_key(k) or k not in allowed:
                     continue
                 if self.max_update_norm is not None:
-                    if clip_norm_(upd["grad"], self.max_update_norm) > self.max_update_norm:
+                    if clip_norm_(grad, self.max_update_norm) > self.max_update_norm:
                         self.metrics.record_norm_clip()
-                apply_outer_grads(self.bank[k], [weight * g.to(self.device) for g in upd["grad"]])
+                apply_outer_grads(self.bank[k], [weight * g.to(self.device) for g in grad])
                 self._outer_opts[k].step()
                 self._outer_opts[k].zero_grad(set_to_none=True)
                 self._versions[k] += 1
@@ -248,10 +272,12 @@ class Scheduler(_ReactorServer):
     def __init__(self, config, corpus, ps_addrs, diloco, batch_size, *,
                  host="0.0.0.0", port=0, auth_key=None, seed=0,
                  staleness_bound=None, staleness_weight="inverse",
-                 heartbeat_timeout=30.0, ps_tls=None, grant_key=None, **reactor_kw):
+                 heartbeat_timeout=30.0, ps_tls=None, grant_key=None,
+                 compress="none", **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.ps_tls = ps_tls  # client context for the scheduler's checkpoint RPCs to PSs
         self.grant_key = grant_key  # shared with the PSs (not workers) to sign grants
+        self.compress = check_mode(compress)  # stamped on tasks; workers follow it
         self.config = config
         self.corpus = corpus
         self.diloco = diloco
@@ -318,7 +344,8 @@ class Scheduler(_ReactorServer):
             "lease": lease,
             "path": path,
             "routing": routing,
-            "shard": shard,
+            "compress": self.compress,  # uplink encoding the worker should use
+            "shard": compress_shard(shard, self.compress),
             "batch_size": self.batch_size,
             "total_rounds": self.total_rounds,
             "seed": self.seed,
@@ -462,6 +489,7 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
     shard_cache: dict = {}
     versions: dict = {}          # shared key -> held version
     ps_conns: dict = {}          # (host, port) -> connected socket
+    residuals: dict = {}         # path -> {key: [tensors]}: compression error feedback
     state = {"done": 0}
 
     first = True
@@ -477,9 +505,9 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
         clean = False
         try:
             clean = _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions,
-                                   ps_conns, state, auth_key, max_msg_bytes, connect_timeout,
-                                   heartbeat_interval, poll_interval, max_tasks, fault_hook,
-                                   tls=tls)
+                                   ps_conns, residuals, state, auth_key, max_msg_bytes,
+                                   connect_timeout, heartbeat_interval, poll_interval,
+                                   max_tasks, fault_hook, tls=tls)
         except (OSError, ConnectionError):
             clean = False  # disconnected -> reconnect (if enabled)
         finally:
@@ -505,9 +533,10 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
         backoff = min(backoff * 2, 1.0)
 
 
-def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_conns, state,
-                   auth_key, max_msg_bytes, connect_timeout, heartbeat_interval,
-                   poll_interval, max_tasks, fault_hook, *, tls=None) -> bool:
+def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_conns,
+                   residuals, state, auth_key, max_msg_bytes, connect_timeout,
+                   heartbeat_interval, poll_interval, max_tasks, fault_hook,
+                   *, tls=None) -> bool:
     """One scheduler connection: serve tasks. Returns True on a clean finish (stop /
     budget), raises ``OSError`` on a disconnect (so the caller can reconnect)."""
     send_lock = threading.Lock()
@@ -562,8 +591,9 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
                 versions.update(reply.get("versions", {}))
             if cold:
                 engine._opt_state.pop(path, None)  # reset Adam on a cold start
+                residuals.pop(path, None)          # and any stale error-feedback carry
             if task.get("shard") is not None:
-                shard_cache[path] = task["shard"]
+                shard_cache[path] = restore_shard(task["shard"])
             shard = shard_cache[path]
             contrib = worker._train_path(path, shard, task["batch_size"], task["gen_id"])
         finally:
@@ -577,11 +607,16 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
             raise OSError("scheduler disconnected during commit")
         if ack.get("accepted"):
             grant = ack["grant"]  # carries the push weight + allowed keys to the PSs
+            # Encode only after acceptance, so the error-feedback residual always
+            # reflects an update that was actually pushed.
+            shared_payload, private_payload = _compress_contribution(
+                contrib, task.get("compress") or "none", residuals, path
+            )
             for addr, keys in by_ps.items():
-                updates = {k: {"grad": contrib.shared_delta[k]}
-                           for k in keys if not is_private_key(k) and k in contrib.shared_delta}
-                private = {k: contrib.private_state[k]
-                           for k in keys if is_private_key(k) and k in contrib.private_state}
+                updates = {k: {"grad": shared_payload[k]}
+                           for k in keys if not is_private_key(k) and k in shared_payload}
+                private = {k: private_payload[k]
+                           for k in keys if is_private_key(k) and k in private_payload}
                 _rpc(ps_sock(addr),
                      {"type": "push", "grant": grant, "updates": updates, "private": private},
                      max_msg_bytes)

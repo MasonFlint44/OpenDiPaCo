@@ -94,6 +94,9 @@ class TransportCfg:
     # Servers always reject non-finite contributions; this additionally clips a
     # pseudo-gradient whose L2 norm exceeds the cap (None = no cap).
     max_update_norm: float | None = None
+    # Wire compression: "none" (fp32, default), "bf16" (2x), or "int8"
+    # (bf16 weights + int8 pseudo-gradients with error feedback, ~4x up).
+    compress: str = "none"
     metrics_port: int | None = None
     metrics_host: str = "0.0.0.0"
     metrics_log_interval: float = 0.0

@@ -49,6 +49,14 @@ from ..checkpoint import latest_checkpoint, load_checkpoint, save_checkpoint
 from ..optim.diloco import apply_outer_grads, make_outer_optimizer
 from ..topology import is_private_key
 from ..train.loop import _optimizer_state_to_cpu, _state_to_cpu
+from .compress import (
+    check_mode,
+    compress_delta,
+    compress_shard,
+    compress_state,
+    maybe_dequantize,
+    restore_shard,
+)
 from .guard import clip_norm_, contribution_ok
 from .reactor import TransportMetrics, _ReactorServer  # noqa: F401 (re-exported)
 from .scheduler import AsyncScheduler
@@ -85,6 +93,7 @@ class CoordinatorServer(_ReactorServer):
         staleness_weight: str = "inverse",
         rescale_by_sqrt_sharing: bool = False,
         max_update_norm: float | None = None,
+        compress: str = "none",
         io_threads: int = 4,
         max_connections: int = 1024,
         tls=None,
@@ -108,6 +117,9 @@ class CoordinatorServer(_ReactorServer):
         # contributions are always rejected; a norm cap (off by default) clips
         # oversized pseudo-gradients per module (see ``guard.py``).
         self.max_update_norm = max_update_norm
+        # Wire compression policy; stamped on every task so workers follow it
+        # (see ``compress.py``). Receivers are self-describing either way.
+        self.compress = check_mode(compress)
         self.heartbeat_timeout = (
             heartbeat_timeout if heartbeat_timeout is not None else scheduler.lease_timeout
         )
@@ -179,11 +191,12 @@ class CoordinatorServer(_ReactorServer):
             private_keys = [k for k in e.topology.path_module_keys(path) if is_private_key(k)]
             # Consistent read of bank weights (the lock also serializes outer steps).
             shared_weights = {
-                k: _state_to_cpu(e.bank[k].state_dict())
+                k: compress_state(_state_to_cpu(e.bank[k].state_dict()), self.compress)
                 for k in shared_keys if have_ver.get(k) != versions[k]
             }
             private_weights = (
-                {k: _state_to_cpu(e.bank[k].state_dict()) for k in private_keys}
+                {k: compress_state(_state_to_cpu(e.bank[k].state_dict()), self.compress)
+                 for k in private_keys}
                 if path not in warm else None
             )
         shard = self.corpus.shard(e.topology.path_index(path)) if path not in cached else None
@@ -193,10 +206,11 @@ class CoordinatorServer(_ReactorServer):
             "lease": lease,                  # echoed on submit/nack/heartbeat; fences the lease
             "generation": generation,        # this path's update count -> inner LR schedule
             "path": path,
+            "compress": self.compress,       # uplink encoding the worker should use
             "shared_weights": shared_weights,
             "shared_versions": {k: versions[k] for k in shared_keys},
             "private_weights": private_weights,
-            "shard": shard,
+            "shard": compress_shard(shard, self.compress),
             "batch_size": self.batch_size,
             "total_rounds": e.total_rounds,
             "seed": self.sched.seed,
@@ -205,6 +219,22 @@ class CoordinatorServer(_ReactorServer):
     def _receive(self, msg: dict) -> None:
         path = msg["path"]
         e = self.engine
+        # Decode + validate outside the lock (O(params) CPU work must not stall
+        # task serving). One applied NaN poisons the bank permanently (faulty
+        # consumer hardware produces them; see guard.py). Keys are filtered to
+        # what they claim to be -- an unknown key must not crash the server, and
+        # a "private" payload must not be able to overwrite a shared module.
+        try:
+            shared = {k: maybe_dequantize(v)
+                      for k, v in (msg.get("shared_grad") or {}).items()
+                      if k in self._versions}
+        except (TypeError, KeyError, ValueError):
+            shared = None  # malformed encoding -> invalid contribution
+        private = {k: v for k, v in (msg.get("private_weights") or {}).items()
+                   if is_private_key(k) and k in e.bank}
+        valid = shared is not None and contribution_ok(
+            msg.get("loss"), msg.get("empty"), shared, private
+        )
         with self._lock:  # serialize with scheduling + other outer steps
             if path not in self._inflight or msg.get("lease") != self._lease.get(path):
                 return  # stale / duplicate / reclaimed / not the current lease holder
@@ -214,16 +244,7 @@ class CoordinatorServer(_ReactorServer):
             if staleness > self.staleness_bound:
                 self.metrics.record_stale_reject()  # too stale -> discard, re-eligible
                 return
-            # Validate before touching the bank: one applied NaN poisons it
-            # permanently (faulty consumer hardware produces them; see guard.py).
-            # Keys are filtered to what they claim to be -- an unknown key must
-            # not crash the server, and a "private" payload must not be able to
-            # overwrite a shared module.
-            shared = {k: v for k, v in (msg.get("shared_grad") or {}).items()
-                      if k in self._versions}
-            private = {k: v for k, v in (msg.get("private_weights") or {}).items()
-                       if is_private_key(k) and k in e.bank}
-            if not contribution_ok(msg.get("loss"), msg.get("empty"), shared, private):
+            if not valid:
                 self.metrics.record_invalid_reject()  # dropped; the path is re-eligible
                 return
             if self.max_update_norm is not None:
@@ -424,6 +445,7 @@ def run_worker(
     shard_cache: dict = {}   # path -> shard tensor (fetched once)
     versions: dict = {}      # shared key -> version currently held
     attempts: dict = {}
+    residuals: dict = {}     # path -> {key: [tensors]}: compression error feedback
     state = {"done": 0}
 
     first = True
@@ -441,8 +463,8 @@ def run_worker(
         try:
             done = _serve_connection(
                 conn, engine, worker, wid, warm, shard_cache, versions, attempts,
-                state, poll_interval, heartbeat_interval, max_msg_bytes, max_tasks,
-                fault_hook,
+                residuals, state, poll_interval, heartbeat_interval, max_msg_bytes,
+                max_tasks, fault_hook,
             )
         finally:
             try:
@@ -456,7 +478,7 @@ def run_worker(
 
 
 def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
-                      attempts, state, poll_interval, heartbeat_interval,
+                      attempts, residuals, state, poll_interval, heartbeat_interval,
                       max_msg_bytes, max_tasks, fault_hook) -> bool:
     """Serve tasks on one connection. Returns True on a clean finish (stop /
     budget reached), False on a disconnect (caller may reconnect)."""
@@ -500,7 +522,7 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
             if fault_hook is not None:
                 attempts[path] = attempts.get(path, 0) + 1
                 fault_hook(path, attempts[path])
-            shard = _apply_task(engine, msg, shard_cache, versions, warm)
+            shard = _apply_task(engine, msg, shard_cache, versions, warm, residuals)
             contrib = worker._train_path(path, shard, msg["batch_size"], msg["generation"])
             # Warm-back: keep this path's Adam state + private modules for next gen.
             engine._opt_state[path] = contrib.opt_state
@@ -519,12 +541,16 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
             continue
         stop_beat.set()
         beat.join(timeout=1)
+        mode = msg.get("compress") or "none"
+        shared_payload, private_payload = _compress_contribution(
+            contrib, mode, residuals, path
+        )
         try:
             safe_send({
                 "type": "submit", "gen_id": msg["gen_id"], "lease": lease, "path": path,
                 "loss": contrib.loss, "empty": contrib.empty,
-                "shared_grad": contrib.shared_delta,
-                "private_weights": contrib.private_state,
+                "shared_grad": shared_payload,
+                "private_weights": private_payload,
             })
             recv_msg(conn, max_msg_bytes)  # ack
         except OSError:
@@ -552,18 +578,39 @@ def _build_worker_engine(config, diloco, device, seed):
     )
 
 
-def _apply_task(engine, msg, shard_cache, versions, warm) -> torch.Tensor:
+def _compress_contribution(contrib, mode, residuals, path):
+    """Encode a contribution's uplink payloads per the server's compress policy.
+
+    In "bf16"/"int8" mode the per-(path, module) quantization residual is carried
+    in ``residuals`` and folded into the next generation's delta (error
+    feedback), so encoding error accumulates into later updates instead of
+    being lost. Returns ``(shared_payload, private_payload)``.
+    """
+    if mode == "none":
+        return contrib.shared_delta, contrib.private_state
+    pres = residuals.setdefault(path, {})
+    shared_payload = {}
+    for key, delta in contrib.shared_delta.items():
+        payload, res = compress_delta(delta, mode, carry=pres.get(key))
+        pres[key] = res
+        shared_payload[key] = payload
+    private_payload = {k: compress_state(sd, mode) for k, sd in contrib.private_state.items()}
+    return shared_payload, private_payload
+
+
+def _apply_task(engine, msg, shard_cache, versions, warm, residuals) -> torch.Tensor:
     """Load a task's shipped (delta) state into the worker bank; return the shard."""
     path = msg["path"]
     for key, sd in msg.get("shared_weights", {}).items():
-        _load_into(engine, key, sd)
+        _load_into(engine, key, sd)  # load_state_dict casts bf16 -> module dtype
     versions.update(msg.get("shared_versions", {}))
     if msg.get("private_weights"):  # cold: coordinator shipped current private modules
         _load_private(engine, msg["private_weights"])
     if path not in warm:
         engine._opt_state.pop(path, None)  # cold -> reset Adam (reset-on-failover)
+        residuals.pop(path, None)          # and drop any stale error-feedback carry
     if msg.get("shard") is not None:
-        shard_cache[path] = msg["shard"]
+        shard_cache[path] = restore_shard(msg["shard"])
     return shard_cache[path]
 
 
