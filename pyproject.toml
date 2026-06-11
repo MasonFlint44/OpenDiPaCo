@@ -20,7 +20,10 @@ dependencies = [
 [project.optional-dependencies]
 data = ["datasets>=2.19", "tokenizers>=0.19"]
 launch = ["pyyaml>=6.0", "cryptography>=41"]
-dev = ["pytest>=8.0", "ruff>=0.5", "pyyaml>=6.0", "cryptography>=41"]
+# torch build selectors (uv routes these to the right index, see [tool.uv]):
+# `uv sync --extra cpu` for CI / CPU boxes, `--extra cu130` for this GPU.
+cpu = ["torch>=2.4"]
+cu130 = ["torch>=2.4"]
 
 [project.scripts]
 opendipaco = "opendipaco.launch.cli:main"
@@ -28,6 +31,32 @@ opendipaco = "opendipaco.launch.cli:main"
 [project.urls]
 Homepage = "https://github.com/masonflint44/opendipaco"
 Paper = "https://arxiv.org/abs/2403.10616"
+
+# -- uv ----------------------------------------------------------------------
+# Dev tooling lives in a PEP 735 dependency group (installed by `uv sync` by
+# default). Run things with `uv run` (e.g. `uv run pytest`, `uv run opendipaco`).
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.5", "pyyaml>=6.0", "cryptography>=41"]
+
+[tool.uv]
+# cpu and cu130 are mutually exclusive torch builds; pick exactly one at sync.
+conflicts = [[{ extra = "cpu" }, { extra = "cu130" }]]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu130", extra = "cu130" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [tool.hatchling.build.targets.wheel]
 packages = ["src/opendipaco"]

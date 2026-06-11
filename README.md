@@ -37,11 +37,33 @@ added behind the same `SyncBackend` interface.
 
 ## Install
 
+This project uses [**uv**](https://docs.astral.sh/uv/). `uv sync` creates a virtual
+env and installs from the lockfile; pick a torch build via an extra:
+
+```bash
+uv sync --extra cu130              # GPU (CUDA 13.0 wheel)
+uv sync --extra cpu                # CPU-only wheel
+uv sync --extra cpu --extra data --extra launch   # + corpora + launch CLI/YAML
+
+uv run pytest                      # run the tests
+uv run opendipaco --help           # the launch CLI
+uv run python examples/validate_c4_gpu.py
+```
+
+(`--extra cpu` and `--extra cu130` are mutually exclusive torch builds; add `--extra
+data` for `datasets`/`tokenizers` and `--extra launch` for the CLI's YAML/cert deps.)
+Dev tooling (pytest/ruff) is in the `dev` dependency group, installed by `uv sync`
+automatically.
+
+<details><summary>Plain pip</summary>
+
 ```bash
 pip install -e .            # core (torch + transformers)
 pip install -e ".[data]"    # + datasets/tokenizers for real corpora
-pip install -e ".[dev]"     # + pytest/ruff
 ```
+(pip resolves torch from PyPI's default index — the CUDA build on Linux. Use uv for
+CPU/CUDA wheel selection and a reproducible lockfile.)
+</details>
 
 ## How it maps to the paper
 
