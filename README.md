@@ -1,5 +1,7 @@
 # opendipaco
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 An open implementation of **DiPaCo** ([Distributed Path Composition](https://arxiv.org/abs/2403.10616),
 Douillard et al., 2024), packaged as usable code.
 
