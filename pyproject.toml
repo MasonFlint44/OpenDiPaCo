@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "opendipaco"
+version = "0.1.0"
+description = "An open implementation of DiPaCo (Distributed Path Composition) for modular, low-communication language-model training."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Mason Flint" }]
+keywords = ["dipaco", "diloco", "distributed-training", "mixture-of-experts", "language-models"]
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.44",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+data = ["datasets>=2.19", "tokenizers>=0.19"]
+launch = ["pyyaml>=6.0"]
+dev = ["pytest>=8.0", "ruff>=0.5", "pyyaml>=6.0"]
+
+[project.scripts]
+opendipaco = "opendipaco.launch.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/masonflint44/opendipaco"
+Paper = "https://arxiv.org/abs/2403.10616"
+
+[tool.hatchling.build.targets.wheel]
+packages = ["src/opendipaco"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

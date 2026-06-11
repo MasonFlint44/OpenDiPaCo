@@ -1,0 +1,209 @@
+"""Declarative cluster configuration for the ``opendipaco`` launcher.
+
+One config file describes a whole run -- the model, the DiLoCo hyper-parameters, the
+data source, the transport (host/port, auth, TLS, metrics), and the run schedule --
+so every role (coordinator / scheduler / parameter server / worker) reads the *same*
+file and agrees on shapes, ports, and secrets. Load it with :func:`load_config`
+(YAML, TOML, or JSON by extension) and turn the model/diloco sections into the core
+dataclasses with the ``*_config`` builders.
+
+The schema is intentionally flat: each section is a small dataclass with defaults, so
+a minimal file (even ``{}``) is valid and you only override what you need.
+"""
+
+import dataclasses
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from ..config import BackboneConfig, DiLoCoConfig, DiPaCoConfig
+
+
+@dataclass
+class ModelCfg:
+    vocab_size: int = 32000
+    hidden_size: int = 512
+    num_attention_heads: int = 8
+    num_key_value_heads: int | None = None
+    intermediate_size: int = 1024
+    max_position_embeddings: int = 1024
+    rope_theta: float = 10000.0
+    layers_per_level: list[int] = field(default_factory=lambda: [2, 2])
+    level_sizes: list[int] = field(default_factory=lambda: [4, 4])
+    embedding: str = "shared"
+    head: str = "shared"
+    tie_word_embeddings: bool = False
+    sequence_length: int = 256
+    eval_sequence_length: int | None = None
+
+
+@dataclass
+class DiLoCoCfg:
+    inner_steps: int = 50
+    inner_lr: float = 4e-4
+    inner_weight_decay: float = 0.1
+    inner_grad_clip: float | None = 1.0
+    inner_lr_schedule: str = "cosine"
+    inner_warmup_steps: int = 0
+    outer_lr: float = 0.7
+    outer_momentum: float = 0.9
+    outer_nesterov: bool = True
+    rescale_by_sqrt_sharing: bool = True
+
+
+@dataclass
+class DataCfg:
+    source: str = "synthetic"          # "c4" | "synthetic"
+    num_documents: int = 2000
+    max_doc_tokens: int | None = 256
+    min_doc_tokens: int = 1
+    tokenizer: str | None = None       # name/path; None -> a sensible default per source
+    cache_path: str | None = None      # single-file doc cache (load_c4_documents)
+    shard_cache_dir: str | None = None # directory for sharded resumable ingestion
+    routing: str = "kmeans"            # "kmeans" | "round_robin"
+    router_seed: int = 0
+    synthetic_topics: int = 4
+    synthetic_doc_len: int = 80
+
+
+@dataclass
+class TLSCfg:
+    enabled: bool = False
+    certfile: str | None = None
+    keyfile: str | None = None
+    cafile: str | None = None
+    insecure: bool = False              # client: encrypt without verifying the server
+    require_client_cert: bool = False   # server: mutual TLS
+    server_hostname: str | None = None  # client: name to verify / SNI
+
+
+@dataclass
+class TransportCfg:
+    host: str = "0.0.0.0"               # bind address (servers)
+    connect_host: str | None = None     # address workers dial (defaults from host)
+    port: int = 29500
+    auth_key: str | None = None
+    accept_keys: list[str] = field(default_factory=list)
+    max_msg_bytes: int | None = None
+    heartbeat_timeout: float = 30.0
+    heartbeat_interval: float = 3.0
+    staleness_bound: int | None = None
+    staleness_weight: str = "inverse"
+    metrics_port: int | None = None
+    metrics_host: str = "0.0.0.0"
+    metrics_log_interval: float = 0.0
+
+
+@dataclass
+class ShardedCfg:
+    num_shards: int = 2
+    # How workers/scheduler reach each parameter server: [[host, port], ...].
+    parameter_servers: list[list] = field(default_factory=list)
+
+
+@dataclass
+class RunCfg:
+    generations: int = 10
+    batch_size: int = 8
+    seed: int = 0
+    device: str = "cpu"
+    checkpoint_dir: str | None = None
+    checkpoint_every: int = 0
+    resume: bool = False
+    max_tasks: int | None = None
+    local_workers: int = 2             # workers the all-in-one `run` command spawns
+
+
+@dataclass
+class LaunchConfig:
+    mode: str = "coordinator"          # "coordinator" | "sharded"
+    model: ModelCfg = field(default_factory=ModelCfg)
+    diloco: DiLoCoCfg = field(default_factory=DiLoCoCfg)
+    data: DataCfg = field(default_factory=DataCfg)
+    transport: TransportCfg = field(default_factory=TransportCfg)
+    tls: TLSCfg = field(default_factory=TLSCfg)
+    sharded: ShardedCfg = field(default_factory=ShardedCfg)
+    run: RunCfg = field(default_factory=RunCfg)
+
+    _SECTIONS = {  # name -> dataclass (class attr, not a field)
+        "model": ModelCfg, "diloco": DiLoCoCfg, "data": DataCfg,
+        "transport": TransportCfg, "tls": TLSCfg, "sharded": ShardedCfg, "run": RunCfg,
+    }
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "LaunchConfig":
+        d = dict(d or {})
+        kw = {"mode": d.pop("mode", "coordinator")}
+        for name, dc in cls._SECTIONS.items():
+            kw[name] = _build_section(dc, d.pop(name, {}))
+        if d:
+            raise ValueError(f"unknown top-level config keys: {sorted(d)}")
+        if kw["mode"] not in ("coordinator", "sharded"):
+            raise ValueError(f"mode must be 'coordinator' or 'sharded', got {kw['mode']!r}")
+        return cls(**kw)
+
+    def connect_addr(self) -> tuple[str, int]:
+        """Address a worker dials for the coordinator/scheduler."""
+        t = self.transport
+        host = t.connect_host or (t.host if t.host not in ("0.0.0.0", "::") else "127.0.0.1")
+        return host, t.port
+
+
+def _build_section(dc, data: dict):
+    data = dict(data or {})
+    names = {f.name for f in dataclasses.fields(dc)}
+    unknown = set(data) - names
+    if unknown:
+        raise ValueError(f"unknown keys for [{dc.__name__}]: {sorted(unknown)}")
+    return dc(**data)
+
+
+def load_config(path) -> LaunchConfig:
+    """Parse a cluster config file (``.yaml``/``.yml``, ``.toml``, or ``.json``)."""
+    path = Path(path)
+    text = path.read_text()
+    suffix = path.suffix.lower()
+    if suffix in (".yaml", ".yml"):
+        try:
+            import yaml
+        except ImportError as e:  # pragma: no cover
+            raise ImportError("YAML config needs PyYAML: pip install 'opendipaco[launch]'") from e
+        data = yaml.safe_load(text)
+    elif suffix == ".toml":
+        import tomllib
+        data = tomllib.loads(text)
+    elif suffix == ".json":
+        import json
+        data = json.loads(text)
+    else:
+        raise ValueError(f"unsupported config format '{suffix}'; use .yaml, .toml or .json")
+    return LaunchConfig.from_dict(data)
+
+
+# -- builders: config sections -> core dataclasses ---------------------------
+
+
+def backbone_config(m: ModelCfg) -> BackboneConfig:
+    return BackboneConfig(
+        vocab_size=m.vocab_size, hidden_size=m.hidden_size,
+        num_attention_heads=m.num_attention_heads, num_key_value_heads=m.num_key_value_heads,
+        intermediate_size=m.intermediate_size, max_position_embeddings=m.max_position_embeddings,
+        rope_theta=m.rope_theta, layers_per_level=list(m.layers_per_level),
+    )
+
+
+def dipaco_config(m: ModelCfg) -> DiPaCoConfig:
+    return DiPaCoConfig(
+        backbone=backbone_config(m), level_sizes=list(m.level_sizes),
+        embedding=m.embedding, head=m.head, tie_word_embeddings=m.tie_word_embeddings,
+        sequence_length=m.sequence_length, eval_sequence_length=m.eval_sequence_length,
+    )
+
+
+def diloco_config(d: DiLoCoCfg) -> DiLoCoConfig:
+    return DiLoCoConfig(
+        inner_steps=d.inner_steps, inner_lr=d.inner_lr, inner_weight_decay=d.inner_weight_decay,
+        inner_grad_clip=d.inner_grad_clip, inner_lr_schedule=d.inner_lr_schedule,
+        inner_warmup_steps=d.inner_warmup_steps, outer_lr=d.outer_lr,
+        outer_momentum=d.outer_momentum, outer_nesterov=d.outer_nesterov,
+        rescale_by_sqrt_sharing=d.rescale_by_sqrt_sharing,
+    )
