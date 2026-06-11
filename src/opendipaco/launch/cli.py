@@ -22,7 +22,7 @@ import dataclasses
 import sys
 from pathlib import Path
 
-from .config import LaunchConfig, ShardedCfg, load_config
+from .config import DataCfg, DiLoCoCfg, LaunchConfig, ModelCfg, RunCfg, ShardedCfg, load_config
 from .roles import (
     run_coordinator,
     run_ingest,
@@ -76,7 +76,17 @@ def cmd_ingest(args) -> int:
 
 
 def cmd_init_config(args) -> int:
-    cfg = LaunchConfig(mode=args.mode)
+    # A small, fast-to-run starter: `opendipaco run` on it finishes in seconds.
+    # Scale model / data / generations up (and set run.device=cuda) for real training.
+    cfg = LaunchConfig(
+        mode=args.mode,
+        model=ModelCfg(vocab_size=4096, hidden_size=128, num_attention_heads=4,
+                       intermediate_size=256, max_position_embeddings=128,
+                       layers_per_level=[1, 1], level_sizes=[2, 2], sequence_length=64),
+        diloco=DiLoCoCfg(inner_steps=10),
+        data=DataCfg(source="synthetic", num_documents=512),
+        run=RunCfg(generations=3, batch_size=16, local_workers=2),
+    )
     if args.mode == "sharded":
         cfg.sharded = ShardedCfg(num_shards=2,
                                  parameter_servers=[["127.0.0.1", 29501], ["127.0.0.1", 29502]])
@@ -92,7 +102,9 @@ def cmd_init_config(args) -> int:
         except ImportError:  # pragma: no cover
             print("PyYAML not installed; use --format json", file=sys.stderr)
             return 1
-        out.write_text(yaml.safe_dump(data, sort_keys=False))
+        header = ("# opendipaco starter config — small and fast to run; scale model/data/\n"
+                  "# generations up (and set run.device=cuda) for real training.\n")
+        out.write_text(header + yaml.safe_dump(data, sort_keys=False))
     print(f"wrote {args.mode} config to {out}")
     return 0
 
