@@ -35,7 +35,7 @@ def save_documents(documents: list[torch.Tensor], path: str | os.PathLike) -> No
 
 def load_documents(path: str | os.PathLike) -> list[torch.Tensor]:
     """Load a tokenized document list written by :func:`save_documents`."""
-    return torch.load(path, weights_only=False)
+    return torch.load(path, weights_only=True)
 
 
 def load_c4_documents(

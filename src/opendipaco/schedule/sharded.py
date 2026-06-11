@@ -248,7 +248,7 @@ class ParameterServer(_ReactorServer):
 
     def load_shard(self, dirpath: str) -> None:
         blob = torch.load(os.path.join(dirpath, self._shard_name()),
-                          map_location=self.device, weights_only=False)
+                          map_location=self.device, weights_only=True)
         with self._lock:
             for k, sd in blob["weights"].items():
                 if k in self.bank:
@@ -274,11 +274,13 @@ class Scheduler(_ReactorServer):
                  host="0.0.0.0", port=0, auth_key=None, seed=0,
                  staleness_bound=None, staleness_weight="inverse",
                  heartbeat_timeout=30.0, ps_tls=None, grant_key=None,
-                 compress="none", **reactor_kw):
+                 compress="none", idle_backoff=None, **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.ps_tls = ps_tls  # client context for the scheduler's checkpoint RPCs to PSs
         self.grant_key = grant_key  # shared with the PSs (not workers) to sign grants
         self.compress = check_mode(compress)  # stamped on tasks; workers follow it
+        self.idle_backoff = idle_backoff      # server-paced idle polling (retry_in)
+        self._worker_caps: dict = {}          # worker_id -> advertised capabilities
         self.config = config
         self.corpus = corpus
         self.diloco = diloco
@@ -318,17 +320,26 @@ class Scheduler(_ReactorServer):
             self._heartbeat(msg)
         return None
 
+    def _idle(self) -> dict:
+        msg = {"type": "idle"}
+        if self.idle_backoff is not None:
+            msg["retry_in"] = self.idle_backoff
+        return msg
+
     def _next_task(self, req: dict) -> dict:
         wid = req.get("worker_id")
         warm = {tuple(p) for p in req.get("warm_paths", [])}
         cached = {tuple(p) for p in req.get("cached_shards", [])}
+        caps = req.get("capabilities") or {}
         with self._lock:
+            if caps:
+                self._worker_caps[wid] = caps
             if not self._serving or self._T >= self._target:
-                return {"type": "stop"} if self._stop else {"type": "idle"}
+                return {"type": "stop"} if self._stop else self._idle()
             self._reclaim_inflight_locked()
             eligible = [p for p in self._completed if p not in self._inflight]
             if not eligible:
-                return {"type": "idle"}
+                return self._idle()
             path = min(eligible, key=lambda p: (self._completed[p], p not in warm, p))
             lease = uuid.uuid4().hex  # unique per lease; fences commit/heartbeat
             self._owner[path] = wid
@@ -355,7 +366,8 @@ class Scheduler(_ReactorServer):
             "compress": self.compress,  # uplink encoding the worker should use
             "shard": compress_shard(shard, self.compress),
             "shard_spec": shard_spec,
-            "batch_size": self.batch_size,
+            "batch_size": (max(1, min(self.batch_size, int(caps["max_batch"])))
+                           if caps.get("max_batch") else self.batch_size),
             "total_rounds": self.total_rounds,
             "seed": self.seed,
         }
@@ -464,7 +476,7 @@ class Scheduler(_ReactorServer):
         path = os.path.join(dirpath, "scheduler.pt")
         if not os.path.exists(path):
             return
-        state = torch.load(path, weights_only=False)
+        state = torch.load(path, weights_only=True)
         with self._lock:
             self._T = state["T"]
             self._completed = dict(state["completed"])
@@ -483,7 +495,8 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
                        poll_interval=0.02, max_msg_bytes=DEFAULT_MAX_MSG_BYTES,
                        connect_timeout=10.0, reconnect=False, reconnect_timeout=30.0,
                        fault_hook=None, tls=None, tls_hostname=None,
-                       data_dir=None, data_source=None, data_tokenizer=None):
+                       data_dir=None, data_source=None, data_tokenizer=None,
+                       max_batch_size=None):
     """Train path-tasks for a sharded scheduler + parameter servers.
 
     Per task: lease from the scheduler, fetch the path's modules from the owning
@@ -505,6 +518,9 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
     ps_conns: dict = {}          # (host, port) -> connected socket
     residuals: dict = {}         # path -> {key: [tensors]}: compression error feedback
     data_ctx = {"dir": data_dir, "source": data_source, "tokenizer": data_tokenizer}
+    caps = {"device": str(device)}
+    if max_batch_size is not None:
+        caps["max_batch"] = int(max_batch_size)
     state = {"done": 0}
 
     first = True
@@ -520,7 +536,7 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
         clean = False
         try:
             clean = _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions,
-                                   ps_conns, residuals, data_ctx, state, auth_key,
+                                   ps_conns, residuals, data_ctx, caps, state, auth_key,
                                    max_msg_bytes, connect_timeout, heartbeat_interval,
                                    poll_interval, max_tasks, fault_hook, tls=tls)
         except (OSError, ConnectionError):
@@ -549,9 +565,9 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
 
 
 def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_conns,
-                   residuals, data_ctx, state, auth_key, max_msg_bytes, connect_timeout,
-                   heartbeat_interval, poll_interval, max_tasks, fault_hook,
-                   *, tls=None) -> bool:
+                   residuals, data_ctx, caps, state, auth_key, max_msg_bytes,
+                   connect_timeout, heartbeat_interval, poll_interval, max_tasks,
+                   fault_hook, *, tls=None) -> bool:
     """One scheduler connection: serve tasks. Returns True on a clean finish (stop /
     budget), raises ``OSError`` on a disconnect (so the caller can reconnect)."""
     send_lock = threading.Lock()
@@ -568,14 +584,15 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
 
     while True:
         sch_send({"type": "request", "worker_id": wid,
-                  "warm_paths": list(warm), "cached_shards": list(shard_cache)})
+                  "warm_paths": list(warm), "cached_shards": list(shard_cache),
+                  "capabilities": caps})
         task = recv_msg(sch, max_msg_bytes)
         if task is None:
             raise OSError("scheduler disconnected")  # not a clean stop -> reconnect
         if task["type"] == "stop":
             return True
         if task["type"] == "idle":
-            time.sleep(poll_interval)
+            time.sleep(task.get("retry_in") or poll_interval)  # server-paced when set
             continue
 
         path = task["path"]

@@ -174,7 +174,8 @@ def run_coordinator(cfg: LaunchConfig, *, on_start=None):
         staleness_bound=cfg.transport.staleness_bound,
         staleness_weight=cfg.transport.staleness_weight,
         max_update_norm=cfg.transport.max_update_norm,
-        compress=cfg.transport.compress, **_server_kw(cfg))
+        compress=cfg.transport.compress,
+        idle_backoff=cfg.transport.idle_backoff, **_server_kw(cfg))
     server.start()
     _attach_metrics(server, cfg)
     if on_start:
@@ -202,7 +203,8 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None):
         staleness_weight=cfg.transport.staleness_weight,
         heartbeat_timeout=cfg.transport.heartbeat_timeout,
         ps_tls=build_tls_client(cfg), grant_key=cfg.transport.grant_key,
-        compress=cfg.transport.compress, **_server_kw(cfg))
+        compress=cfg.transport.compress,
+        idle_backoff=cfg.transport.idle_backoff, **_server_kw(cfg))
     scheduler.start()
     _attach_metrics(scheduler, cfg)
     if on_start:
@@ -257,7 +259,7 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             auth_key=cfg.transport.auth_key, max_tasks=mt, reconnect=True,
             heartbeat_interval=cfg.transport.heartbeat_interval,
             tls=build_tls_client(cfg), tls_hostname=cfg.tls.server_hostname,
-            data_dir=data_dir)
+            data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch)
     else:
         host, port = addr or cfg.connect_addr()
         run_worker(
@@ -265,7 +267,7 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             auth_key=cfg.transport.auth_key, max_tasks=mt,
             heartbeat_interval=cfg.transport.heartbeat_interval,
             tls=build_tls_client(cfg), tls_hostname=cfg.tls.server_hostname,
-            data_dir=data_dir)
+            data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch)
 
 
 def run_local(cfg: LaunchConfig):

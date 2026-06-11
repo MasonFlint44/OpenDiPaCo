@@ -114,7 +114,13 @@ def run_inner_steps(
     Factored out of :meth:`DiPaCoEngine._inner_train` so the async scheduler can
     reuse the *exact* same numerics (the LR schedule, grad clip, and step) with
     its own per-task RNG. Returns the last batch's loss.
+
+    With ``diloco.inner_autocast`` the forward/loss runs under bf16 autocast;
+    parameters and gradients stay fp32 (bf16 needs no GradScaler), so the
+    pseudo-gradient and clipping are unchanged in dtype.
     """
+    device_type = torch.device(device).type
+    autocast_on = getattr(diloco, "inner_autocast", False)
     last_loss = 0.0
     pm.train()
     for i, batch in enumerate(_iter_batches(shard, batch_size, inner_steps, gen)):
@@ -122,7 +128,10 @@ def run_inner_steps(
             group["lr"] = inner_lr_at(base_step + i, total_steps, diloco)
         batch = batch.to(device)
         opt.zero_grad(set_to_none=True)
-        _, loss = pm(batch, labels=batch)
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16,
+                            enabled=autocast_on):
+            _, loss = pm(batch, labels=batch)
+        loss = loss.float()
         loss.backward()
         if diloco.inner_grad_clip is not None:
             nn.utils.clip_grad_norm_(pm.parameters(), diloco.inner_grad_clip)

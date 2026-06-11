@@ -118,7 +118,7 @@ class ShardCache:
         """Return ``(docs, next_index)`` -- ``([], 0)`` if nothing is cached yet."""
         if not self.path.exists():
             return [], 0
-        blob = torch.load(self.path, weights_only=False)
+        blob = torch.load(self.path, weights_only=True)
         return list(blob["docs"]), int(blob["next_index"])
 
     def save(self, docs: list[torch.Tensor], next_index: int) -> None:

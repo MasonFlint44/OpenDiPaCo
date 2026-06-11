@@ -154,6 +154,10 @@ class DiLoCoConfig:
     inner_betas: tuple[float, float] = (0.9, 0.95)
     inner_weight_decay: float = 0.1
     inner_grad_clip: float | None = 1.0
+    # Run the inner forward/backward under bf16 autocast (mixed precision).
+    # Parameters, gradients, and the pseudo-gradient stay fp32 (master weights);
+    # bf16 needs no loss scaling. ~2x throughput/memory on consumer GPUs.
+    inner_autocast: bool = False
 
     # Inner LR schedule over the *whole* run (paper: cosine, peak 4e-4). Needs the
     # total number of rounds, which ``DiPaCoEngine.fit`` supplies automatically;

@@ -149,29 +149,39 @@ egress scales O(workers) — with the payloads of §1.2, even ~50 volunteers sat
 bounds swarm size, and it remains a SPOF with checkpoint/restart as the only
 recovery. **This is the finding the P2P plan (§2) addresses.**
 
-#### 1.9 Work granularity doesn't fit a swarm · [design]
+#### 1.9 Work granularity doesn't fit a swarm · [design] · ◑ idle pacing done
 
-At most `num_paths` leases can be in flight (one lease per path,
-`distributed.py:157-160`). Surplus workers spin on `idle` at `poll_interval=0.02 s`
-— 50 control requests/sec *per idle worker*, no server-driven backoff. A
-1,000-volunteer swarm with 256 paths means ~750 workers hammering the coordinator
-for nothing. Redundant execution (§1.1) would absorb the oversupply and provide the
-agreement signal at the same time.
+**✅ Server-driven idle backoff is in**: with `idle_backoff` set
+(`TransportCfg.idle_backoff`), idle replies carry `retry_in` and workers wait
+that long instead of hammering at their own `poll_interval` — the poll-storm
+half of this finding is closed. **Still open (the structural half):** at most
+`num_paths` leases can be in flight (one lease per path), so surplus workers
+have nothing to do but wait. Redundant execution (§1.1 / Phase 3) absorbs the
+oversupply and provides the agreement signal at the same time.
 
-#### 1.10 No accommodation for heterogeneous hardware · [design]
+#### 1.10 No accommodation for heterogeneous hardware · [design] · ◑ basics done
 
-One global `batch_size` / `inner_steps` for every worker; no capability negotiation,
-no per-worker task sizing, no mixed precision in the inner loop (`run_inner_steps`
-is pure fp32 — consumer GPUs lose ~2× throughput and memory headroom without
-bf16/AMP). Slow workers are handled only by lease timeout + staleness damping, i.e.
-their work tends to be *discarded* rather than right-sized.
+**✅ The basics are in**: `DiLoCoConfig.inner_autocast` runs the inner
+forward/backward under **bf16 autocast** (params/grads/pseudo-gradients stay
+fp32; no loss scaling — ~2× throughput/memory on consumer GPUs), and workers
+advertise a **capability profile** on every request (`device`, plus an optional
+`max_batch_size=` / `run.worker_max_batch` cap that the server clamps task batch
+sizes to — a small-VRAM volunteer trains smaller batches instead of
+OOM-crash-looping; note the documented caveat that a capped worker's paths see
+different batch statistics). Verified by `tests/test_heterogeneity.py`, including
+bit-identity of the default fp32 path. **Still open:** task sizing from
+*measured* throughput (the capability profile is a place to put it), and
+per-worker `inner_steps` (deliberately untouched — it changes the inner LR
+schedule semantics).
 
 ### P2 — hardening / hygiene
 
-- **1.11 `torch.load(weights_only=False)`** on checkpoint/scheduler/shard files
-  (`checkpoint.py:92`, `sharded.py:139`, `sharded.py:322`) · [bug-adjacent]. Local
-  files today, but in a real deployment checkpoints land on shared storage and
-  become a code-execution vector.
+- **1.11 `torch.load(weights_only=False)`** · [bug-adjacent] · ✅ fixed — every
+  checkpoint/shard/cache load (engine ranks, coordinator extra, PS shards,
+  scheduler clock, shard caches, document caches) now uses `weights_only=True`;
+  the corpus classes are the only allow-listed non-primitives
+  (`torch.serialization.add_safe_globals`). Checkpoint files are no longer a
+  code-execution vector.
 - **1.12 Stale, alarming docstring** · [bug] · ✅ fixed — `schedule/distributed.py`'s
   module docstring claimed the wire format was `torch.save`/unpickles; it now
   describes the pickle-free codec (and the lease fence).
@@ -328,7 +338,7 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
 | ~~0b~~ ✅ | ~~Update validation (NaN/norm/loss)~~ | **Done** — 1.1 (the faulty-hardware half; malice needs Phase 3) | S |
 | ~~0c~~ ✅ | ~~Compression (bf16 + int8 grads + error feedback)~~ | **Done** — 1.2 (2× down / 4× up measured; delta-encoding + convergence validation remain) | M |
 | ~~0d~~ ✅ | ~~Data decentralization (shard ids + worker-side ingest + local routing)~~ | **Done** — 1.3 (`data.ship: spec`; router fitting + EM still central) | M |
-| 0e | bf16 inner loop, capability negotiation, idle backoff, hygiene | 1.10, 1.9 (partial), 1.11, 1.12 | S–M |
+| ~~0e~~ ✅ | ~~bf16 inner loop, capability negotiation, idle backoff, hygiene~~ | **Done** — 1.10 (autocast + batch caps), 1.9 (idle pacing), 1.11, 1.12 | S–M |
 | 0f | WAN validation run of the async path | 1.4 | M (mostly wall-clock) |
 | 1 | Peer identity + tracker + reachability tiers | 1.13, 1.8 (prereq) | M |
 | 2 | Replicated module owners, dynamic ownership, signed manifests | 1.8 | L |

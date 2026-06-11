@@ -95,6 +95,7 @@ class CoordinatorServer(_ReactorServer):
         rescale_by_sqrt_sharing: bool = False,
         max_update_norm: float | None = None,
         compress: str = "none",
+        idle_backoff: float | None = None,
         io_threads: int = 4,
         max_connections: int = 1024,
         tls=None,
@@ -121,6 +122,11 @@ class CoordinatorServer(_ReactorServer):
         # Wire compression policy; stamped on every task so workers follow it
         # (see ``compress.py``). Receivers are self-describing either way.
         self.compress = check_mode(compress)
+        # Server-driven idle pacing: when set, idle replies carry ``retry_in``
+        # and workers wait that long before polling again (instead of their own
+        # tight ``poll_interval``) -- a swarm of surplus workers stops hammering.
+        self.idle_backoff = idle_backoff
+        self._worker_caps: dict = {}  # worker_id -> advertised capability profile
         self.heartbeat_timeout = (
             heartbeat_timeout if heartbeat_timeout is not None else scheduler.lease_timeout
         )
@@ -163,23 +169,43 @@ class CoordinatorServer(_ReactorServer):
         super().simulate_crash()
 
     # -- async task lease / collect ------------------------------------------
+    def _idle(self) -> dict:
+        msg = {"type": "idle"}
+        if self.idle_backoff is not None:
+            msg["retry_in"] = self.idle_backoff
+        return msg
+
+    def _task_batch_size(self, caps: dict) -> int:
+        """The task's batch size, capped by the worker's advertised maximum.
+
+        Lets a memory-constrained volunteer train smaller batches instead of
+        OOM-crash-looping. Note this is a *semantic* knob: a capped worker takes
+        the same number of inner steps on smaller batches, so its paths see
+        different batch statistics (acceptable in async mode, opt-in).
+        """
+        cap = (caps or {}).get("max_batch")
+        return max(1, min(self.batch_size, int(cap))) if cap else self.batch_size
+
     def _next_task(self, req: dict) -> dict:
         wid = req.get("worker_id")
         warm = {tuple(p) for p in req.get("warm_paths", [])}
         cached = {tuple(p) for p in req.get("cached_shards", [])}
         have_ver = req.get("have_shared", {})
+        caps = req.get("capabilities") or {}
         e = self.engine
 
         with self._lock:  # one lock guards both scheduling state and the bank
+            if caps:
+                self._worker_caps[wid] = caps
             if not self._serving or self._T >= self._target:
-                return {"type": "stop"} if self._stop else {"type": "idle"}
+                return {"type": "stop"} if self._stop else self._idle()
             self._reclaim_inflight_locked()
             # Eligible = paths not already in flight. Pick the *least-completed* one
             # (balances progress, bounds staleness); tie-break toward a path this
             # worker holds warm (data locality).
             eligible = [p for p in self._completed if p not in self._inflight]
             if not eligible:
-                return {"type": "idle"}
+                return self._idle()
             path = min(eligible, key=lambda p: (self._completed[p], p not in warm, p))
             lease = uuid.uuid4().hex  # unique per lease; fences submit/nack/heartbeat
             self._owner[path] = wid
@@ -221,7 +247,7 @@ class CoordinatorServer(_ReactorServer):
             "private_weights": private_weights,
             "shard": compress_shard(shard, self.compress),
             "shard_spec": shard_spec,
-            "batch_size": self.batch_size,
+            "batch_size": self._task_batch_size(caps),
             "total_rounds": e.total_rounds,
             "seed": self.sched.seed,
         }
@@ -432,6 +458,7 @@ def run_worker(
     data_dir: str | None = None,
     data_source=None,
     data_tokenizer=None,
+    max_batch_size: int | None = None,
 ):
     """Connect to a coordinator and train leased path-tasks until told to stop.
 
@@ -456,6 +483,12 @@ def run_worker(
     ``data/spec.py``): ``data_dir`` keeps materialized shards on disk across
     restarts; ``data_source`` / ``data_tokenizer`` override the spec's stream
     and tokenizer (tests, non-C4 corpora).
+
+    ``max_batch_size`` advertises a memory cap: the coordinator ships this
+    worker tasks with ``batch_size`` clamped to it, so a small-VRAM volunteer
+    trains smaller batches instead of OOM-crash-looping (a semantic knob --
+    that worker's paths see different batch statistics). Idle replies may carry
+    a server-chosen ``retry_in``, which overrides ``poll_interval``.
     """
     engine = _build_worker_engine(config, diloco, device, seed)
     worker = AsyncScheduler(engine, num_workers=1)
@@ -466,6 +499,9 @@ def run_worker(
     attempts: dict = {}
     residuals: dict = {}     # path -> {key: [tensors]}: compression error feedback
     data_ctx = {"dir": data_dir, "source": data_source, "tokenizer": data_tokenizer}
+    caps = {"device": str(device)}
+    if max_batch_size is not None:
+        caps["max_batch"] = int(max_batch_size)
     state = {"done": 0}
 
     first = True
@@ -483,7 +519,7 @@ def run_worker(
         try:
             done = _serve_connection(
                 conn, engine, worker, wid, warm, shard_cache, versions, attempts,
-                residuals, data_ctx, state, poll_interval, heartbeat_interval,
+                residuals, data_ctx, caps, state, poll_interval, heartbeat_interval,
                 max_msg_bytes, max_tasks, fault_hook,
             )
         finally:
@@ -498,7 +534,7 @@ def run_worker(
 
 
 def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
-                      attempts, residuals, data_ctx, state, poll_interval,
+                      attempts, residuals, data_ctx, caps, state, poll_interval,
                       heartbeat_interval, max_msg_bytes, max_tasks, fault_hook) -> bool:
     """Serve tasks on one connection. Returns True on a clean finish (stop /
     budget reached), False on a disconnect (caller may reconnect)."""
@@ -514,6 +550,7 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
                 "type": "request", "worker_id": wid,
                 "have_shared": versions, "warm_paths": list(warm),
                 "cached_shards": list(shard_cache),
+                "capabilities": caps,
             })
             msg = recv_msg(conn, max_msg_bytes)
         except (OSError, ValueError):
@@ -523,7 +560,7 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
         if msg["type"] == "stop":
             return True
         if msg["type"] == "idle":
-            time.sleep(poll_interval)
+            time.sleep(msg.get("retry_in") or poll_interval)  # server-paced when set
             continue
 
         path = msg["path"]
