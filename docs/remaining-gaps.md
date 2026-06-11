@@ -5,6 +5,11 @@ This document is broader: it captures what's still missing across the **whole pr
 including the items that were explicitly *out of scope* of the 11-gap transport list, so
 we have one honest map of where this stands.
 
+This map is written against the "reproduce DiPaCo on a cluster" goal. For the
+**volunteer-internet / consumer-hardware** goal — a different lens with different
+severities — see [`internet-scale-plan.md`](internet-scale-plan.md), which also holds
+the peer-to-peer transition plan.
+
 Each gap is tagged:
 - **severity** — P0 (blocks the project's purpose) · P1 (needed for real use) · P2 (hardening/ops) · P3 (nice-to-have)
 - whether it's a **deliberate scope decision** (a choice we made, documented) vs. genuinely **unfinished**.
