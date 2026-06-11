@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "An open implementation of DiPaCo (Distributed Path Composition) for modular, low-communication language-model training."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = { text = "MIT" }
 authors = [{ name = "Mason Flint" }]
 keywords = ["dipaco", "diloco", "distributed-training", "mixture-of-experts", "language-models"]
 dependencies = [
