@@ -1,5 +1,6 @@
 # opendipaco
 
+[![CI](https://github.com/MasonFlint44/OpenDiPaCo/actions/workflows/ci.yml/badge.svg)](https://github.com/MasonFlint44/OpenDiPaCo/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](pyproject.toml)
 [![arXiv](https://img.shields.io/badge/arXiv-2403.10616-b31b1b.svg)](https://arxiv.org/abs/2403.10616)
