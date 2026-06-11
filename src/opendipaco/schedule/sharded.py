@@ -52,6 +52,7 @@ from .compress import (
 )
 from .distributed import (
     _build_worker_engine,
+    _commit_residuals,
     _compress_contribution,
     _load_into,
     _load_private,
@@ -642,10 +643,11 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
         if ack.get("accepted"):
             grant = ack["grant"]  # carries the push weight + allowed keys to the PSs
             # Encode only after acceptance, so the error-feedback residual always
-            # reflects an update that was actually pushed.
-            shared_payload, private_payload = _compress_contribution(
+            # reflects an update that is actually pushed.
+            shared_payload, private_payload, pending_res = _compress_contribution(
                 contrib, task.get("compress") or "none", residuals, path
             )
+            _commit_residuals(residuals, path, pending_res)
             for addr, keys in by_ps.items():
                 updates = {k: {"grad": shared_payload[k]}
                            for k in keys if not is_private_key(k) and k in shared_payload}

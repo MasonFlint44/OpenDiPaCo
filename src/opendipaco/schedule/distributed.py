@@ -150,8 +150,11 @@ class CoordinatorServer(_ReactorServer):
         if kind == "request":
             return self._next_task(msg)
         if kind == "submit":
-            self._receive(msg)
-            return {"type": "ack"}
+            # ``applied`` tells the worker whether the update reached the bank,
+            # so it can commit its error-feedback residual only for updates that
+            # actually landed (a rejected/stale submit must not leak into the
+            # next generation's carry).
+            return {"type": "ack", "applied": self._receive(msg)}
         if kind == "nack":
             self._nack(msg)
         elif kind == "heartbeat":
@@ -252,7 +255,8 @@ class CoordinatorServer(_ReactorServer):
             "seed": self.sched.seed,
         }
 
-    def _receive(self, msg: dict) -> None:
+    def _receive(self, msg: dict) -> bool:
+        """Apply one submitted contribution; return True iff it reached the bank."""
         path = msg["path"]
         e = self.engine
         # Decode + validate outside the lock (O(params) CPU work must not stall
@@ -273,16 +277,16 @@ class CoordinatorServer(_ReactorServer):
         )
         with self._lock:  # serialize with scheduling + other outer steps
             if path not in self._inflight or msg.get("lease") != self._lease.get(path):
-                return  # stale / duplicate / reclaimed / not the current lease holder
+                return False  # stale / duplicate / reclaimed / not the lease holder
             staleness = self._T - self._issued.get(path, self._T)
             self._inflight.pop(path, None)
             self._lease.pop(path, None)
             if staleness > self.staleness_bound:
                 self.metrics.record_stale_reject()  # too stale -> discard, re-eligible
-                return
+                return False
             if not valid:
                 self.metrics.record_invalid_reject()  # dropped; the path is re-eligible
-                return
+                return False
             if self.max_update_norm is not None:
                 for delta in shared.values():
                     if clip_norm_(delta, self.max_update_norm) > self.max_update_norm:
@@ -303,6 +307,7 @@ class CoordinatorServer(_ReactorServer):
                 self._outer_opts[key].zero_grad(set_to_none=True)
                 self._versions[key] += 1
             self.metrics.record_update(staleness)
+            return True
 
     def _nack(self, msg: dict) -> None:
         path = msg["path"]
@@ -600,7 +605,7 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
         stop_beat.set()
         beat.join(timeout=1)
         mode = msg.get("compress") or "none"
-        shared_payload, private_payload = _compress_contribution(
+        shared_payload, private_payload, pending_res = _compress_contribution(
             contrib, mode, residuals, path
         )
         try:
@@ -610,9 +615,14 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
                 "shared_grad": shared_payload,
                 "private_weights": private_payload,
             })
-            recv_msg(conn, max_msg_bytes)  # ack
+            ack = recv_msg(conn, max_msg_bytes)
         except OSError:
             return False
+        # Acceptance-aware error feedback: adopt the residual only if the
+        # coordinator applied the update (rejected/stale/dropped submits keep
+        # the previous carry, like the sharded worker's encode-after-commit).
+        if ack and ack.get("applied"):
+            _commit_residuals(residuals, path, pending_res)
         state["done"] += 1
         if max_tasks is not None and state["done"] >= max_tasks:
             return True
@@ -639,21 +649,31 @@ def _build_worker_engine(config, diloco, device, seed):
 def _compress_contribution(contrib, mode, residuals, path):
     """Encode a contribution's uplink payloads per the server's compress policy.
 
-    In "bf16"/"int8" mode the per-(path, module) quantization residual is carried
-    in ``residuals`` and folded into the next generation's delta (error
-    feedback), so encoding error accumulates into later updates instead of
-    being lost. Returns ``(shared_payload, private_payload)``.
+    In "bf16"/"int8" mode the per-(path, module) quantization residual is the
+    error-feedback carry: it is folded into this delta before encoding, and the
+    *new* residual is returned as ``pending`` — **not** written back. The caller
+    must commit it (:func:`_commit_residuals`) only once the server confirms the
+    update was applied; committing for a rejected/stale/lost submit would both
+    discard the previous legitimate carry and leak the dead update's rounding
+    error into a later accepted one. Returns
+    ``(shared_payload, private_payload, pending_residuals | None)``.
     """
     if mode == "none":
-        return contrib.shared_delta, contrib.private_state
-    pres = residuals.setdefault(path, {})
-    shared_payload = {}
+        return contrib.shared_delta, contrib.private_state, None
+    carry = residuals.get(path) or {}
+    shared_payload, pending = {}, {}
     for key, delta in contrib.shared_delta.items():
-        payload, res = compress_delta(delta, mode, carry=pres.get(key))
-        pres[key] = res
+        payload, res = compress_delta(delta, mode, carry=carry.get(key))
+        pending[key] = res
         shared_payload[key] = payload
     private_payload = {k: compress_state(sd, mode) for k, sd in contrib.private_state.items()}
-    return shared_payload, private_payload
+    return shared_payload, private_payload, pending
+
+
+def _commit_residuals(residuals, path, pending) -> None:
+    """Adopt a contribution's error-feedback residuals after the server applied it."""
+    if pending:  # per-key update: an empty contribution must not wipe the carry
+        residuals.setdefault(path, {}).update(pending)
 
 
 def _apply_task(engine, msg, shard_cache, versions, warm, residuals,

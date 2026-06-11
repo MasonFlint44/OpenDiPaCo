@@ -245,6 +245,73 @@ def test_sharded_int8_run_completes_and_trains():
         assert _maxdiff(before, _snap(ps.bank)) > 1e-4   # every shard still trains
 
 
+def test_submit_ack_reports_applied_and_residuals_stay_pure():
+    """The coordinator's submit ack carries ``applied`` (True only when the update
+    reached the bank), and ``_compress_contribution`` no longer mutates the
+    residual store — the worker commits it only on a positive ack, so a
+    rejected/stale submit can neither discard the previous error-feedback carry
+    nor leak its own rounding error into a later accepted update."""
+    from opendipaco.optim.diloco import make_outer_optimizer
+    from opendipaco.schedule.scheduler import Contribution
+    from opendipaco.schedule.distributed import (
+        _commit_residuals,
+        _compress_contribution,
+    )
+    from opendipaco.topology import is_private_key
+
+    cfg = _cfg()
+    eng = _engine(cfg)
+    server = CoordinatorServer(AsyncScheduler(eng, lease_timeout=5.0), _corpus(cfg),
+                               batch_size=BATCH, host="127.0.0.1", port=0,
+                               compress="int8")
+    server._outer_opts = {k: make_outer_optimizer({k: eng.bank[k]}, eng.diloco)
+                          for k in server._versions}
+    with server._lock:
+        server._serving = True
+        server._target = 10 ** 9
+        server._completed = {p: 0 for p in eng.topology.paths()}
+    req = {"worker_id": "w", "warm_paths": [], "cached_shards": [], "have_shared": {}}
+
+    # Build a worker-side contribution and encode it (residual store untouched).
+    task = server._next_task(req)
+    path = task["path"]
+    shared_keys = [k for k in eng.topology.path_module_keys(path) if not is_private_key(k)]
+    delta = {k: [torch.full_like(p, 0.123) for p in eng.bank[k].parameters()]
+             for k in shared_keys}
+    contrib = Contribution(path, eng.topology.path_index(path), 0.1, delta, {}, {})
+    residuals: dict = {}
+    payload, _priv, pending = _compress_contribution(contrib, "int8", residuals, path)
+    assert residuals == {}                       # encoding is pure: nothing committed
+    assert pending and all(pending[k] for k in shared_keys)
+
+    # A zombie submit (wrong lease) is refused: ack says not applied.
+    ack = server._handle({"type": "submit", "path": path, "lease": "dead-token",
+                          "shared_grad": payload, "private_weights": {}, "loss": 0.1}, 0)
+    assert ack == {"type": "ack", "applied": False}
+
+    # The live lease's submit is applied: ack says so; the worker then commits.
+    ack = server._handle({"type": "submit", "path": path, "lease": task["lease"],
+                          "shared_grad": payload, "private_weights": {}, "loss": 0.1}, 0)
+    assert ack == {"type": "ack", "applied": True}
+    _commit_residuals(residuals, path, pending)
+    assert set(residuals[path]) == set(shared_keys)
+
+    # An invalid (NaN) submit on a fresh lease is also reported as not applied.
+    task2 = server._next_task(req)
+    bad = {k: [torch.full_like(p, float("nan")) for p in eng.bank[k].parameters()]
+           for k in shared_keys}
+    ack = server._handle({"type": "submit", "path": task2["path"], "lease": task2["lease"],
+                          "shared_grad": bad, "private_weights": {}, "loss": 0.1}, 0)
+    assert ack == {"type": "ack", "applied": False}
+
+    # An empty pending commit must not wipe an existing carry.
+    before = {k: [t.clone() for t in v] for k, v in residuals[path].items()}
+    _commit_residuals(residuals, path, {})
+    assert all(torch.equal(a, b) for k in before
+               for a, b in zip(before[k], residuals[path][k]))
+    server.shutdown()
+
+
 def test_compress_mode_is_validated():
     import pytest
     cfg = _cfg()
