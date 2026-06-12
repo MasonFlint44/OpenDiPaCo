@@ -24,9 +24,12 @@ warm, so optimizer/private/shard state stays cached. Fault tolerance is unchange
 ships it the current private modules). New workers connect any time; a worker
 whose connection blips **reconnects** and resumes (its warm caches survive).
 
-Wire format: each message is an 8-byte big-endian length followed by a
-``torch.save`` payload (so tensors travel natively). NOTE: ``torch.load`` unpickles,
-so only run this between mutually trusting hosts on a trusted network.
+Wire format: the pickle-free framed codec in ``wire.py`` (8-byte length prefix,
+JSON structure + raw tensor blobs decoded against a dtype allowlist -- nothing on
+the wire is unpickled). Every lease carries a unique token that the worker must
+echo on submit/nack/heartbeat; a submission whose token doesn't match the current
+lease is dropped, so a reclaimed-and-re-leased path can't be hijacked by a zombie
+worker (and the fresher result silently discarded).
 """
 
 from __future__ import annotations
@@ -43,9 +46,19 @@ import torch
 
 from ..backend.local import LocalBackend
 from ..checkpoint import latest_checkpoint, load_checkpoint, save_checkpoint
+from ..data.spec import materialize_shard
 from ..optim.diloco import apply_outer_grads, make_outer_optimizer
 from ..topology import is_private_key
-from ..train.loop import _state_to_cpu
+from ..train.loop import _optimizer_state_to_cpu, _state_to_cpu
+from .compress import (
+    check_mode,
+    compress_delta,
+    compress_shard,
+    compress_state,
+    maybe_dequantize,
+    restore_shard,
+)
+from .guard import clip_norm_, contribution_ok
 from .reactor import TransportMetrics, _ReactorServer  # noqa: F401 (re-exported)
 from .scheduler import AsyncScheduler
 from .wire import DEFAULT_MAX_MSG_BYTES, client_handshake, recv_msg, send_msg
@@ -80,6 +93,9 @@ class CoordinatorServer(_ReactorServer):
         staleness_bound: int | None = None,
         staleness_weight: str = "inverse",
         rescale_by_sqrt_sharing: bool = False,
+        max_update_norm: float | None = None,
+        compress: str = "none",
+        idle_backoff: float | None = None,
         io_threads: int = 4,
         max_connections: int = 1024,
         tls=None,
@@ -99,6 +115,18 @@ class CoordinatorServer(_ReactorServer):
         self.staleness_bound = staleness_bound if staleness_bound is not None else 2 * n_paths
         self.staleness_weight = staleness_weight
         self.rescale_by_sqrt_sharing = rescale_by_sqrt_sharing
+        # Guard rails on what a worker may apply to the bank: non-finite
+        # contributions are always rejected; a norm cap (off by default) clips
+        # oversized pseudo-gradients per module (see ``guard.py``).
+        self.max_update_norm = max_update_norm
+        # Wire compression policy; stamped on every task so workers follow it
+        # (see ``compress.py``). Receivers are self-describing either way.
+        self.compress = check_mode(compress)
+        # Server-driven idle pacing: when set, idle replies carry ``retry_in``
+        # and workers wait that long before polling again (instead of their own
+        # tight ``poll_interval``) -- a swarm of surplus workers stops hammering.
+        self.idle_backoff = idle_backoff
+        self._worker_caps: dict = {}  # worker_id -> advertised capability profile
         self.heartbeat_timeout = (
             heartbeat_timeout if heartbeat_timeout is not None else scheduler.lease_timeout
         )
@@ -114,6 +142,7 @@ class CoordinatorServer(_ReactorServer):
         self._completed: dict = {}
         self._inflight: dict = {}           # path -> heartbeat deadline (one lease per path)
         self._issued: dict = {}             # path -> _T at lease time (for staleness)
+        self._lease: dict = {}              # path -> current lease token (fences submits)
         self._outer_opts: dict = {}         # shared key -> per-module SGD+Nesterov
 
     def _handle(self, msg: dict, nbytes: int):
@@ -121,8 +150,11 @@ class CoordinatorServer(_ReactorServer):
         if kind == "request":
             return self._next_task(msg)
         if kind == "submit":
-            self._receive(msg)
-            return {"type": "ack"}
+            # ``applied`` tells the worker whether the update reached the bank,
+            # so it can commit its error-feedback residual only for updates that
+            # actually landed (a rejected/stale submit must not leak into the
+            # next generation's carry).
+            return {"type": "ack", "applied": self._receive(msg)}
         if kind == "nack":
             self._nack(msg)
         elif kind == "heartbeat":
@@ -140,75 +172,140 @@ class CoordinatorServer(_ReactorServer):
         super().simulate_crash()
 
     # -- async task lease / collect ------------------------------------------
+    def _idle(self) -> dict:
+        msg = {"type": "idle"}
+        if self.idle_backoff is not None:
+            msg["retry_in"] = self.idle_backoff
+        return msg
+
+    def _task_batch_size(self, caps: dict) -> int:
+        """The task's batch size, capped by the worker's advertised maximum.
+
+        Lets a memory-constrained volunteer train smaller batches instead of
+        OOM-crash-looping. Note this is a *semantic* knob: a capped worker takes
+        the same number of inner steps on smaller batches, so its paths see
+        different batch statistics (acceptable in async mode, opt-in).
+        """
+        cap = (caps or {}).get("max_batch")
+        return max(1, min(self.batch_size, int(cap))) if cap else self.batch_size
+
     def _next_task(self, req: dict) -> dict:
         wid = req.get("worker_id")
         warm = {tuple(p) for p in req.get("warm_paths", [])}
         cached = {tuple(p) for p in req.get("cached_shards", [])}
         have_ver = req.get("have_shared", {})
+        caps = req.get("capabilities") or {}
         e = self.engine
 
         with self._lock:  # one lock guards both scheduling state and the bank
+            if caps:
+                self._worker_caps[wid] = caps
             if not self._serving or self._T >= self._target:
-                return {"type": "stop"} if self._stop else {"type": "idle"}
+                return {"type": "stop"} if self._stop else self._idle()
             self._reclaim_inflight_locked()
             # Eligible = paths not already in flight. Pick the *least-completed* one
             # (balances progress, bounds staleness); tie-break toward a path this
             # worker holds warm (data locality).
             eligible = [p for p in self._completed if p not in self._inflight]
             if not eligible:
-                return {"type": "idle"}
+                return self._idle()
             path = min(eligible, key=lambda p: (self._completed[p], p not in warm, p))
+            lease = uuid.uuid4().hex  # unique per lease; fences submit/nack/heartbeat
             self._owner[path] = wid
             self._inflight[path] = time.monotonic() + self.heartbeat_timeout
             self._issued[path] = self._T
+            self._lease[path] = lease
             generation = self._completed[path]
             versions = dict(self._versions)
             shared_keys = [k for k in e.topology.path_module_keys(path) if not is_private_key(k)]
             private_keys = [k for k in e.topology.path_module_keys(path) if is_private_key(k)]
             # Consistent read of bank weights (the lock also serializes outer steps).
             shared_weights = {
-                k: _state_to_cpu(e.bank[k].state_dict())
+                k: compress_state(_state_to_cpu(e.bank[k].state_dict()), self.compress)
                 for k in shared_keys if have_ver.get(k) != versions[k]
             }
             private_weights = (
-                {k: _state_to_cpu(e.bank[k].state_dict()) for k in private_keys}
+                {k: compress_state(_state_to_cpu(e.bank[k].state_dict()), self.compress)
+                 for k in private_keys}
                 if path not in warm else None
             )
-        shard = self.corpus.shard(e.topology.path_index(path)) if path not in cached else None
+        # Data plane: ship the shard bytes -- or, for a spec corpus, just the
+        # recipe (the worker materializes the shard locally; see data/spec.py).
+        shard, shard_spec = None, None
+        if path not in cached:
+            if hasattr(self.corpus, "spec"):
+                shard_spec = {"path_index": e.topology.path_index(path),
+                              "spec": self.corpus.spec}
+            else:
+                shard = self.corpus.shard(e.topology.path_index(path))
         return {
             "type": "task",
-            "gen_id": generation,            # echoed by the worker; ignored by the async coordinator
+            "gen_id": generation,            # this path's update count (informational)
+            "lease": lease,                  # echoed on submit/nack/heartbeat; fences the lease
             "generation": generation,        # this path's update count -> inner LR schedule
             "path": path,
+            "compress": self.compress,       # uplink encoding the worker should use
             "shared_weights": shared_weights,
             "shared_versions": {k: versions[k] for k in shared_keys},
             "private_weights": private_weights,
-            "shard": shard,
-            "batch_size": self.batch_size,
+            "shard": compress_shard(shard, self.compress),
+            "shard_spec": shard_spec,
+            "batch_size": self._task_batch_size(caps),
             "total_rounds": e.total_rounds,
             "seed": self.sched.seed,
         }
 
-    def _receive(self, msg: dict) -> None:
+    def _receive(self, msg: dict) -> bool:
+        """Apply one submitted contribution; return True iff it reached the bank."""
         path = msg["path"]
         e = self.engine
+        # Decode + validate outside the lock (O(params) CPU work must not stall
+        # task serving). One applied NaN poisons the bank permanently (faulty
+        # consumer hardware produces them; see guard.py). Keys are filtered to
+        # what they claim to be -- an unknown key must not crash the server, and
+        # a "private" payload must not be able to overwrite a shared module.
+        try:
+            shared = {k: maybe_dequantize(v)
+                      for k, v in (msg.get("shared_grad") or {}).items()
+                      if k in self._versions}
+        except (TypeError, KeyError, ValueError):
+            shared = None  # malformed encoding -> invalid contribution
+        private = {k: v for k, v in (msg.get("private_weights") or {}).items()
+                   if is_private_key(k) and k in e.bank}
+        valid = shared is not None and contribution_ok(
+            msg.get("loss"), msg.get("empty"), shared, private
+        )
         with self._lock:  # serialize with scheduling + other outer steps
-            if path not in self._inflight:
-                return  # stale / duplicate / already reclaimed
+            if path not in self._inflight or msg.get("lease") != self._lease.get(path):
+                return False  # stale / duplicate / reclaimed / not the lease holder
             staleness = self._T - self._issued.get(path, self._T)
-            if staleness > self.staleness_bound:
-                self._inflight.pop(path, None)  # too stale -> discard, re-eligible
-                self.metrics.record_stale_reject()
-                return
             self._inflight.pop(path, None)
+            self._lease.pop(path, None)
+            if staleness > self.staleness_bound:
+                self.metrics.record_stale_reject()  # too stale -> discard, re-eligible
+                return False
+            if not valid:
+                self.metrics.record_invalid_reject()  # dropped; the path is re-eligible
+                return False
+            # Restrict to the submitting path's own modules (path is known-valid
+            # past the fence): a lease on path A must not be able to write
+            # another path's private modules or unrelated shared ones. (The
+            # sharded path gets the same property from the grant's key list.)
+            path_keys = set(e.topology.path_module_keys(path))
+            shared = {k: v for k, v in shared.items() if k in path_keys}
+            private = {k: v for k, v in private.items() if k in path_keys}
+            if self.max_update_norm is not None:
+                for delta in shared.values():
+                    if clip_norm_(delta, self.max_update_norm) > self.max_update_norm:
+                        self.metrics.record_norm_clip()
             self._T += 1
             self._completed[path] = self._completed.get(path, 0) + 1
             # Apply the (damped) per-contribution outer step for this path.
             damp = 1.0 / (1.0 + staleness) if self.staleness_weight == "inverse" else 1.0
-            for key, sd in (msg.get("private_weights") or {}).items():
+            for key, sd in private.items():
                 e.bank[key].load_state_dict({n: v.to(e.device) for n, v in sd.items()})
             path_idx = e.topology.path_index(path)
-            for key, delta in (msg.get("shared_grad") or {}).items():
+            for key, delta in shared.items():
                 w = e._outer_weight(key, path_idx, self.corpus) * damp
                 if self.rescale_by_sqrt_sharing:
                     w *= math.sqrt(e.topology.sharing_count(key))
@@ -217,17 +314,24 @@ class CoordinatorServer(_ReactorServer):
                 self._outer_opts[key].zero_grad(set_to_none=True)
                 self._versions[key] += 1
             self.metrics.record_update(staleness)
+            return True
 
     def _nack(self, msg: dict) -> None:
         path = msg["path"]
         with self._lock:
+            # Require a *live* matching lease: a stale nack must not free someone
+            # else's lease, and a nack for a never-leased path must not be able
+            # to grow ``errors`` with arbitrary keys.
+            if path not in self._inflight or msg.get("lease") != self._lease.get(path):
+                return
             self.sched.errors[path] = msg.get("error", "worker nack")
             self._inflight.pop(path, None)  # free the lease; the path becomes re-eligible
+            self._lease.pop(path, None)
 
     def _heartbeat(self, msg: dict) -> None:
         path = msg["path"]
         with self._lock:
-            if path in self._inflight and self._owner.get(path) == msg.get("worker_id"):
+            if path in self._inflight and msg.get("lease") == self._lease.get(path):
                 self._inflight[path] = time.monotonic() + self.heartbeat_timeout
 
     def _reclaim_inflight_locked(self) -> None:
@@ -236,6 +340,7 @@ class CoordinatorServer(_ReactorServer):
         for path, deadline in list(self._inflight.items()):
             if now >= deadline:
                 del self._inflight[path]
+                self._lease.pop(path, None)  # invalidate the token: zombies can't submit
                 self._owner[path] = None
                 self.metrics.reclaims += 1
 
@@ -261,8 +366,9 @@ class CoordinatorServer(_ReactorServer):
         and ``resume`` work as before; the bank is always current.
         """
         e = self.engine
+        restore = None
         if resume and checkpoint_dir and latest_checkpoint(checkpoint_dir):
-            load_checkpoint(e, latest_checkpoint(checkpoint_dir))
+            restore = load_checkpoint(e, latest_checkpoint(checkpoint_dir)).get("extra")
 
         if total_generations is not None:
             e.total_rounds = total_generations
@@ -277,6 +383,19 @@ class CoordinatorServer(_ReactorServer):
             k: make_outer_optimizer({k: e.bank[k]}, e.diloco)
             for k in self._versions
         }
+        # Restore the coordinator's own state alongside the engine's: the async
+        # clock and per-path counts (so the inner LR schedule continues rather
+        # than restarting at generation 0), the shared-module versions (so warm
+        # workers' caches stay meaningful), and the per-key outer Nesterov
+        # momentum (``engine.outer_opt`` is unused on the async path).
+        if restore is not None:
+            with self._lock:
+                self._T = restore["T"]
+                self._completed = dict(restore["completed"])
+                self._versions.update(restore["versions"])
+            for k, sd in restore["outer_opts"].items():
+                if k in self._outer_opts:
+                    self._outer_opts[k].load_state_dict(sd)
         with self._lock:
             self._completed = {p: self._completed.get(p, 0) for p in paths}
             self._inflight = {}
@@ -293,10 +412,9 @@ class CoordinatorServer(_ReactorServer):
             if done or self._stop or self._dead:
                 break
             if checkpoint_dir and checkpoint_every and (self._T - last_ckpt) >= checkpoint_every:
-                save_checkpoint(e, os.path.join(checkpoint_dir, f"upd{self._T:08d}"))
-                last_ckpt = self._T
+                last_ckpt = self._save_cluster_checkpoint(checkpoint_dir)
                 if log_every:
-                    print(f"[async] T={self._T}/{self._target} "
+                    print(f"[async] T={last_ckpt}/{self._target} "
                           f"{self.metrics.report().splitlines()[0]}", flush=True)
             time.sleep(reclaim_interval)
 
@@ -304,8 +422,30 @@ class CoordinatorServer(_ReactorServer):
             self._serving = False
         self.metrics._wall += time.monotonic() - t0
         if checkpoint_dir and checkpoint_every:
-            save_checkpoint(e, os.path.join(checkpoint_dir, f"upd{self._T:08d}"))
+            self._save_cluster_checkpoint(checkpoint_dir)
         return dict(self._completed)
+
+    def _save_cluster_checkpoint(self, checkpoint_dir: str) -> int:
+        """Checkpoint the engine plus the coordinator's async state, consistently.
+
+        Held under ``_lock`` so the snapshot can't interleave with a concurrent
+        ``_receive`` outer step (serving pauses for the duration of the write).
+        Returns the clock value the checkpoint captured.
+        """
+        with self._lock:
+            extra = {
+                "T": self._T,
+                "completed": dict(self._completed),
+                "versions": dict(self._versions),
+                "outer_opts": {
+                    k: _optimizer_state_to_cpu(o.state_dict())
+                    for k, o in self._outer_opts.items()
+                },
+            }
+            save_checkpoint(
+                self.engine, os.path.join(checkpoint_dir, f"upd{self._T:08d}"), extra=extra
+            )
+            return self._T
 
 
 # -- worker ------------------------------------------------------------------
@@ -330,6 +470,10 @@ def run_worker(
     fault_hook=None,
     tls=None,
     tls_hostname: str | None = None,
+    data_dir: str | None = None,
+    data_source=None,
+    data_tokenizer=None,
+    max_batch_size: int | None = None,
 ):
     """Connect to a coordinator and train leased path-tasks until told to stop.
 
@@ -348,6 +492,18 @@ def run_worker(
     ``max_tasks`` makes the worker leave cleanly after that many tasks (elastic
     membership). ``reconnect`` retries a dropped connection (e.g. a coordinator
     restart) for up to ``reconnect_timeout``; warm caches survive reconnects.
+
+    When the coordinator serves a *spec* corpus, tasks carry a shard recipe
+    instead of bytes and the worker materializes its shard locally (see
+    ``data/spec.py``): ``data_dir`` keeps materialized shards on disk across
+    restarts; ``data_source`` / ``data_tokenizer`` override the spec's stream
+    and tokenizer (tests, non-C4 corpora).
+
+    ``max_batch_size`` advertises a memory cap: the coordinator ships this
+    worker tasks with ``batch_size`` clamped to it, so a small-VRAM volunteer
+    trains smaller batches instead of OOM-crash-looping (a semantic knob --
+    that worker's paths see different batch statistics). Idle replies may carry
+    a server-chosen ``retry_in``, which overrides ``poll_interval``.
     """
     engine = _build_worker_engine(config, diloco, device, seed)
     worker = AsyncScheduler(engine, num_workers=1)
@@ -356,6 +512,11 @@ def run_worker(
     shard_cache: dict = {}   # path -> shard tensor (fetched once)
     versions: dict = {}      # shared key -> version currently held
     attempts: dict = {}
+    residuals: dict = {}     # path -> {key: [tensors]}: compression error feedback
+    data_ctx = {"dir": data_dir, "source": data_source, "tokenizer": data_tokenizer}
+    caps = {"device": str(device)}
+    if max_batch_size is not None:
+        caps["max_batch"] = int(max_batch_size)
     state = {"done": 0}
 
     first = True
@@ -373,8 +534,8 @@ def run_worker(
         try:
             done = _serve_connection(
                 conn, engine, worker, wid, warm, shard_cache, versions, attempts,
-                state, poll_interval, heartbeat_interval, max_msg_bytes, max_tasks,
-                fault_hook,
+                residuals, data_ctx, caps, state, poll_interval, heartbeat_interval,
+                max_msg_bytes, max_tasks, fault_hook,
             )
         finally:
             try:
@@ -388,8 +549,8 @@ def run_worker(
 
 
 def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
-                      attempts, state, poll_interval, heartbeat_interval,
-                      max_msg_bytes, max_tasks, fault_hook) -> bool:
+                      attempts, residuals, data_ctx, caps, state, poll_interval,
+                      heartbeat_interval, max_msg_bytes, max_tasks, fault_hook) -> bool:
     """Serve tasks on one connection. Returns True on a clean finish (stop /
     budget reached), False on a disconnect (caller may reconnect)."""
     send_lock = threading.Lock()  # heartbeat thread + main thread share the socket
@@ -404,6 +565,7 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
                 "type": "request", "worker_id": wid,
                 "have_shared": versions, "warm_paths": list(warm),
                 "cached_shards": list(shard_cache),
+                "capabilities": caps,
             })
             msg = recv_msg(conn, max_msg_bytes)
         except (OSError, ValueError):
@@ -413,17 +575,18 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
         if msg["type"] == "stop":
             return True
         if msg["type"] == "idle":
-            time.sleep(poll_interval)
+            time.sleep(msg.get("retry_in") or poll_interval)  # server-paced when set
             continue
 
         path = msg["path"]
+        lease = msg.get("lease")
         worker.seed = msg["seed"]
         engine.total_rounds = msg["total_rounds"]
         # Heartbeat this lease while the (possibly long) task runs.
         stop_beat = threading.Event()
         beat = threading.Thread(
             target=_heartbeat_loop,
-            args=(safe_send, stop_beat, heartbeat_interval, wid, msg["gen_id"], path),
+            args=(safe_send, stop_beat, heartbeat_interval, wid, lease, path),
             daemon=True,
         )
         beat.start()
@@ -431,7 +594,8 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
             if fault_hook is not None:
                 attempts[path] = attempts.get(path, 0) + 1
                 fault_hook(path, attempts[path])
-            shard = _apply_task(engine, msg, shard_cache, versions, warm)
+            shard = _apply_task(engine, msg, shard_cache, versions, warm, residuals,
+                                data_ctx)
             contrib = worker._train_path(path, shard, msg["batch_size"], msg["generation"])
             # Warm-back: keep this path's Adam state + private modules for next gen.
             engine._opt_state[path] = contrib.opt_state
@@ -442,7 +606,7 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
             beat.join(timeout=1)
             try:
                 safe_send({
-                    "type": "nack", "gen_id": msg["gen_id"],
+                    "type": "nack", "gen_id": msg["gen_id"], "lease": lease,
                     "path": path, "error": repr(e),
                 })
             except OSError:
@@ -450,26 +614,35 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
             continue
         stop_beat.set()
         beat.join(timeout=1)
+        mode = msg.get("compress") or "none"
+        shared_payload, private_payload, pending_res = _compress_contribution(
+            contrib, mode, residuals, path
+        )
         try:
             safe_send({
-                "type": "submit", "gen_id": msg["gen_id"], "path": path,
+                "type": "submit", "gen_id": msg["gen_id"], "lease": lease, "path": path,
                 "loss": contrib.loss, "empty": contrib.empty,
-                "shared_grad": contrib.shared_delta,
-                "private_weights": contrib.private_state,
+                "shared_grad": shared_payload,
+                "private_weights": private_payload,
             })
-            recv_msg(conn, max_msg_bytes)  # ack
+            ack = recv_msg(conn, max_msg_bytes)
         except OSError:
             return False
+        # Acceptance-aware error feedback: adopt the residual only if the
+        # coordinator applied the update (rejected/stale/dropped submits keep
+        # the previous carry, like the sharded worker's encode-after-commit).
+        if ack and ack.get("applied"):
+            _commit_residuals(residuals, path, pending_res)
         state["done"] += 1
         if max_tasks is not None and state["done"] >= max_tasks:
             return True
 
 
-def _heartbeat_loop(safe_send, stop_beat, interval, wid, gen_id, path) -> None:
+def _heartbeat_loop(safe_send, stop_beat, interval, wid, lease, path) -> None:
     """Ping the coordinator until the task ends or the socket dies."""
     while not stop_beat.wait(interval):
         try:
-            safe_send({"type": "heartbeat", "gen_id": gen_id, "path": path, "worker_id": wid})
+            safe_send({"type": "heartbeat", "lease": lease, "path": path, "worker_id": wid})
         except OSError:
             return
 
@@ -483,19 +656,63 @@ def _build_worker_engine(config, diloco, device, seed):
     )
 
 
-def _apply_task(engine, msg, shard_cache, versions, warm) -> torch.Tensor:
+def _compress_contribution(contrib, mode, residuals, path):
+    """Encode a contribution's uplink payloads per the server's compress policy.
+
+    In "bf16"/"int8" mode the per-(path, module) quantization residual is the
+    error-feedback carry: it is folded into this delta before encoding, and the
+    *new* residual is returned as ``pending`` — **not** written back. The caller
+    must commit it (:func:`_commit_residuals`) only once the server confirms the
+    update was applied; committing for a rejected/stale/lost submit would both
+    discard the previous legitimate carry and leak the dead update's rounding
+    error into a later accepted one. Returns
+    ``(shared_payload, private_payload, pending_residuals | None)``.
+    """
+    if mode == "none":
+        return contrib.shared_delta, contrib.private_state, None
+    carry = residuals.get(path) or {}
+    shared_payload, pending = {}, {}
+    for key, delta in contrib.shared_delta.items():
+        payload, res = compress_delta(delta, mode, carry=carry.get(key))
+        pending[key] = res
+        shared_payload[key] = payload
+    private_payload = {k: compress_state(sd, mode) for k, sd in contrib.private_state.items()}
+    return shared_payload, private_payload, pending
+
+
+def _commit_residuals(residuals, path, pending) -> None:
+    """Adopt a contribution's error-feedback residuals after the server applied it."""
+    if pending:  # per-key update: an empty contribution must not wipe the carry
+        residuals.setdefault(path, {}).update(pending)
+
+
+def _apply_task(engine, msg, shard_cache, versions, warm, residuals,
+                data_ctx=None) -> torch.Tensor:
     """Load a task's shipped (delta) state into the worker bank; return the shard."""
     path = msg["path"]
     for key, sd in msg.get("shared_weights", {}).items():
-        _load_into(engine, key, sd)
+        _load_into(engine, key, sd)  # load_state_dict casts bf16 -> module dtype
     versions.update(msg.get("shared_versions", {}))
     if msg.get("private_weights"):  # cold: coordinator shipped current private modules
         _load_private(engine, msg["private_weights"])
     if path not in warm:
         engine._opt_state.pop(path, None)  # cold -> reset Adam (reset-on-failover)
+        residuals.pop(path, None)          # and drop any stale error-feedback carry
     if msg.get("shard") is not None:
-        shard_cache[path] = msg["shard"]
+        shard_cache[path] = restore_shard(msg["shard"])
+    elif msg.get("shard_spec") is not None and path not in shard_cache:
+        shard_cache[path] = _materialize_from_spec(msg["shard_spec"], data_ctx)
     return shard_cache[path]
+
+
+def _materialize_from_spec(shard_spec, data_ctx) -> torch.Tensor:
+    """Build the shard locally from the shipped recipe (no corpus bytes on the wire)."""
+    ctx = data_ctx or {}
+    return materialize_shard(
+        shard_spec["spec"], shard_spec["path_index"],
+        source=ctx.get("source"), tokenizer=ctx.get("tokenizer"),
+        cache_dir=ctx.get("dir"),
+    )
 
 
 def _load_private(engine, private_state) -> None:

@@ -1,5 +1,16 @@
 from .c4 import load_c4_documents, load_documents, save_documents
 from .sharding import ShardedCorpus, assign_paths, chunk_documents, pack_sequences
+from .spec import (
+    SpecCorpus,
+    c4_source,
+    kmeans_routing,
+    make_shard_spec,
+    materialize_shard,
+    round_robin_routing,
+    spec_fingerprint,
+    synthetic_documents,
+    synthetic_source,
+)
 from .streaming import (
     ShardCache,
     ingest_c4_shard,
@@ -17,6 +28,15 @@ from .text import (
 
 __all__ = [
     "ShardedCorpus",
+    "SpecCorpus",
+    "make_shard_spec",
+    "materialize_shard",
+    "spec_fingerprint",
+    "synthetic_documents",
+    "synthetic_source",
+    "c4_source",
+    "kmeans_routing",
+    "round_robin_routing",
     "assign_paths",
     "pack_sequences",
     "chunk_documents",

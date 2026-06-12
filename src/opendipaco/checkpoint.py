@@ -24,6 +24,14 @@ from pathlib import Path as FsPath
 
 import torch
 
+from .data.sharding import ShardedCorpus
+from .data.spec import SpecCorpus
+
+# Checkpoints load with ``weights_only=True`` (the unpickler executes no code).
+# The corpus classes are the only non-primitive payloads we ever save, so they
+# are explicitly allow-listed.
+torch.serialization.add_safe_globals([ShardedCorpus, SpecCorpus])
+
 __all__ = ["save_checkpoint", "load_checkpoint", "latest_checkpoint"]
 
 
@@ -89,16 +97,16 @@ def load_checkpoint(engine, dirpath: str | os.PathLike, *, strict: bool = True) 
     if not rank_file.exists():
         raise FileNotFoundError(f"no checkpoint shard for rank {rank} at {rank_file}")
 
-    state = torch.load(rank_file, map_location="cpu", weights_only=False)
+    state = torch.load(rank_file, map_location="cpu", weights_only=True)
     engine.load_state_dict(state, strict=strict)
 
     out: dict = {}
     corpus_file = dirpath / "corpus.pt"
     if corpus_file.exists():
-        out["corpus"] = torch.load(corpus_file, map_location="cpu", weights_only=False)
+        out["corpus"] = torch.load(corpus_file, map_location="cpu", weights_only=True)
     extra_file = dirpath / "extra.pt"
     if extra_file.exists():
-        out["extra"] = torch.load(extra_file, map_location="cpu", weights_only=False)
+        out["extra"] = torch.load(extra_file, map_location="cpu", weights_only=True)
     return out
 
 

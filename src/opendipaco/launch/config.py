@@ -48,6 +48,8 @@ class DiLoCoCfg:
     outer_momentum: float = 0.9
     outer_nesterov: bool = True
     rescale_by_sqrt_sharing: bool = True
+    # bf16 mixed-precision inner loop (params/grads stay fp32; no loss scaling).
+    inner_autocast: bool = False
 
 
 @dataclass
@@ -61,6 +63,10 @@ class DataCfg:
     shard_cache_dir: str | None = None # directory for sharded resumable ingestion
     routing: str = "kmeans"            # "kmeans" | "round_robin"
     router_seed: int = 0
+    # "bytes": the server holds the corpus and ships packed shards (default).
+    # "spec": the server ships a shard *recipe*; workers materialize shards
+    # locally from the public source (data/spec.py). No per-path val split.
+    ship: str = "bytes"
     synthetic_topics: int = 4
     synthetic_doc_len: int = 80
 
@@ -83,11 +89,23 @@ class TransportCfg:
     port: int = 29500
     auth_key: str | None = None
     accept_keys: list[str] = field(default_factory=list)
+    # Sharded mode: secret shared by the scheduler + parameter servers (NOT workers)
+    # that signs commit grants, so workers can't forge push weights.
+    grant_key: str | None = None
     max_msg_bytes: int | None = None
     heartbeat_timeout: float = 30.0
     heartbeat_interval: float = 3.0
     staleness_bound: int | None = None
     staleness_weight: str = "inverse"
+    # Servers always reject non-finite contributions; this additionally clips a
+    # pseudo-gradient whose L2 norm exceeds the cap (None = no cap).
+    max_update_norm: float | None = None
+    # Wire compression: "none" (fp32, default), "bf16" (2x), or "int8"
+    # (bf16 weights + int8 pseudo-gradients with error feedback, ~4x up).
+    compress: str = "none"
+    # When set, idle replies tell workers to wait this many seconds before
+    # polling again (server-paced; otherwise workers use their own tight poll).
+    idle_backoff: float | None = None
     metrics_port: int | None = None
     metrics_host: str = "0.0.0.0"
     metrics_log_interval: float = 0.0
@@ -111,6 +129,9 @@ class RunCfg:
     resume: bool = False
     max_tasks: int | None = None
     local_workers: int = 2             # workers the all-in-one `run` command spawns
+    # Worker-advertised batch cap: the server clamps this worker's task batch
+    # size to it (small-VRAM volunteers train smaller batches instead of OOMing).
+    worker_max_batch: int | None = None
 
 
 @dataclass
@@ -206,4 +227,5 @@ def diloco_config(d: DiLoCoCfg) -> DiLoCoConfig:
         inner_warmup_steps=d.inner_warmup_steps, outer_lr=d.outer_lr,
         outer_momentum=d.outer_momentum, outer_nesterov=d.outer_nesterov,
         rescale_by_sqrt_sharing=d.rescale_by_sqrt_sharing,
+        inner_autocast=d.inner_autocast,
     )

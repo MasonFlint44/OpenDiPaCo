@@ -221,24 +221,121 @@ def test_async_staleness_bound_enforced():
     req = {"worker_id": "w", "warm_paths": [], "cached_shards": [], "have_shared": {}}
 
     # Lease a path (issued at T=0), then advance the clock past the bound.
-    path = server._next_task(req)["path"]
+    task = server._next_task(req)
+    path = task["path"]
     shared_keys = [k for k in eng.topology.path_module_keys(path) if not is_private_key(k)]
     grad = {k: [torch.ones_like(p) for p in eng.bank[k].parameters()] for k in shared_keys}
     with server._lock:
         server._T = 5  # 5 outer steps happened since this path was issued -> staleness 5
 
     before = _snap(eng)
-    server._receive({"path": path, "shared_grad": grad, "private_weights": {}, "loss": 0.1})
+    server._receive({"path": path, "lease": task["lease"], "shared_grad": grad,
+                     "private_weights": {}, "loss": 0.1})
     assert server.metrics.stale_rejected == 1
     assert _maxdiff(before, _snap(eng)) == 0.0       # rejected -> bank untouched
 
     # Re-lease (issued at the current T) and submit -> staleness 0 -> accepted.
-    server._next_task(req)
-    server._receive({"path": path, "shared_grad": grad, "private_weights": {}, "loss": 0.1})
+    task2 = server._next_task(req)
+    server._receive({"path": path, "lease": task2["lease"], "shared_grad": grad,
+                     "private_weights": {}, "loss": 0.1})
     assert server.metrics.accepted_updates == 1
     assert server.metrics.max_staleness <= 1
     assert _maxdiff(before, _snap(eng)) > 0.0        # accepted -> the outer step moved weights
     server.shutdown()
+
+
+def test_zombie_submit_fenced_after_release():
+    """A submission from an expired (reclaimed + re-leased) lease is dropped; only
+    the current lease holder's result is applied. Without the lease-token fence the
+    zombie's stale result would be accepted (with understated staleness) and the
+    live worker's fresher result silently discarded."""
+    cfg = _cfg()
+    eng = _engine(cfg)
+    server = CoordinatorServer(AsyncScheduler(eng, lease_timeout=5.0), _corpus(cfg),
+                               batch_size=BATCH, host="127.0.0.1", port=0)
+    server._outer_opts = {k: make_outer_optimizer({k: eng.bank[k]}, eng.diloco)
+                          for k in server._versions}
+    with server._lock:
+        server._serving = True
+        server._target = 10 ** 9
+        server._completed = {p: 0 for p in eng.topology.paths()}
+
+    task_a = server._next_task(
+        {"worker_id": "A", "warm_paths": [], "cached_shards": [], "have_shared": {}})
+    path = task_a["path"]
+    # Worker A goes silent; its lease expires and is reclaimed.
+    with server._lock:
+        server._inflight[path] = 0.0  # force the deadline into the past
+        server._reclaim_inflight_locked()
+    # The path is re-leased to worker B under a fresh token.
+    task_b = server._next_task(
+        {"worker_id": "B", "warm_paths": [], "cached_shards": [], "have_shared": {}})
+    assert task_b["path"] == path and task_b["lease"] != task_a["lease"]
+
+    shared_keys = [k for k in eng.topology.path_module_keys(path) if not is_private_key(k)]
+    grad = {k: [torch.ones_like(p) for p in eng.bank[k].parameters()] for k in shared_keys}
+    before = _snap(eng)
+
+    # Zombie A submits against its dead lease -> dropped, bank untouched.
+    server._receive({"path": path, "lease": task_a["lease"], "shared_grad": grad,
+                     "private_weights": {}, "loss": 0.1})
+    assert server.metrics.accepted_updates == 0
+    assert _maxdiff(before, _snap(eng)) == 0.0
+
+    # B, the live lease holder, submits -> applied.
+    server._receive({"path": path, "lease": task_b["lease"], "shared_grad": grad,
+                     "private_weights": {}, "loss": 0.1})
+    assert server.metrics.accepted_updates == 1
+    assert _maxdiff(before, _snap(eng)) > 0.0
+    server.shutdown()
+
+
+def test_async_checkpoint_restores_clock_momentum_and_schedule(tmp_path):
+    """A resumed coordinator restores the async clock, per-path completion counts
+    (the inner-LR schedule position), shared-module versions, and the per-key outer
+    Nesterov momentum -- not just the engine bank. (Previously only the engine was
+    checkpointed, so resume reset the momentum and restarted every path's cosine
+    schedule at generation 0.)"""
+    cfg = _cfg()
+    eng = _engine(cfg)
+    A = CoordinatorServer(AsyncScheduler(eng, lease_timeout=5.0), _corpus(cfg),
+                          batch_size=BATCH, host="127.0.0.1", port=0)
+    A._outer_opts = {k: make_outer_optimizer({k: eng.bank[k]}, eng.diloco)
+                     for k in A._versions}
+    with A._lock:
+        A._serving = True
+        A._target = 10 ** 9
+        A._completed = {p: 0 for p in eng.topology.paths()}
+    task = A._next_task(
+        {"worker_id": "w", "warm_paths": [], "cached_shards": [], "have_shared": {}})
+    path = task["path"]
+    shared_keys = [k for k in eng.topology.path_module_keys(path) if not is_private_key(k)]
+    grad = {k: [torch.ones_like(p) for p in eng.bank[k].parameters()] for k in shared_keys}
+    A._receive({"path": path, "lease": task["lease"], "shared_grad": grad,
+                "private_weights": {}, "loss": 0.1})
+    assert A._T == 1
+    ckpt = str(tmp_path / "ck")
+    A._save_cluster_checkpoint(ckpt)
+    A.shutdown()
+
+    eng_b = _engine(cfg, seed=7)  # different init; resume must overwrite it
+    B = CoordinatorServer(AsyncScheduler(eng_b, lease_timeout=5.0), _corpus(cfg),
+                          batch_size=BATCH, host="127.0.0.1", port=0)
+    # num_generations=0 -> fit restores state and returns at the (already met) target.
+    B.fit(num_generations=0, log_every=0, checkpoint_dir=ckpt, resume=True)
+
+    assert B._T == 1
+    assert B._completed[path] == 1        # the inner-LR schedule continues, not restarts
+    assert B._versions == A._versions     # warm workers' version caches stay meaningful
+    touched = [k for k in A._outer_opts if A._outer_opts[k].state_dict()["state"]]
+    assert touched                        # the outer step left momentum to restore
+    for k in touched:
+        sa = A._outer_opts[k].state_dict()["state"]
+        sb = B._outer_opts[k].state_dict()["state"]
+        assert set(sa) == set(sb)
+        for i in sa:
+            assert torch.equal(sa[i]["momentum_buffer"], sb[i]["momentum_buffer"])
+    B.shutdown()
 
 
 def test_distributed_tolerates_workers_leaving():
@@ -400,7 +497,7 @@ def test_heartbeat_refreshes_lease_and_reclaim_frees_dead():
     d0 = server._inflight[path]
 
     time.sleep(0.05)
-    server._heartbeat({"path": path, "worker_id": "w", "gen_id": 0})
+    server._heartbeat({"path": path, "worker_id": "w", "lease": task["lease"]})
     assert server._inflight[path] > d0           # heartbeat pushed the deadline out
 
     time.sleep(0.4)                              # now let it lapse without heartbeats

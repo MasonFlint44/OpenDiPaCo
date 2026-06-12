@@ -17,8 +17,10 @@ from opendipaco.schedule import (
     ParameterServer,
     Scheduler,
     assign_shards,
+    make_grant,
     run_sharded_worker,
 )
+from opendipaco.topology import is_private_key
 
 BATCH = 8
 
@@ -133,18 +135,128 @@ def test_sharded_staleness_bound():
         sched._completed = {p: 0 for p in sched.paths}
     req = {"worker_id": "w", "warm_paths": [], "cached_shards": []}
 
-    path = sched._next_task(req)["path"]       # issued at _T = 0
+    task = sched._next_task(req)                # issued at _T = 0
+    path = task["path"]
     with sched._lock:
         sched._T = 5                            # 5 commits since -> staleness 5
-    rej = sched._commit({"path": path, "worker_id": "w", "issued_token": 0})
+    rej = sched._commit({"path": path, "worker_id": "w", "lease": task["lease"]})
     assert rej["accepted"] is False
     assert sched.metrics.stale_rejected == 1
 
-    sched._next_task(req)                       # re-lease at _T = 5 -> staleness 0
-    acc = sched._commit({"path": path, "worker_id": "w", "issued_token": 0})
+    task2 = sched._next_task(req)               # re-lease at _T = 5 -> staleness 0
+    acc = sched._commit({"path": path, "worker_id": "w", "lease": task2["lease"]})
     assert acc["accepted"] is True and acc["push_weight"] > 0
+    # The grant carries the verdict to the PSs: same weight, single-use lease token.
+    assert acc["grant"]["weight"] == acc["push_weight"]
+    assert acc["grant"]["token"] == task2["lease"]
     assert sched.metrics.accepted_updates == 1
     sched.shutdown()
+
+
+def test_sharded_zombie_commit_fenced():
+    """A commit from an expired (reclaimed + re-leased) lease is rejected; the
+    current lease holder's commit is the one accepted."""
+    cfg = _cfg()
+    sched = Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1)], _diloco(),
+                      batch_size=BATCH, host="127.0.0.1", port=0)
+    with sched._lock:
+        sched._serving = True
+        sched._target = 10 ** 9
+        sched._completed = {p: 0 for p in sched.paths}
+
+    task_a = sched._next_task({"worker_id": "A", "warm_paths": [], "cached_shards": []})
+    path = task_a["path"]
+    with sched._lock:
+        sched._inflight[path] = 0.0             # worker A goes silent; lease expires
+        sched._reclaim_inflight_locked()
+    task_b = sched._next_task({"worker_id": "B", "warm_paths": [], "cached_shards": []})
+    assert task_b["path"] == path and task_b["lease"] != task_a["lease"]
+
+    zombie = sched._commit({"path": path, "worker_id": "A", "lease": task_a["lease"]})
+    assert zombie["accepted"] is False           # the dead lease can't commit
+    live = sched._commit({"path": path, "worker_id": "B", "lease": task_b["lease"]})
+    assert live["accepted"] is True
+    assert sched.metrics.accepted_updates == 1
+    sched.shutdown()
+
+
+def test_ps_push_requires_valid_grant():
+    """Pushes are gated by the scheduler's commit grant: refused without one, with a
+    forged/unsigned grant when a signature is required, or on replay; the applied
+    weight and allowed keys come from the grant, not the worker."""
+    cfg = _cfg()
+    keys = _key_shards(cfg, 1)[0]
+    ps = ParameterServer(cfg, keys, _diloco(), host="127.0.0.1", port=0,
+                         grant_key="ps-secret")
+    try:
+        shared = sorted(k for k in keys if not is_private_key(k))
+        k0 = shared[0]
+        grad = {"grad": [torch.ones_like(p) for p in ps.bank[k0].parameters()]}
+        path = cfg.build_topology().path_from_index(0)
+        before = _ps_snap(ps)
+
+        # No grant -> refused, weights untouched.
+        r = ps._push({"updates": {k0: grad}})
+        assert r["applied"] is False and _maxdiff(before, _ps_snap(ps)) == 0.0
+
+        # Grant signed with the wrong key -> refused.
+        forged = make_grant(path, keys, 100.0, "tok-forged", grant_key="wrong-key")
+        r = ps._push({"grant": forged, "updates": {k0: grad}})
+        assert r["applied"] is False and _maxdiff(before, _ps_snap(ps)) == 0.0
+
+        # Unsigned grant while the PS requires a signature -> refused.
+        unsigned = make_grant(path, keys, 1.0, "tok-unsigned")
+        r = ps._push({"grant": unsigned, "updates": {k0: grad}})
+        assert r["applied"] is False and _maxdiff(before, _ps_snap(ps)) == 0.0
+
+        # Properly signed grant -> applied.
+        good = make_grant(path, keys, 1.0, "tok-good", grant_key="ps-secret")
+        r = ps._push({"grant": good, "updates": {k0: grad}})
+        assert r["applied"] is True and _maxdiff(before, _ps_snap(ps)) > 0.0
+
+        # Replay of the same grant -> refused, weights unchanged.
+        after = _ps_snap(ps)
+        r = ps._push({"grant": good, "updates": {k0: grad}})
+        assert r["applied"] is False and _maxdiff(after, _ps_snap(ps)) == 0.0
+
+        # A key outside the grant's allow-list is skipped even on a valid grant.
+        k1 = shared[1]
+        grad1 = {"grad": [torch.ones_like(p) for p in ps.bank[k1].parameters()]}
+        only_k0 = make_grant(path, [k0], 1.0, "tok-narrow", grant_key="ps-secret")
+        snap = _ps_snap(ps)
+        r = ps._push({"grant": only_k0, "updates": {k1: grad1}})
+        assert r["applied"] is True                   # the push is processed...
+        assert _maxdiff(snap, _ps_snap(ps)) == 0.0    # ...but k1 wasn't touched
+    finally:
+        ps.shutdown()
+
+
+def test_ps_checkpoint_restores_outer_momentum(tmp_path):
+    """``save_shard``/``load_shard`` round-trip the per-module outer Nesterov
+    momentum, not just weights and versions."""
+    cfg = _cfg()
+    keys = _key_shards(cfg, 1)[0]
+    dl = _diloco()
+    ps = ParameterServer(cfg, keys, dl, host="127.0.0.1", port=0)
+    shared = [k for k in keys if not is_private_key(k)]
+    path = cfg.build_topology().path_from_index(0)
+    updates = {k: {"grad": [torch.ones_like(p) for p in ps.bank[k].parameters()]}
+               for k in shared}
+    ps._push({"grant": make_grant(path, keys, 1.0, "tok"), "updates": updates})
+    ckpt = str(tmp_path / "ck")
+    ps.save_shard(ckpt)
+
+    ps2 = ParameterServer(cfg, keys, dl, host="127.0.0.1", port=0, resume_dir=ckpt)
+    try:
+        for k in shared:
+            sa = ps._outer_opts[k].state_dict()["state"]
+            sb = ps2._outer_opts[k].state_dict()["state"]
+            assert sa and set(sa) == set(sb)   # momentum exists and was restored
+            for i in sa:
+                assert torch.equal(sa[i]["momentum_buffer"], sb[i]["momentum_buffer"])
+    finally:
+        ps.shutdown()
+        ps2.shutdown()
 
 
 def _combined_snap(pss):

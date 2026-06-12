@@ -17,6 +17,15 @@ import torch
 
 from ..backend import LocalBackend
 from ..data import ShardedCorpus
+from ..data.spec import (
+    SpecCorpus,
+    c4_source,
+    kmeans_routing,
+    make_shard_spec,
+    round_robin_routing,
+    synthetic_documents,
+    synthetic_source,
+)
 from ..routing import BagOfTokensFeaturizer, KMeansRouter
 from ..schedule import (
     AsyncScheduler,
@@ -67,13 +76,11 @@ def build_documents(cfg: LaunchConfig):
     """Load (or synthesize) the training documents named by the data config."""
     d = cfg.data
     if d.source == "synthetic":
-        g = torch.Generator().manual_seed(cfg.run.seed)
-        vocab, topics = cfg.model.vocab_size, d.synthetic_topics
-        span = max(1, vocab // topics)
-        per = max(1, d.num_documents // topics)
-        return [torch.randint(t * span, min((t + 1) * span, vocab), (d.synthetic_doc_len,),
-                              generator=g)
-                for t in range(topics) for _ in range(per)]
+        # Single-sourced with spec materialization, so a worker regenerating from
+        # a shard spec sees byte-identical documents.
+        return synthetic_documents(
+            vocab_size=cfg.model.vocab_size, num_documents=d.num_documents,
+            doc_len=d.synthetic_doc_len, topics=d.synthetic_topics, seed=cfg.run.seed)
     if d.source == "c4":
         from ..data import load_c4_documents
         return load_c4_documents(num_documents=d.num_documents,
@@ -83,8 +90,13 @@ def build_documents(cfg: LaunchConfig):
     raise ValueError(f"unknown data source {d.source!r} (use 'c4' or 'synthetic')")
 
 
-def build_corpus(cfg: LaunchConfig, model, docs) -> ShardedCorpus:
-    """Assign documents to paths (k-means routing or round-robin) and pack them."""
+def build_corpus(cfg: LaunchConfig, model, docs):
+    """Build the server-side corpus: packed shards, or (``data.ship: spec``) a
+    shard recipe + token counts with workers materializing shards locally."""
+    if cfg.data.ship == "spec":
+        return build_spec_corpus(cfg, model, docs)
+    if cfg.data.ship != "bytes":
+        raise ValueError(f"data.ship must be 'bytes' or 'spec', got {cfg.data.ship!r}")
     num_paths, seq_len = model.num_paths, model.sequence_length
     if cfg.data.routing == "round_robin" or len(docs) < num_paths:
         assign = torch.tensor([i % num_paths for i in range(len(docs))])
@@ -94,6 +106,35 @@ def build_corpus(cfg: LaunchConfig, model, docs) -> ShardedCorpus:
     router = KMeansRouter(num_paths, seed=cfg.data.router_seed).fit(
         feat([d[:seq_len] for d in docs]))
     return ShardedCorpus.from_documents(docs, router, feat, num_paths, seq_len)
+
+
+def build_spec_corpus(cfg: LaunchConfig, model, docs) -> SpecCorpus:
+    """Fit the router on the docs in hand, then keep only the recipe + counts."""
+    d = cfg.data
+    num_paths, seq_len = model.num_paths, model.sequence_length
+    if d.source == "synthetic":
+        source = synthetic_source(
+            vocab_size=cfg.model.vocab_size, num_documents=d.num_documents,
+            doc_len=d.synthetic_doc_len, topics=d.synthetic_topics, seed=cfg.run.seed)
+    elif d.source == "c4":
+        source = c4_source(num_documents=d.num_documents,
+                           tokenizer=d.tokenizer or "t5-base",
+                           max_doc_tokens=d.max_doc_tokens,
+                           min_doc_tokens=d.min_doc_tokens)
+    else:
+        raise ValueError(f"unknown data source {d.source!r}")
+    if cfg.data.routing == "round_robin" or len(docs) < num_paths:
+        routing = round_robin_routing()
+    else:
+        feature_dim = min(256, cfg.model.vocab_size)
+        feat = BagOfTokensFeaturizer(cfg.model.vocab_size, feature_dim=feature_dim)
+        router = KMeansRouter(num_paths, seed=d.router_seed).fit(
+            feat([doc[:seq_len] for doc in docs]))
+        routing = kmeans_routing(router.centroids, vocab_size=cfg.model.vocab_size,
+                                 feature_dim=feature_dim)
+    spec = make_shard_spec(source=source, routing=routing,
+                           num_paths=num_paths, seq_len=seq_len)
+    return SpecCorpus.from_documents(spec, docs)
 
 
 def _attach_metrics(server, cfg: LaunchConfig):
@@ -131,7 +172,10 @@ def run_coordinator(cfg: LaunchConfig, *, on_start=None):
         host=cfg.transport.host, port=cfg.transport.port,
         heartbeat_timeout=cfg.transport.heartbeat_timeout,
         staleness_bound=cfg.transport.staleness_bound,
-        staleness_weight=cfg.transport.staleness_weight, **_server_kw(cfg))
+        staleness_weight=cfg.transport.staleness_weight,
+        max_update_norm=cfg.transport.max_update_norm,
+        compress=cfg.transport.compress,
+        idle_backoff=cfg.transport.idle_backoff, **_server_kw(cfg))
     server.start()
     _attach_metrics(server, cfg)
     if on_start:
@@ -158,7 +202,9 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None):
         staleness_bound=cfg.transport.staleness_bound,
         staleness_weight=cfg.transport.staleness_weight,
         heartbeat_timeout=cfg.transport.heartbeat_timeout,
-        ps_tls=build_tls_client(cfg), **_server_kw(cfg))
+        ps_tls=build_tls_client(cfg), grant_key=cfg.transport.grant_key,
+        compress=cfg.transport.compress,
+        idle_backoff=cfg.transport.idle_backoff, **_server_kw(cfg))
     scheduler.start()
     _attach_metrics(scheduler, cfg)
     if on_start:
@@ -189,7 +235,8 @@ def run_parameter_server(cfg: LaunchConfig, shard_id: int, *, port=None,
     owned = [k for k, s in assignment.items() if s == shard_id]
     ps = ParameterServer(
         model, owned, diloco, host=cfg.transport.host, port=_ps_port(cfg, shard_id, port),
-        device=cfg.run.device,
+        device=cfg.run.device, grant_key=cfg.transport.grant_key,
+        max_update_norm=cfg.transport.max_update_norm, compress=cfg.transport.compress,
         resume_dir=cfg.run.checkpoint_dir if cfg.run.resume else None, **_server_kw(cfg))
     ps.start()
     _attach_metrics(ps, cfg)
@@ -204,20 +251,23 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
     """A worker: connect to the coordinator (or scheduler in sharded mode) and train."""
     model, diloco = dipaco_config(cfg.model), diloco_config(cfg.diloco)
     mt = max_tasks if max_tasks is not None else cfg.run.max_tasks
+    data_dir = cfg.data.shard_cache_dir  # spec mode: cache materialized shards here
     if cfg.mode == "sharded":
         target = scheduler_addr or cfg.connect_addr()
         run_sharded_worker(
             model, diloco, tuple(target), device=cfg.run.device, seed=cfg.run.seed,
             auth_key=cfg.transport.auth_key, max_tasks=mt, reconnect=True,
             heartbeat_interval=cfg.transport.heartbeat_interval,
-            tls=build_tls_client(cfg), tls_hostname=cfg.tls.server_hostname)
+            tls=build_tls_client(cfg), tls_hostname=cfg.tls.server_hostname,
+            data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch)
     else:
         host, port = addr or cfg.connect_addr()
         run_worker(
             model, diloco, host, port, device=cfg.run.device, seed=cfg.run.seed,
             auth_key=cfg.transport.auth_key, max_tasks=mt,
             heartbeat_interval=cfg.transport.heartbeat_interval,
-            tls=build_tls_client(cfg), tls_hostname=cfg.tls.server_hostname)
+            tls=build_tls_client(cfg), tls_hostname=cfg.tls.server_hostname,
+            data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch)
 
 
 def run_local(cfg: LaunchConfig):

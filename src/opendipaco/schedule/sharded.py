@@ -7,9 +7,17 @@ per-module outer optimizers + versions) coordinated by one light **Scheduler**
 (task queue + async clock + staleness; *no weights*). A worker leases a path from
 the scheduler, **fetches** that path's modules from the ParameterServers that own
 them, trains, **commits** to the scheduler (which accepts/rejects on staleness and
-returns a damped weight), and **pushes** the pseudo-gradients to the owning
-ParameterServers. Model memory *and* weight bandwidth are sharded; the scheduler
-stays light.
+returns a **commit grant** carrying the damped weight), and **pushes** the
+pseudo-gradients to the owning ParameterServers, presenting the grant. Model
+memory *and* weight bandwidth are sharded; the scheduler stays light.
+
+A push without a grant is refused, the applied weight and allowed keys come from
+the grant (not the worker), and each grant is single-use per server (no replay).
+With ``grant_key=`` set on both the scheduler and the parameter servers, grants
+are HMAC-signed so a worker that only holds a *worker* auth key cannot forge one;
+keep ``grant_key`` secret from workers. Leases carry a unique token the worker
+echoes on commit/heartbeat, so a reclaimed-and-re-leased path can't be committed
+by a zombie worker.
 
 This reuses the reactor (`reactor.py`), wire/auth (`wire.py`), and the worker's
 warm-cache + ``AsyncScheduler._train_path`` machinery. It is scale-only and
@@ -18,9 +26,12 @@ unvalidated at toy size (same async-dynamics caveat as the single coordinator).
 
 from __future__ import annotations
 
+import collections
+import hashlib
+import hmac
+import json
 import math
 import os
-import hashlib
 import ssl
 import threading
 import time
@@ -31,11 +42,26 @@ import torch
 from ..model import build_module_bank
 from ..optim.diloco import apply_outer_grads, make_outer_optimizer
 from ..topology import is_private_key
-from ..train.loop import _state_to_cpu
-from .distributed import _build_worker_engine, _load_into, _load_private
+from ..train.loop import _optimizer_state_to_cpu, _state_to_cpu
+from .compress import (
+    check_mode,
+    compress_shard,
+    compress_state,
+    maybe_dequantize,
+    restore_shard,
+)
+from .distributed import (
+    _build_worker_engine,
+    _commit_residuals,
+    _compress_contribution,
+    _load_into,
+    _load_private,
+    _materialize_from_spec,
+)
+from .guard import all_finite, clip_norm_, loss_ok
 from .reactor import DEFAULT_MAX_MSG_BYTES, _ReactorServer
 from .scheduler import AsyncScheduler
-from .wire import client_handshake, recv_msg, send_msg
+from .wire import _key_bytes, client_handshake, recv_msg, send_msg
 
 
 def assign_shards(keys, num_shards: int) -> dict:
@@ -47,6 +73,48 @@ def assign_shards(keys, num_shards: int) -> dict:
     return {k: i % num_shards for i, k in enumerate(sorted(keys))}
 
 
+# -- commit grants ------------------------------------------------------------
+#
+# The scheduler is where staleness is decided, but the parameter servers are
+# where weights live. A *grant* carries the scheduler's verdict to the servers:
+# the accepted path, the damped push weight, the keys the push may touch, and
+# the (unique) lease token. The weight/keys always come from the grant rather
+# than the worker; with a shared ``grant_key`` the grant is HMAC-signed too.
+
+
+def _grant_payload(grant: dict) -> bytes:
+    """Canonical signed bytes of a grant (everything except the mac)."""
+    return json.dumps(
+        {"path": list(grant["path"]), "token": grant["token"],
+         "weight": grant["weight"], "keys": list(grant["keys"])},
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def make_grant(path, keys, weight: float, token: str, grant_key=None) -> dict:
+    grant = {"path": list(path), "token": token, "weight": float(weight),
+             "keys": sorted(keys)}
+    if grant_key is not None:
+        grant["mac"] = hmac.new(
+            _key_bytes(grant_key), _grant_payload(grant), hashlib.sha256
+        ).hexdigest()
+    return grant
+
+
+def verify_grant(grant, grant_key) -> bool:
+    """Structurally valid and, when ``grant_key`` is set, correctly signed."""
+    if not isinstance(grant, dict) or not grant.get("token"):
+        return False
+    try:
+        payload = _grant_payload(grant)
+    except (KeyError, TypeError):
+        return False
+    if grant_key is None:
+        return True
+    expected = hmac.new(_key_bytes(grant_key), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(grant.get("mac", ""), expected)
+
+
 # -- parameter server --------------------------------------------------------
 
 
@@ -55,16 +123,29 @@ class ParameterServer(_ReactorServer):
 
     ``fetch`` returns the requested owned weights (versioned; private only when the
     worker is cold); ``push`` applies a weighted per-module outer step to owned
-    shared modules and stores owned private modules.
+    shared modules and stores owned private modules. A push must present a commit
+    grant from the scheduler: the weight and allowed keys are taken from the grant,
+    each grant is single-use here, and with ``grant_key=`` set the signature is
+    verified (set the same key on the :class:`Scheduler`; don't give it to workers).
     """
 
+    _SEEN_GRANTS_MAX = 4096  # replay window; older tokens age out FIFO
+
     def __init__(self, config, owned_keys, diloco, *, host="0.0.0.0", port=0,
-                 auth_key=None, device="cpu", resume_dir=None, **reactor_kw):
+                 auth_key=None, device="cpu", resume_dir=None, grant_key=None,
+                 max_update_norm=None, compress="none", **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.config = config
         self.diloco = diloco
         self.device = torch.device(device)
         self.owned_keys = set(owned_keys)
+        self.grant_key = grant_key
+        # Non-finite pushes are always refused; the optional norm cap clips
+        # oversized pseudo-gradients per module (see ``guard.py``).
+        self.max_update_norm = max_update_norm
+        # Downlink (fetch) compression; pushes are decoded self-describingly.
+        self.compress = check_mode(compress)
+        self._seen_grants: collections.OrderedDict = collections.OrderedDict()
         # Build the full bank deterministically, then keep only this shard's keys.
         full = build_module_bank(config)
         self.bank = {k: full[k].to(self.device) for k in self.owned_keys}
@@ -97,27 +178,55 @@ class ParameterServer(_ReactorServer):
                     continue
                 if is_private_key(k):
                     if cold:  # ship the path's private modules only on a cold start
-                        weights[k] = _state_to_cpu(self.bank[k].state_dict())
+                        weights[k] = compress_state(
+                            _state_to_cpu(self.bank[k].state_dict()), self.compress)
                 else:
                     versions[k] = self._versions[k]
                     if have.get(k) != self._versions[k]:  # ship only what's stale
-                        weights[k] = _state_to_cpu(self.bank[k].state_dict())
+                        weights[k] = compress_state(
+                            _state_to_cpu(self.bank[k].state_dict()), self.compress)
         return {"type": "weights", "weights": weights, "versions": versions}
 
     def _push(self, msg: dict) -> dict:
+        grant = msg.get("grant")
+        if not verify_grant(grant, self.grant_key):
+            return {"type": "ack", "applied": False}  # no/forged grant -> refuse
+        # Decode (possibly quantized) gradients outside the lock; a malformed
+        # encoding refuses the push rather than crashing the server.
+        try:
+            updates = {k: maybe_dequantize(u["grad"])
+                       for k, u in (msg.get("updates") or {}).items()
+                       if isinstance(u, dict)}
+        except (TypeError, KeyError, ValueError):
+            self.metrics.record_invalid_reject()
+            return {"type": "ack", "applied": False}
+        private = msg.get("private") or {}
+        weight = float(grant["weight"])
+        allowed = set(grant["keys"])
         with self._lock:
-            for k, upd in (msg.get("updates") or {}).items():
-                if k not in self.owned_keys or is_private_key(k):
+            if grant["token"] in self._seen_grants:
+                return {"type": "ack", "applied": False}  # replay -> refuse
+            self._seen_grants[grant["token"]] = True  # consumed even if invalid below
+            while len(self._seen_grants) > self._SEEN_GRANTS_MAX:
+                self._seen_grants.popitem(last=False)
+            # Validate before touching the shard: one applied NaN poisons it.
+            if not (all_finite(updates) and all_finite(private)):
+                self.metrics.record_invalid_reject()
+                return {"type": "ack", "applied": False}
+            for k, grad in updates.items():
+                if k not in self.owned_keys or is_private_key(k) or k not in allowed:
                     continue
-                w = float(upd["weight"])
-                apply_outer_grads(self.bank[k], [w * g.to(self.device) for g in upd["grad"]])
+                if self.max_update_norm is not None:
+                    if clip_norm_(grad, self.max_update_norm) > self.max_update_norm:
+                        self.metrics.record_norm_clip()
+                apply_outer_grads(self.bank[k], [weight * g.to(self.device) for g in grad])
                 self._outer_opts[k].step()
                 self._outer_opts[k].zero_grad(set_to_none=True)
                 self._versions[k] += 1
-            for k, sd in (msg.get("private") or {}).items():
-                if k in self.owned_keys:
+            for k, sd in private.items():
+                if k in self.owned_keys and k in allowed:
                     _load_into(self, k, sd)  # store latest private (authoritative-local)
-        return {"type": "ack"}
+        return {"type": "ack", "applied": True}
 
     def _shard_name(self) -> str:
         # Stable across processes (unlike per-process-salted ``hash``), so a shard
@@ -126,23 +235,29 @@ class ParameterServer(_ReactorServer):
         return f"shard_{digest}.pt"
 
     def save_shard(self, dirpath: str) -> None:
-        """Persist this shard's weights + versions to ``dir/shard_<stable-hash>.pt``."""
+        """Persist this shard's weights + versions + outer-optimizer momentum
+        to ``dir/shard_<stable-hash>.pt``."""
         os.makedirs(dirpath, exist_ok=True)
         with self._lock:
             blob = {"weights": {k: _state_to_cpu(m.state_dict()) for k, m in self.bank.items()},
-                    "versions": dict(self._versions)}
+                    "versions": dict(self._versions),
+                    "outer_opts": {k: _optimizer_state_to_cpu(o.state_dict())
+                                   for k, o in self._outer_opts.items()}}
         tmp = os.path.join(dirpath, self._shard_name() + ".tmp")
         torch.save(blob, tmp)
         os.replace(tmp, os.path.join(dirpath, self._shard_name()))  # atomic
 
     def load_shard(self, dirpath: str) -> None:
         blob = torch.load(os.path.join(dirpath, self._shard_name()),
-                          map_location=self.device, weights_only=False)
+                          map_location=self.device, weights_only=True)
         with self._lock:
             for k, sd in blob["weights"].items():
                 if k in self.bank:
                     self.bank[k].load_state_dict({n: v.to(self.device) for n, v in sd.items()})
             self._versions.update({k: v for k, v in blob["versions"].items() if k in self._versions})
+            for k, sd in blob.get("outer_opts", {}).items():
+                if k in self._outer_opts:  # restore Nesterov momentum, not just weights
+                    self._outer_opts[k].load_state_dict(sd)
 
 
 # -- scheduler (no weights) --------------------------------------------------
@@ -159,9 +274,14 @@ class Scheduler(_ReactorServer):
     def __init__(self, config, corpus, ps_addrs, diloco, batch_size, *,
                  host="0.0.0.0", port=0, auth_key=None, seed=0,
                  staleness_bound=None, staleness_weight="inverse",
-                 heartbeat_timeout=30.0, ps_tls=None, **reactor_kw):
+                 heartbeat_timeout=30.0, ps_tls=None, grant_key=None,
+                 compress="none", idle_backoff=None, **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.ps_tls = ps_tls  # client context for the scheduler's checkpoint RPCs to PSs
+        self.grant_key = grant_key  # shared with the PSs (not workers) to sign grants
+        self.compress = check_mode(compress)  # stamped on tasks; workers follow it
+        self.idle_backoff = idle_backoff      # server-paced idle polling (retry_in)
+        self._worker_caps: dict = {}          # worker_id -> advertised capabilities
         self.config = config
         self.corpus = corpus
         self.diloco = diloco
@@ -188,6 +308,7 @@ class Scheduler(_ReactorServer):
         self._completed: dict = {}
         self._inflight: dict = {}
         self._issued: dict = {}
+        self._lease: dict = {}  # path -> current lease token (fences commits)
         self._owner: dict = {}
 
     def _handle(self, msg: dict, nbytes: int):
@@ -200,32 +321,54 @@ class Scheduler(_ReactorServer):
             self._heartbeat(msg)
         return None
 
+    def _idle(self) -> dict:
+        msg = {"type": "idle"}
+        if self.idle_backoff is not None:
+            msg["retry_in"] = self.idle_backoff
+        return msg
+
     def _next_task(self, req: dict) -> dict:
         wid = req.get("worker_id")
         warm = {tuple(p) for p in req.get("warm_paths", [])}
         cached = {tuple(p) for p in req.get("cached_shards", [])}
+        caps = req.get("capabilities") or {}
         with self._lock:
+            if caps:
+                self._worker_caps[wid] = caps
             if not self._serving or self._T >= self._target:
-                return {"type": "stop"} if self._stop else {"type": "idle"}
+                return {"type": "stop"} if self._stop else self._idle()
             self._reclaim_inflight_locked()
             eligible = [p for p in self._completed if p not in self._inflight]
             if not eligible:
-                return {"type": "idle"}
+                return self._idle()
             path = min(eligible, key=lambda p: (self._completed[p], p not in warm, p))
+            lease = uuid.uuid4().hex  # unique per lease; fences commit/heartbeat
             self._owner[path] = wid
             self._inflight[path] = time.monotonic() + self.heartbeat_timeout
             self._issued[path] = self._T
+            self._lease[path] = lease
             generation = self._completed[path]
             keys = self.topology.path_module_keys(path)
             routing = {k: self._routing[k] for k in keys}
-        shard = self.corpus.shard(self.topology.path_index(path)) if path not in cached else None
+        # Data plane: shard bytes, or just the recipe for a spec corpus.
+        shard, shard_spec = None, None
+        if path not in cached:
+            if hasattr(self.corpus, "spec"):
+                shard_spec = {"path_index": self.topology.path_index(path),
+                              "spec": self.corpus.spec}
+            else:
+                shard = self.corpus.shard(self.topology.path_index(path))
         return {
             "type": "task",
             "gen_id": generation,
+            "lease": lease,
             "path": path,
             "routing": routing,
-            "shard": shard,
-            "batch_size": self.batch_size,
+            "compress": self.compress,  # uplink encoding the worker should use
+            "shard": compress_shard(shard, self.compress),
+            "shard_spec": shard_spec,
+            "batch_size": (max(1, min(self.batch_size, int(caps["max_batch"])))
+                           if caps.get("max_batch") else self.batch_size),
             "total_rounds": self.total_rounds,
             "seed": self.seed,
         }
@@ -233,24 +376,38 @@ class Scheduler(_ReactorServer):
     def _commit(self, msg: dict) -> dict:
         path = msg["path"]
         with self._lock:
-            if path not in self._inflight:
-                return {"type": "commit_ack", "accepted": False}  # stale / already freed
+            lease = self._lease.get(path)
+            if path not in self._inflight or msg.get("lease") != lease:
+                # stale / already freed / not the current lease holder
+                return {"type": "commit_ack", "accepted": False}
             staleness = self._T - self._issued.get(path, self._T)
             self._inflight.pop(path, None)
+            self._lease.pop(path, None)
             if staleness > self.staleness_bound:
                 self.metrics.record_stale_reject()
+                return {"type": "commit_ack", "accepted": False}
+            # A non-finite inner loss means the worker's training diverged (or its
+            # hardware is faulty) -- don't grant a push for it. The empty-shard
+            # no-op convention (loss=NaN, nothing to push) stays accepted.
+            if not loss_ok(msg.get("loss"), empty=bool(msg.get("empty"))):
+                self.metrics.record_invalid_reject()
                 return {"type": "commit_ack", "accepted": False}
             self._T += 1
             self._completed[path] = self._completed.get(path, 0) + 1
             damp = 1.0 / (1.0 + staleness) if self.staleness_weight == "inverse" else 1.0
             push_weight = self.corpus.shard_weight(self.topology.path_index(path)) * damp
             self.metrics.record_update(staleness)
-            return {"type": "commit_ack", "accepted": True, "push_weight": push_weight}
+            # The grant carries the verdict to the parameter servers: weight and
+            # allowed keys come from here, the lease token makes it single-use.
+            grant = make_grant(path, self.topology.path_module_keys(path),
+                               push_weight, lease, self.grant_key)
+            return {"type": "commit_ack", "accepted": True,
+                    "push_weight": push_weight, "grant": grant}
 
     def _heartbeat(self, msg: dict) -> None:
         path = msg["path"]
         with self._lock:
-            if path in self._inflight and self._owner.get(path) == msg.get("worker_id"):
+            if path in self._inflight and msg.get("lease") == self._lease.get(path):
                 self._inflight[path] = time.monotonic() + self.heartbeat_timeout
 
     def _reclaim_inflight_locked(self) -> None:
@@ -258,6 +415,7 @@ class Scheduler(_ReactorServer):
         for path, deadline in list(self._inflight.items()):
             if now >= deadline:
                 del self._inflight[path]
+                self._lease.pop(path, None)  # invalidate the token: zombies can't commit
                 self._owner[path] = None
                 self.metrics.reclaims += 1
 
@@ -319,7 +477,7 @@ class Scheduler(_ReactorServer):
         path = os.path.join(dirpath, "scheduler.pt")
         if not os.path.exists(path):
             return
-        state = torch.load(path, weights_only=False)
+        state = torch.load(path, weights_only=True)
         with self._lock:
             self._T = state["T"]
             self._completed = dict(state["completed"])
@@ -337,7 +495,9 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
                        auth_key=None, max_tasks=None, heartbeat_interval=3.0,
                        poll_interval=0.02, max_msg_bytes=DEFAULT_MAX_MSG_BYTES,
                        connect_timeout=10.0, reconnect=False, reconnect_timeout=30.0,
-                       fault_hook=None, tls=None, tls_hostname=None):
+                       fault_hook=None, tls=None, tls_hostname=None,
+                       data_dir=None, data_source=None, data_tokenizer=None,
+                       max_batch_size=None):
     """Train path-tasks for a sharded scheduler + parameter servers.
 
     Per task: lease from the scheduler, fetch the path's modules from the owning
@@ -345,6 +505,10 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
     pseudo-gradients to the owning servers. Warm caches (private modules, Adam
     state, shard) persist across tasks. With ``reconnect`` a dropped scheduler/PS
     connection is retried (e.g. a coordinator restart); warm caches survive.
+
+    With a spec corpus on the scheduler, tasks carry a shard recipe instead of
+    bytes and the worker materializes its shard locally (``data/spec.py``);
+    ``data_dir`` / ``data_source`` / ``data_tokenizer`` as in ``run_worker``.
     """
     engine = _build_worker_engine(config, diloco, device, seed)
     worker = AsyncScheduler(engine, num_workers=1)
@@ -353,6 +517,11 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
     shard_cache: dict = {}
     versions: dict = {}          # shared key -> held version
     ps_conns: dict = {}          # (host, port) -> connected socket
+    residuals: dict = {}         # path -> {key: [tensors]}: compression error feedback
+    data_ctx = {"dir": data_dir, "source": data_source, "tokenizer": data_tokenizer}
+    caps = {"device": str(device)}
+    if max_batch_size is not None:
+        caps["max_batch"] = int(max_batch_size)
     state = {"done": 0}
 
     first = True
@@ -368,9 +537,9 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
         clean = False
         try:
             clean = _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions,
-                                   ps_conns, state, auth_key, max_msg_bytes, connect_timeout,
-                                   heartbeat_interval, poll_interval, max_tasks, fault_hook,
-                                   tls=tls)
+                                   ps_conns, residuals, data_ctx, caps, state, auth_key,
+                                   max_msg_bytes, connect_timeout, heartbeat_interval,
+                                   poll_interval, max_tasks, fault_hook, tls=tls)
         except (OSError, ConnectionError):
             clean = False  # disconnected -> reconnect (if enabled)
         finally:
@@ -396,9 +565,10 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
         backoff = min(backoff * 2, 1.0)
 
 
-def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_conns, state,
-                   auth_key, max_msg_bytes, connect_timeout, heartbeat_interval,
-                   poll_interval, max_tasks, fault_hook, *, tls=None) -> bool:
+def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_conns,
+                   residuals, data_ctx, caps, state, auth_key, max_msg_bytes,
+                   connect_timeout, heartbeat_interval, poll_interval, max_tasks,
+                   fault_hook, *, tls=None) -> bool:
     """One scheduler connection: serve tasks. Returns True on a clean finish (stop /
     budget), raises ``OSError`` on a disconnect (so the caller can reconnect)."""
     send_lock = threading.Lock()
@@ -415,17 +585,19 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
 
     while True:
         sch_send({"type": "request", "worker_id": wid,
-                  "warm_paths": list(warm), "cached_shards": list(shard_cache)})
+                  "warm_paths": list(warm), "cached_shards": list(shard_cache),
+                  "capabilities": caps})
         task = recv_msg(sch, max_msg_bytes)
         if task is None:
             raise OSError("scheduler disconnected")  # not a clean stop -> reconnect
         if task["type"] == "stop":
             return True
         if task["type"] == "idle":
-            time.sleep(poll_interval)
+            time.sleep(task.get("retry_in") or poll_interval)  # server-paced when set
             continue
 
         path = task["path"]
+        lease = task.get("lease")
         worker.seed = task["seed"]
         engine.total_rounds = task["total_rounds"]
         routing = {k: tuple(a) for k, a in task["routing"].items()}
@@ -436,7 +608,7 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
 
         stop_beat = threading.Event()
         beat = threading.Thread(target=_sch_heartbeat,
-                                args=(sch_send, stop_beat, heartbeat_interval, wid, path),
+                                args=(sch_send, stop_beat, heartbeat_interval, wid, lease, path),
                                 daemon=True)
         beat.start()
         try:
@@ -452,8 +624,11 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
                 versions.update(reply.get("versions", {}))
             if cold:
                 engine._opt_state.pop(path, None)  # reset Adam on a cold start
+                residuals.pop(path, None)          # and any stale error-feedback carry
             if task.get("shard") is not None:
-                shard_cache[path] = task["shard"]
+                shard_cache[path] = restore_shard(task["shard"])
+            elif task.get("shard_spec") is not None and path not in shard_cache:
+                shard_cache[path] = _materialize_from_spec(task["shard_spec"], data_ctx)
             shard = shard_cache[path]
             contrib = worker._train_path(path, shard, task["batch_size"], task["gen_id"])
         finally:
@@ -461,18 +636,25 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
             beat.join(timeout=1)
 
         ack = _rpc_send(sch, send_lock, max_msg_bytes,
-                        {"type": "commit", "path": path, "worker_id": wid,
-                         "issued_token": task["gen_id"]})
+                        {"type": "commit", "path": path, "worker_id": wid, "lease": lease,
+                         "loss": contrib.loss, "empty": contrib.empty})
         if ack is None:
             raise OSError("scheduler disconnected during commit")
         if ack.get("accepted"):
-            w = ack["push_weight"]
+            grant = ack["grant"]  # carries the push weight + allowed keys to the PSs
+            # Encode only after acceptance, so the error-feedback residual always
+            # reflects an update that is actually pushed.
+            shared_payload, private_payload, pending_res = _compress_contribution(
+                contrib, task.get("compress") or "none", residuals, path
+            )
+            _commit_residuals(residuals, path, pending_res)
             for addr, keys in by_ps.items():
-                updates = {k: {"grad": contrib.shared_delta[k], "weight": w}
-                           for k in keys if not is_private_key(k) and k in contrib.shared_delta}
-                private = {k: contrib.private_state[k]
-                           for k in keys if is_private_key(k) and k in contrib.private_state}
-                _rpc(ps_sock(addr), {"type": "push", "updates": updates, "private": private},
+                updates = {k: {"grad": shared_payload[k]}
+                           for k in keys if not is_private_key(k) and k in shared_payload}
+                private = {k: private_payload[k]
+                           for k in keys if is_private_key(k) and k in private_payload}
+                _rpc(ps_sock(addr),
+                     {"type": "push", "grant": grant, "updates": updates, "private": private},
                      max_msg_bytes)
             engine._opt_state[path] = contrib.opt_state          # warm-back
             _load_private(engine, contrib.private_state)
@@ -517,9 +699,9 @@ def _rpc_send(sock, lock, max_msg_bytes, msg):
         return recv_msg(sock, max_msg_bytes)
 
 
-def _sch_heartbeat(sch_send, stop_beat, interval, wid, path):
+def _sch_heartbeat(sch_send, stop_beat, interval, wid, lease, path):
     while not stop_beat.wait(interval):
         try:
-            sch_send({"type": "heartbeat", "path": path, "worker_id": wid})
+            sch_send({"type": "heartbeat", "lease": lease, "path": path, "worker_id": wid})
         except OSError:
             return

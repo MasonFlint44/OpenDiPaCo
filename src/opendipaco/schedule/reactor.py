@@ -109,6 +109,8 @@ class TransportMetrics:
     bytes_opt: int = 0
     accepted_updates: int = 0
     stale_rejected: int = 0
+    invalid_rejected: int = 0   # non-finite gradient/weights/loss -> contribution dropped
+    norm_clipped: int = 0       # pseudo-gradients scaled down to max_update_norm
     staleness_sum: int = 0
     max_staleness: int = 0
     _wall: float = 0.0
@@ -136,6 +138,14 @@ class TransportMetrics:
     def record_stale_reject(self) -> None:
         with self._lock:
             self.stale_rejected += 1
+
+    def record_invalid_reject(self) -> None:
+        with self._lock:
+            self.invalid_rejected += 1
+
+    def record_norm_clip(self) -> None:
+        with self._lock:
+            self.norm_clipped += 1
 
     def record_out(self, msg: dict, nbytes: int) -> None:
         with self._lock:
