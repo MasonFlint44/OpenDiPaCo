@@ -60,7 +60,7 @@ from .distributed import (
 )
 from .guard import all_finite, clip_norm_, loss_ok
 from .identity import sign_record, verify_record
-from .ownership import make_epoch_record
+from .ownership import epoch_newer, make_epoch_record, owners_for, verify_epoch_record
 from .reactor import DEFAULT_MAX_MSG_BYTES, _ReactorServer
 from .scheduler import AsyncScheduler
 from .wire import _key_bytes, client_handshake, recv_msg, send_msg
@@ -137,18 +137,51 @@ def verify_grant(grant, grant_key, *, scheduler_pub: str | None = None) -> bool:
     return hmac.compare_digest(grant.get("mac", ""), expected)
 
 
+def _opt_to_wire(sd: dict) -> dict:
+    """Optimizer state_dicts key their ``state`` by parameter *index* (int) --
+    the wire codec only takes str dict keys, so stringify for transport."""
+    return {"state": {str(i): st for i, st in sd["state"].items()},
+            "param_groups": sd["param_groups"]}
+
+
+def _opt_from_wire(sd: dict) -> dict:
+    return {"state": {int(i): st for i, st in sd["state"].items()},
+            "param_groups": sd["param_groups"]}
+
+
+def _version_pair(v) -> tuple:
+    """Coerce a stored version to the (epoch, counter) pair form (Phase 2b);
+    pre-pair checkpoints stored bare ints, which were all epoch-0."""
+    return tuple(v) if isinstance(v, (tuple, list)) else (0, int(v))
+
+
 # -- parameter server --------------------------------------------------------
 
 
 class ParameterServer(_ReactorServer):
-    """Owns a shard of module keys: their weights, versions, and outer optimizers.
+    """Owns module keys: their weights, versions, and outer optimizers.
 
     ``fetch`` returns the requested owned weights (versioned; private only when the
     worker is cold); ``push`` applies a weighted per-module outer step to owned
     shared modules and stores owned private modules. A push must present a commit
     grant from the scheduler: the weight and allowed keys are taken from the grant,
-    each grant is single-use here, and with ``grant_key=`` set the signature is
-    verified (set the same key on the :class:`Scheduler`; don't give it to workers).
+    each grant is single-use here, and signed per the configured mode
+    (``grant_key=`` HMAC, or ``scheduler_pub=`` Ed25519 -- see the grants section).
+
+    Two ownership modes (Phase 2b, design D2/D4/D6):
+
+    * **static** -- ``owned_keys`` fixed at launch (today's trusted-cluster
+      shape); the server is primary for everything it owns and versions carry
+      epoch 0.
+    * **dynamic** -- pass ``identity=`` and an ``epoch_record=``: the owned set
+      is *derived* (``owners_for`` over the record), the server accepts pushes
+      only for keys it is **primary** for, and a replication thread pulls every
+      backup/syncing key from its authoritative replica each
+      ``replicate_interval`` seconds (the failover loss window). Keys gained at
+      runtime (:meth:`apply_epoch`) start ``syncing`` and are served only after
+      a successful pull; keys lost stay servable (lame duck). Versions are
+      ``(epoch, counter)`` pairs so a promoted backup can never re-issue an old
+      version number with different bytes.
     """
 
     _SEEN_GRANTS_MAX = 4096  # replay window; older tokens age out FIFO
@@ -156,12 +189,13 @@ class ParameterServer(_ReactorServer):
     def __init__(self, config, owned_keys, diloco, *, host="0.0.0.0", port=0,
                  auth_key=None, device="cpu", resume_dir=None, grant_key=None,
                  scheduler_pub=None, max_update_norm=None, compress="none",
+                 identity=None, epoch_record=None, replicate_interval=10.0,
+                 peer_auth=None, peer_tls=None, bootstrap=True, bank_seed=0,
                  **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.config = config
         self.diloco = diloco
         self.device = torch.device(device)
-        self.owned_keys = set(owned_keys)
         self.grant_key = grant_key
         # Ed25519 grant mode: the scheduler's *public* key. When set it is the
         # only accepted grant form (HMAC grants are refused -- no downgrade).
@@ -172,21 +206,63 @@ class ParameterServer(_ReactorServer):
         # Downlink (fetch) compression; pushes are decoded self-describingly.
         self.compress = check_mode(compress)
         self._seen_grants: collections.OrderedDict = collections.OrderedDict()
-        # Build the full bank deterministically, then keep only this shard's keys.
-        full = build_module_bank(config)
+
+        self.identity = identity
+        self.peer_id = getattr(identity, "peer_id", None)
+        self._all_keys = set(config.build_topology().module_keys())
+        self._epoch = None
+        self._epoch_num = 0
+        if epoch_record is not None:
+            if self.peer_id is None:
+                raise ValueError("epoch_record= needs identity=")
+            if not verify_epoch_record(epoch_record):
+                raise ValueError("invalid epoch record")
+            self._epoch = epoch_record
+            self._epoch_num = epoch_record["epoch"]
+            owned_keys = [k for k in self._all_keys
+                          if self.peer_id in self._owner_ids(k, epoch_record)]
+        self.owned_keys = set(owned_keys)
+        # What this peer presents when *dialing* other owners for replication;
+        # its identity by default, so the source can gate state on the session.
+        self._peer_auth = peer_auth if peer_auth is not None else (identity or auth_key)
+        self._peer_tls = peer_tls
+        self._peer_conns: dict = {}
+        self._repl_interval = replicate_interval
+        self._repl_stop = threading.Event()
+        self._repl_thread = None
+
+        # Build the bank as a pure function of (config, bank_seed): every owner
+        # passing the same seed gets bit-identical modules, which is what lets
+        # version (0, 0) mean the same bytes on every replica (see _versions).
+        self.bank_seed = bank_seed
+        full = build_module_bank(config, seed=bank_seed)
         self.bank = {k: full[k].to(self.device) for k in self.owned_keys}
         self._lock = threading.Lock()
-        self._versions = {k: 0 for k in self.owned_keys if not is_private_key(k)}
+        # (epoch, counter) per owned key, *including* private modules: pull
+        # replication needs an order on private stores too. Counters start at
+        # (0, 0), which identifies the seeded freshly-built bank -- equal
+        # versions imply equal bytes, everywhere, always.
+        self._versions = {k: (0, 0) for k in self.owned_keys}
         self._outer_opts = {
-            k: make_outer_optimizer({k: self.bank[k]}, diloco) for k in self._versions
+            k: make_outer_optimizer({k: self.bank[k]}, diloco)
+            for k in self.owned_keys if not is_private_key(k)
         }
+        # Served keys. ``bootstrap=True`` (a cluster start): everything owned
+        # serves immediately -- every owner built the identical (0, 0) bank.
+        # ``bootstrap=False`` (joining a live cluster): serve nothing until the
+        # replication pull catches each key up.
+        self._active = set(self.owned_keys) if bootstrap else set()
         if resume_dir is not None and os.path.exists(os.path.join(resume_dir, self._shard_name())):
             self.load_shard(resume_dir)  # restart this shard from a checkpoint
 
-    def _handle(self, msg: dict, nbytes: int):
+    @staticmethod
+    def _owner_ids(key, record) -> set:
+        return {o["peer_id"] for o in owners_for(key, record)}
+
+    def _handle(self, msg: dict, nbytes: int, peer_id: str | None = None):
         kind = msg.get("type")
         if kind == "fetch":
-            return self._fetch(msg)
+            return self._fetch(msg, peer_id)
         if kind == "push":
             return self._push(msg)
         if kind == "checkpoint":
@@ -194,13 +270,56 @@ class ParameterServer(_ReactorServer):
             return {"type": "ack"}
         return None
 
-    def _fetch(self, msg: dict) -> dict:
+    # -- lifecycle helpers (call under self._lock) -----------------------------
+
+    def _state_allowed_locked(self, key, peer_id) -> bool:
+        """May this session pull replication state (exact weights + momentum)?
+
+        Static mode: yes (trusted cluster, replication unused anyway). Dynamic:
+        only a session identity-authenticated as one of the key's owners in the
+        current epoch.
+        """
+        if self._epoch is None:
+            return True
+        return peer_id is not None and peer_id in self._owner_ids(key, self._epoch)
+
+    def _primary_locked(self, key) -> bool:
+        """Is this server the (active) primary for ``key``? Static mode: always."""
+        if self._epoch is None:
+            return True
+        if key not in self._active:
+            return False  # a syncing primary's base state is stale; refuse writes
+        owners = owners_for(key, self._epoch)
+        return bool(owners) and owners[0]["peer_id"] == self.peer_id
+
+    def _bump_version_locked(self, key) -> None:
+        e, c = self._versions[key]
+        self._versions[key] = (self._epoch_num, c + 1 if e == self._epoch_num else 1)
+
+    def _fetch(self, msg: dict, peer_id: str | None = None) -> dict:
         have = msg.get("have", {})
         cold = msg.get("cold", False)
-        weights, versions = {}, {}
+        want_state = bool(msg.get("include_state"))
+        weights, versions, state, missing = {}, {}, {}, []
         with self._lock:
             for k in msg.get("keys", []):
-                if k not in self.owned_keys:
+                if k not in self.bank or k not in self._active:
+                    missing.append(k)  # not held / still syncing -> try a replica
+                    continue
+                if want_state:
+                    # Replication pull: exact bytes (replicas must be bit-equal,
+                    # so no wire compression here) + outer momentum, all-or-
+                    # nothing per key -- an unauthorized session gets "missing",
+                    # never a silently degraded copy.
+                    if not self._state_allowed_locked(k, peer_id):
+                        missing.append(k)
+                        continue
+                    versions[k] = self._versions[k]
+                    if tuple(have.get(k) or ()) != self._versions[k]:
+                        weights[k] = _state_to_cpu(self.bank[k].state_dict())
+                        if k in self._outer_opts:
+                            state[k] = _opt_to_wire(_optimizer_state_to_cpu(
+                                self._outer_opts[k].state_dict()))
                     continue
                 if is_private_key(k):
                     if cold:  # ship the path's private modules only on a cold start
@@ -208,10 +327,155 @@ class ParameterServer(_ReactorServer):
                             _state_to_cpu(self.bank[k].state_dict()), self.compress)
                 else:
                     versions[k] = self._versions[k]
-                    if have.get(k) != self._versions[k]:  # ship only what's stale
+                    if tuple(have.get(k) or ()) != self._versions[k]:  # ship only stale
                         weights[k] = compress_state(
                             _state_to_cpu(self.bank[k].state_dict()), self.compress)
-        return {"type": "weights", "weights": weights, "versions": versions}
+        out = {"type": "weights", "weights": weights, "versions": versions}
+        if want_state:
+            out["state"] = state
+        if missing:
+            out["missing"] = missing
+        return out
+
+    def apply_epoch(self, record, *, bootstrap: bool = False) -> None:
+        """Adopt a newer owner-set epoch.
+
+        Gained keys are built fresh (the deterministic ``(0, 0)`` bank state)
+        and enter ``syncing`` -- served and writable only after the replication
+        pull catches them up. ``bootstrap=True`` marks a coordinated cluster
+        *start* instead: every owner boots the identical ``(0, 0)`` bank, so
+        owned keys serve immediately (there is nobody to sync from). Lost keys
+        leave ``owned_keys`` but stay servable (lame duck) until a later
+        epoch's owners take over (trimmed in 2c).
+        """
+        if self.peer_id is None:
+            raise RuntimeError("apply_epoch needs identity=")
+        if not verify_epoch_record(record):
+            raise ValueError("invalid epoch record")
+        with self._lock:
+            if self._epoch is not None and not epoch_newer(record, self._epoch):
+                return
+            owned = {k for k in self._all_keys if self.peer_id in self._owner_ids(k, record)}
+            gained = owned - set(self.bank)
+            if gained:
+                # Seeded build: gained keys start at the same (0, 0) bytes as
+                # everyone else's, so the version gate stays truthful.
+                full = build_module_bank(self.config, seed=self.bank_seed)
+                for k in gained:
+                    self.bank[k] = full[k].to(self.device)
+                    self._versions[k] = (0, 0)
+            for k in owned:
+                if not is_private_key(k) and k not in self._outer_opts:
+                    self._outer_opts[k] = make_outer_optimizer({k: self.bank[k]}, self.diloco)
+            self.owned_keys = owned
+            if bootstrap:
+                self._active |= owned
+            self._epoch = record
+            self._epoch_num = record["epoch"]
+
+    # -- pull replication (design D4: backups poll, idempotent, version-gated) --
+
+    def start(self) -> None:
+        super().start()
+        self._repl_thread = threading.Thread(target=self._replicate_loop, daemon=True)
+        self._repl_thread.start()
+
+    def _replicate_loop(self) -> None:
+        while not self._repl_stop.wait(self._repl_interval):
+            if self._stop or self._dead:
+                return
+            try:
+                self._replicate_once()
+            except Exception:  # noqa: BLE001 -- a peer mid-restart must not kill the puller
+                pass
+
+    def _replicate_once(self) -> dict:
+        """One delta-sync pass: every owned key pulls from its authoritative
+        source -- backups from the primary (then fellow replicas), a syncing
+        primary from its backups. Returns ``{key: "active" | "pending"}``.
+        """
+        with self._lock:
+            epoch = self._epoch
+            if epoch is None or self.peer_id is None:
+                return {}
+            candidates: dict = {}  # key -> [addr, ...] to try, in order
+            for k in sorted(self.owned_keys):
+                owners = owners_for(k, epoch)
+                ids = [o["peer_id"] for o in owners]
+                if self.peer_id not in ids:
+                    continue
+                if ids[0] == self.peer_id:
+                    if k in self._active:
+                        continue  # active primary: authoritative, nothing to pull
+                    srcs = owners[1:]  # syncing primary catches up from backups
+                else:
+                    srcs = [owners[0]] + [o for o in owners[1:] if o["peer_id"] != self.peer_id]
+                if srcs:
+                    candidates[k] = [tuple(o["addr"]) for o in srcs]
+        results = {k: "pending" for k in candidates}
+        pending = dict(candidates)
+        while pending:
+            k0 = next(iter(pending))
+            addr = pending[k0][0]
+            batch = [k for k, cands in pending.items() if cands[0] == addr]
+            with self._lock:
+                have = {k: self._versions.get(k) for k in batch}
+            try:
+                reply = self._peer_rpc(addr, {"type": "fetch", "keys": batch,
+                                              "have": have, "include_state": True})
+            except (OSError, ConnectionError):
+                reply = None
+            served = (reply or {}).get("versions") or {}
+            with self._lock:
+                for k in batch:
+                    v = served.get(k)
+                    if v is None:  # peer down / key missing there -> next candidate
+                        pending[k] = pending[k][1:]
+                        if not pending[k]:
+                            pending.pop(k)
+                        continue
+                    pending.pop(k)
+                    v = tuple(v)
+                    if v > self._versions[k]:
+                        sd = (reply.get("weights") or {}).get(k)
+                        if sd is None:
+                            continue  # source claims newer but shipped nothing; retry next pass
+                        self.bank[k].load_state_dict(
+                            {n: t.to(self.device) for n, t in sd.items()})
+                        osd = (reply.get("state") or {}).get(k)
+                        if osd is not None and k in self._outer_opts:
+                            self._outer_opts[k].load_state_dict(_opt_from_wire(osd))
+                        self._versions[k] = v
+                    if self._versions[k] >= v:  # confirmed at/ahead of the source -> serve
+                        self._active.add(k)
+                        results[k] = "active"
+        return results
+
+    def _peer_rpc(self, addr, msg):
+        sock = self._peer_conns.get(addr)
+        if sock is None:
+            sock = _ps_connect(addr, self._peer_auth, self.max_msg_bytes, 5.0,
+                               tls=self._peer_tls, server_hostname=addr[0])
+            self._peer_conns[addr] = sock
+        try:
+            return _rpc(sock, msg, self.max_msg_bytes)
+        except OSError:
+            self._peer_conns.pop(addr, None)
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise
+
+    def shutdown(self) -> None:
+        self._repl_stop.set()
+        for s in self._peer_conns.values():
+            try:
+                s.close()
+            except OSError:
+                pass
+        self._peer_conns.clear()
+        super().shutdown()
 
     def _push(self, msg: dict) -> dict:
         grant = msg.get("grant")
@@ -229,6 +493,7 @@ class ParameterServer(_ReactorServer):
         private = msg.get("private") or {}
         weight = float(grant["weight"])
         allowed = set(grant["keys"])
+        skipped, n_applied = [], 0
         with self._lock:
             if grant["token"] in self._seen_grants:
                 return {"type": "ack", "applied": False}  # replay -> refuse
@@ -242,16 +507,32 @@ class ParameterServer(_ReactorServer):
             for k, grad in updates.items():
                 if k not in self.owned_keys or is_private_key(k) or k not in allowed:
                     continue
+                if not self._primary_locked(k):  # backups copy state, never apply writes
+                    skipped.append(k)
+                    continue
                 if self.max_update_norm is not None:
                     if clip_norm_(grad, self.max_update_norm) > self.max_update_norm:
                         self.metrics.record_norm_clip()
                 apply_outer_grads(self.bank[k], [weight * g.to(self.device) for g in grad])
                 self._outer_opts[k].step()
                 self._outer_opts[k].zero_grad(set_to_none=True)
-                self._versions[k] += 1
+                self._bump_version_locked(k)
+                n_applied += 1
             for k, sd in private.items():
-                if k in self.owned_keys and k in allowed:
-                    _load_into(self, k, sd)  # store latest private (authoritative-local)
+                if k not in self.owned_keys or k not in allowed:
+                    continue
+                if not self._primary_locked(k):
+                    skipped.append(k)
+                    continue
+                _load_into(self, k, sd)  # store latest private (authoritative-local)
+                self._bump_version_locked(k)
+                n_applied += 1
+            epoch_num = self._epoch_num
+        if skipped:
+            # Stale routing (the worker's epoch is behind): refuse outright when
+            # nothing landed so the loss is visible, list partial skips otherwise.
+            return {"type": "ack", "applied": n_applied > 0, "skipped": sorted(skipped),
+                    "reason": "not_primary", "epoch": epoch_num}
         return {"type": "ack", "applied": True}
 
     def _shard_name(self) -> str:
@@ -280,7 +561,8 @@ class ParameterServer(_ReactorServer):
             for k, sd in blob["weights"].items():
                 if k in self.bank:
                     self.bank[k].load_state_dict({n: v.to(self.device) for n, v in sd.items()})
-            self._versions.update({k: v for k, v in blob["versions"].items() if k in self._versions})
+            self._versions.update({k: _version_pair(v) for k, v in blob["versions"].items()
+                                   if k in self._versions})
             for k, sd in blob.get("outer_opts", {}).items():
                 if k in self._outer_opts:  # restore Nesterov momentum, not just weights
                     self._outer_opts[k].load_state_dict(sd)
@@ -328,8 +610,14 @@ class Scheduler(_ReactorServer):
 
         # key -> (host, port) of the owning parameter server.
         self.ps_addrs = [tuple(a) for a in ps_addrs]
-        self._key_shard = assign_shards(self.topology.module_keys(), len(self.ps_addrs))
-        self._routing = {k: list(self.ps_addrs[s]) for k, s in self._key_shard.items()}
+        # Routing values are *replica lists* in rank order (primary first); the
+        # static map has one entry per key. With no ps_addrs the scheduler is in
+        # rendezvous mode: routing derives from the published epoch instead.
+        if self.ps_addrs:
+            key_shard = assign_shards(self.topology.module_keys(), len(self.ps_addrs))
+            self._routing = {k: [list(self.ps_addrs[s])] for k, s in key_shard.items()}
+        else:
+            self._routing = {}
 
         self._lock = threading.Lock()
         self._serving = False
@@ -341,7 +629,7 @@ class Scheduler(_ReactorServer):
         self._lease: dict = {}  # path -> current lease token (fences commits)
         self._owner: dict = {}
 
-    def _handle(self, msg: dict, nbytes: int):
+    def _handle(self, msg: dict, nbytes: int, peer_id: str | None = None):
         kind = msg.get("type")
         if kind == "request":
             return self._next_task(msg)
@@ -389,6 +677,8 @@ class Scheduler(_ReactorServer):
                 self._worker_caps[wid] = caps
             if not self._serving or self._T >= self._target:
                 return {"type": "stop"} if self._stop else self._idle()
+            if not self._routing and self._epoch_record is None:
+                return self._idle()  # rendezvous mode before the first epoch
             self._reclaim_inflight_locked()
             eligible = [p for p in self._completed if p not in self._inflight]
             if not eligible:
@@ -401,7 +691,11 @@ class Scheduler(_ReactorServer):
             self._lease[path] = lease
             generation = self._completed[path]
             keys = self.topology.path_module_keys(path)
-            routing = {k: self._routing[k] for k in keys}
+            if self._epoch_record is not None:  # rendezvous: replicas in rank order
+                routing = {k: [list(o["addr"]) for o in owners_for(k, self._epoch_record)]
+                           for k in keys}
+            else:
+                routing = {k: self._routing[k] for k in keys}
         # Data plane: shard bytes, or just the recipe for a spec corpus.
         shard, shard_spec = None, None
         if path not in cached:
@@ -512,7 +806,10 @@ class Scheduler(_ReactorServer):
     def _checkpoint_cluster(self, dirpath: str) -> None:
         """Save the scheduler clock and trigger every parameter server to persist."""
         os.makedirs(dirpath, exist_ok=True)
-        for addr in self.ps_addrs:
+        with self._lock:
+            addrs = (sorted({tuple(o["addr"]) for o in self._epoch_record["owners"]})
+                     if self._epoch_record is not None else self.ps_addrs)
+        for addr in addrs:
             try:
                 s = _ps_connect(addr, self.auth_key, DEFAULT_MAX_MSG_BYTES, 5.0,
                                 tls=self.ps_tls, server_hostname=addr[0])
@@ -653,11 +950,46 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
         lease = task.get("lease")
         worker.seed = task["seed"]
         engine.total_rounds = task["total_rounds"]
-        routing = {k: tuple(a) for k, a in task["routing"].items()}
-        by_ps: dict = {}
-        for k, addr in routing.items():
-            by_ps.setdefault(addr, []).append(k)
+        # Routing values are replica addr lists in rank order (primary first).
+        routing = {k: [tuple(a) for a in addrs] for k, addrs in task["routing"].items()}
         cold = path not in warm
+
+        def fetch_keys():
+            """Fetch each key from its first responsive replica: prefer an
+            already-connected owner, else rank order; a replica that is down or
+            still syncing ("missing") falls back to the next one (design D8)."""
+            pending = {
+                k: [a for a in addrs if a in ps_conns] + [a for a in addrs if a not in ps_conns]
+                for k, addrs in routing.items()
+            }
+            while pending:
+                addr = next(iter(pending.values()))[0]
+                batch = [k for k, cands in pending.items() if cands[0] == addr]
+                try:
+                    reply = _rpc(ps_sock(addr), {
+                        "type": "fetch", "keys": batch, "cold": cold,
+                        "have": {k: versions.get(k) for k in batch if not is_private_key(k)},
+                    }, max_msg_bytes)
+                    if reply is None:
+                        raise OSError(f"replica {addr} closed")
+                except (OSError, ConnectionError):
+                    ps_conns.pop(addr, None)
+                    for k in batch:
+                        pending[k] = pending[k][1:]
+                        if not pending[k]:
+                            raise OSError(f"no replica could serve {k}")
+                    continue
+                missing = set(reply.get("missing") or [])
+                for k, sd in reply["weights"].items():
+                    _load_into(engine, k, sd)
+                versions.update(reply.get("versions", {}))
+                for k in batch:
+                    if k in missing:
+                        pending[k] = pending[k][1:]
+                        if not pending[k]:
+                            raise OSError(f"no replica could serve {k}")
+                    else:
+                        pending.pop(k)
 
         stop_beat = threading.Event()
         beat = threading.Thread(target=_sch_heartbeat,
@@ -667,14 +999,7 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
         try:
             if fault_hook is not None:
                 fault_hook(path, 1)
-            for addr, keys in by_ps.items():
-                reply = _rpc(ps_sock(addr), {
-                    "type": "fetch", "keys": keys, "cold": cold,
-                    "have": {k: versions.get(k) for k in keys if not is_private_key(k)},
-                }, max_msg_bytes)
-                for k, sd in reply["weights"].items():
-                    _load_into(engine, k, sd)
-                versions.update(reply.get("versions", {}))
+            fetch_keys()
             if cold:
                 engine._opt_state.pop(path, None)  # reset Adam on a cold start
                 residuals.pop(path, None)          # and any stale error-feedback carry
@@ -701,11 +1026,16 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
                 contrib, task.get("compress") or "none", residuals, path
             )
             _commit_residuals(residuals, path, pending_res)
-            for addr, keys in by_ps.items():
+            by_primary: dict = {}  # writes go to rank 0 only (design D3)
+            for k, addrs in routing.items():
+                by_primary.setdefault(addrs[0], []).append(k)
+            for addr, keys in by_primary.items():
                 updates = {k: {"grad": shared_payload[k]}
                            for k in keys if not is_private_key(k) and k in shared_payload}
                 private = {k: private_payload[k]
                            for k in keys if is_private_key(k) and k in private_payload}
+                if not updates and not private:
+                    continue
                 _rpc(ps_sock(addr),
                      {"type": "push", "grant": grant, "updates": updates, "private": private},
                      max_msg_bytes)

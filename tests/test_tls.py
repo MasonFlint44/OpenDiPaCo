@@ -221,4 +221,4 @@ def test_sharded_over_tls_completes(certs):
     w.join(timeout=15)
     assert sum(completed.values()) >= cfg.num_paths * 2
     # The shards genuinely moved over the encrypted channel.
-    assert any(ps._versions and max(ps._versions.values()) > 0 for ps in pss)
+    assert any(ps._versions and max(ps._versions.values()) > (0, 0) for ps in pss)

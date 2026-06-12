@@ -421,7 +421,9 @@ class _IOThread:
         if wid is not None:
             srv.metrics.record_worker(wid)  # any worker-tagged message = liveness
         srv.metrics.record_in(msg, nin)
-        reply = srv._handle(msg, nin)  # subclass dispatch
+        # conn.peer_id (identity-authenticated sessions only) lets handlers gate
+        # peer-to-peer operations -- e.g. replication state pulls (Phase 2b).
+        reply = srv._handle(msg, nin, conn.peer_id)  # subclass dispatch
         if reply is not None:
             nout = self._queue(conn, reply)
             srv.metrics.record_out(reply, nout)
@@ -555,7 +557,12 @@ class _ReactorServer:
         self._metrics_logger = None
 
     # -- subclass hook -------------------------------------------------------
-    def _handle(self, msg: dict, nbytes: int):
+    def _handle(self, msg: dict, nbytes: int, peer_id: str | None = None):
+        """Turn one decoded message into an optional reply dict.
+
+        ``peer_id`` is the session's Ed25519-authenticated peer id (None for
+        HMAC-authed or unauthenticated connections).
+        """
         raise NotImplementedError
 
     # -- per-peer identity admission ------------------------------------------

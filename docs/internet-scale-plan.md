@@ -363,7 +363,7 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
 | ~~0e~~ ✅ | ~~bf16 inner loop, capability negotiation, idle backoff, hygiene~~ | **Done** — 1.10 (autocast + batch caps), 1.9 (idle pacing), 1.11, 1.12 | S–M |
 | 0f | WAN validation run of the async path | 1.4 | M (mostly wall-clock) |
 | ~~1~~ ✅ | ~~Peer identity + tracker + reachability tiers~~ | **Done** — 1.13, 1.8 (prereq); per-frame envelopes + autonomous gossip deferred to Phase 2 | M |
-| 2 | Replicated module owners, dynamic ownership, signed manifests — **2a done** (HRW placement, signed epoch records, Ed25519 grants, tracker epoch cache); 2b–2d pending | 1.8 | L |
+| 2 | Replicated module owners, dynamic ownership, signed manifests — **2a, 2b done** (HRW placement, signed epochs, Ed25519 grants, version pairs, pull replication, fetch-any/push-primary); 2c–2d pending | 1.8 | L |
 | 3 | Robust aggregation, redundancy, reputation, private-module policy | 1.1, 1.9, 1.14 | L |
 | 4 | Decentralized scheduling (optional) | residual SPOF | L |
 

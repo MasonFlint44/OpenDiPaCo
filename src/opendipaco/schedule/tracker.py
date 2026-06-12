@@ -128,7 +128,7 @@ class Tracker(_ReactorServer):
         return self.open_enrollment or pub.lower() in self._enrolled
 
     # -- handlers ----------------------------------------------------------------
-    def _handle(self, msg: dict, nbytes: int):
+    def _handle(self, msg: dict, nbytes: int, peer_id: str | None = None):
         kind = msg.get("type")
         if kind == "register":
             return self._register(msg.get("record"))

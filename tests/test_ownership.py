@@ -239,10 +239,10 @@ def test_ps_push_requires_scheduler_signature():
 
         good = make_grant(path, keys, 1.0, "tok-g", identity=sched_id)
         assert ps._push({"grant": good, "updates": {k0: grad}})["applied"] is True
-        assert ps._versions[k0] == v0 + 1
+        assert ps._versions[k0] == (0, v0[1] + 1)  # (epoch, counter) pairs (2b)
         # Single-use: replaying the signed grant is refused like an HMAC one.
         assert ps._push({"grant": good, "updates": {k0: grad}})["applied"] is False
-        assert ps._versions[k0] == v0 + 1
+        assert ps._versions[k0] == (0, v0[1] + 1)
     finally:
         ps.shutdown()
 
@@ -267,7 +267,7 @@ def test_sharded_end_to_end_with_signed_grants():
     try:
         completed = sched.fit(num_generations=2, total_generations=2)
         assert sum(completed.values()) >= sched._target
-        assert any(v > 0 for ps in pss for v in ps._versions.values())  # pushes landed
+        assert any(v > (0, 0) for ps in pss for v in ps._versions.values())  # pushes landed
     finally:
         sched.shutdown()
         for ps in pss:

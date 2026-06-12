@@ -332,7 +332,7 @@ def test_sharded_checkpoint_resume(tmp_path):
     loaded2, _ = _resume_snap()
     assert _maxdiff(init, loaded) > 1e-4   # restored trained weights, not init...
     assert _maxdiff(loaded, loaded2) == 0  # ...exactly and reproducibly from the file
-    assert all(v > 0 for v in versions)    # versions restored too
+    assert all(v > (0, 0) for v in versions)  # (epoch, counter) versions restored too
 
     # The scheduler's clock resumes (a fresh scheduler restores _T > 0 from the file).
     sched = Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1), ("127.0.0.1", 2)], _diloco(),

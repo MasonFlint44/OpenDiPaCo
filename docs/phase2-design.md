@@ -1,9 +1,14 @@
 # Phase 2 design — distribute the module bank (PS → replicated owner peers)
 
-Status: **slice 2a landed** (`schedule/ownership.py`: HRW + epoch records;
-Ed25519 grants beside HMAC; scheduler `epoch` RPC + `publish_epoch`; tracker
-epoch cache with signer pinning — `put_epoch`/`get_epoch`). Slices 2b–2d
-pending. This expands the Phase 2 sketch in
+Status: **slices 2a + 2b landed.** 2a: `schedule/ownership.py` (HRW + epoch
+records), Ed25519 grants beside HMAC, scheduler `epoch` RPC + `publish_epoch`,
+tracker epoch cache with signer pinning. 2b: `(epoch, counter)` version pairs,
+dynamic owner key sets with the `syncing → active` lifecycle
+(`apply_epoch`/`bootstrap=`), pull replication (`include_state`, owner-session
+gated, momentum + private counters, **exact bytes** — see the D4 amendment),
+rendezvous-mode scheduler routing, worker fetch-any/push-primary with replica
+fallback, and seeded bank builds (`bank_seed`, see D5 amendment). Slices
+2c–2d pending. This expands the Phase 2 sketch in
 [internet-scale-plan.md](internet-scale-plan.md) into concrete decisions before
 code. Each decision below (D1–D10) states the options considered and the
 recommendation; "open questions" at the end are the ones genuinely worth a
@@ -148,8 +153,11 @@ optimization if measurement demands it.
 
 **Momentum replicates with weights.** A promoted backup with weights but
 stale momentum changes the outer dynamics silently. Replication payload per
-key = weights + outer momentum + version, bf16-compressible on the wire
-(Phase 0c machinery).
+key = weights + outer momentum + version. *(Amended during 2b: replication
+ships **exact bytes**, never wire-compressed — bf16 round-trips are lossy, and
+a version stamp must always identify identical content or the whole gate
+lies. Replication-path compression is deferred with the other bandwidth
+optimizations in D10.)*
 
 **Private modules** get a version counter too (today `_versions` covers only
 shared keys; private stores bump nothing, so a puller can't tell stale from
@@ -183,6 +191,13 @@ owner set + the leasing worker.
   accepted pushes on the failed key's shard. That is the same class of
   perturbation as the async staleness dynamics — documented, dialable, and
   validated like every other dynamics change (§1.4 discipline).
+- *(Amended during 2b: **seeded bank builds**. `build_module_bank` used the
+  ambient RNG, so "every owner boots the identical `(0, 0)` bank" was false —
+  two owners' fresh builds differed, and a never-written key would silently
+  serve different bytes per replica. `build_module_bank(config, seed=…)` is
+  now a pure function of (config, seed) and owners pass a shared `bank_seed`
+  (default 0); version `(0, 0)` therefore means the same bytes on every
+  replica, which is the premise the whole version gate rests on.)*
 
 ### D6. Owner lifecycle and cold-sync
 
