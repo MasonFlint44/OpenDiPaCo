@@ -7,8 +7,18 @@ dynamic owner key sets with the `syncing → active` lifecycle
 (`apply_epoch`/`bootstrap=`), pull replication (`include_state`, owner-session
 gated, momentum + private counters, **exact bytes** — see the D4 amendment),
 rendezvous-mode scheduler routing, worker fetch-any/push-primary with replica
-fallback, and seeded bank builds (`bank_seed`, see D5 amendment). Slices
-2c–2d pending. This expands the Phase 2 sketch in
+fallback, and seeded bank builds (`bank_seed`, see D5 amendment). 2c:
+`EpochManager` (grace/flap/rate-limit hysteresis) + `Scheduler.watch_tracker`
+(tracker liveness → signed epoch bumps, cached back to the tracker), owners
+poll the scheduler for epochs from their replication loop
+(`scheduler_addr=`), **bootstrap-flagged first epoch** (a fresh cluster's
+owners boot-serve their seeded banks exactly once — without it a polled first
+epoch deadlocks with everyone syncing; restart-within-epoch over a lost disk
+remains a documented hole until 2d persistence), zombie write fencing +
+one-epoch lame ducks that double as **fallback pull sources** (a wholesale
+remap can still cold-sync from last epoch's owners), and
+`start_tracker_heartbeat`. Slice 2d pending. This expands the Phase 2 sketch
+in
 [internet-scale-plan.md](internet-scale-plan.md) into concrete decisions before
 code. Each decision below (D1–D10) states the options considered and the
 recommendation; "open questions" at the end are the ones genuinely worth a

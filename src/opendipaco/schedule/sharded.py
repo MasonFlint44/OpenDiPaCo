@@ -60,7 +60,13 @@ from .distributed import (
 )
 from .guard import all_finite, clip_norm_, loss_ok
 from .identity import sign_record, verify_record
-from .ownership import epoch_newer, make_epoch_record, owners_for, verify_epoch_record
+from .ownership import (
+    EpochManager,
+    epoch_newer,
+    make_epoch_record,
+    owners_for,
+    verify_epoch_record,
+)
 from .reactor import DEFAULT_MAX_MSG_BYTES, _ReactorServer
 from .scheduler import AsyncScheduler
 from .wire import _key_bytes, client_handshake, recv_msg, send_msg
@@ -191,7 +197,7 @@ class ParameterServer(_ReactorServer):
                  scheduler_pub=None, max_update_norm=None, compress="none",
                  identity=None, epoch_record=None, replicate_interval=10.0,
                  peer_auth=None, peer_tls=None, bootstrap=True, bank_seed=0,
-                 **reactor_kw):
+                 scheduler_addr=None, **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.config = config
         self.diloco = diloco
@@ -230,6 +236,11 @@ class ParameterServer(_ReactorServer):
         self._repl_interval = replicate_interval
         self._repl_stop = threading.Event()
         self._repl_thread = None
+        self._beat_thread = None
+        # With a scheduler address the replication loop also polls for newer
+        # epoch records, so ownership changes reach owners without restarts.
+        self._scheduler_addr = tuple(scheduler_addr) if scheduler_addr else None
+        self._prev_epoch = None  # last epoch's record: its owners are fallback pull sources
 
         # Build the bank as a pure function of (config, bank_seed): every owner
         # passing the same seed gets bit-identical modules, which is what lets
@@ -337,21 +348,29 @@ class ParameterServer(_ReactorServer):
             out["missing"] = missing
         return out
 
-    def apply_epoch(self, record, *, bootstrap: bool = False) -> None:
+    def apply_epoch(self, record, *, bootstrap: bool | None = None) -> None:
         """Adopt a newer owner-set epoch.
 
-        Gained keys are built fresh (the deterministic ``(0, 0)`` bank state)
-        and enter ``syncing`` -- served and writable only after the replication
-        pull catches them up. ``bootstrap=True`` marks a coordinated cluster
-        *start* instead: every owner boots the identical ``(0, 0)`` bank, so
-        owned keys serve immediately (there is nobody to sync from). Lost keys
-        leave ``owned_keys`` but stay servable (lame duck) until a later
-        epoch's owners take over (trimmed in 2c).
+        Gained keys are built fresh (the seeded ``(0, 0)`` bank state) and
+        enter ``syncing`` -- served and writable only after the replication
+        pull catches them up. ``bootstrap`` marks a coordinated cluster *start*
+        instead: every owner boots the identical ``(0, 0)`` bank, so owned keys
+        serve immediately (there is nobody to sync from); ``None`` (the polled
+        path) defers to the record's signed ``bootstrap`` flag. A crashed owner
+        restarting *within* the same epoch must resume from its checkpoint (2d)
+        or wait for the next bump -- re-applying a bootstrap epoch over a lost
+        disk would serve ``(0, 0)`` for state its backups have since trained.
+
+        Lost keys leave ``owned_keys`` but stay servable (lame duck) for one
+        more epoch -- replica fallback can still read them while the new
+        owners sync -- and are dropped on the epoch after that.
         """
         if self.peer_id is None:
             raise RuntimeError("apply_epoch needs identity=")
         if not verify_epoch_record(record):
             raise ValueError("invalid epoch record")
+        if bootstrap is None:
+            bootstrap = bool(record.get("bootstrap"))
         with self._lock:
             if self._epoch is not None and not epoch_newer(record, self._epoch):
                 return
@@ -367,9 +386,19 @@ class ParameterServer(_ReactorServer):
             for k in owned:
                 if not is_private_key(k) and k not in self._outer_opts:
                     self._outer_opts[k] = make_outer_optimizer({k: self.bank[k]}, self.diloco)
+            # Trim lame ducks from two epochs ago: keys neither owned now nor
+            # in the outgoing epoch (self.owned_keys, about to be replaced)
+            # have had a full epoch for their new owners to sync, and holding
+            # them forever would defeat the sharding.
+            for k in set(self.bank) - owned - self.owned_keys:
+                del self.bank[k]
+                self._versions.pop(k, None)
+                self._outer_opts.pop(k, None)
+                self._active.discard(k)
             self.owned_keys = owned
             if bootstrap:
                 self._active |= owned
+            self._prev_epoch = self._epoch
             self._epoch = record
             self._epoch_num = record["epoch"]
 
@@ -385,9 +414,24 @@ class ParameterServer(_ReactorServer):
             if self._stop or self._dead:
                 return
             try:
+                self._poll_epoch()
                 self._replicate_once()
             except Exception:  # noqa: BLE001 -- a peer mid-restart must not kill the puller
                 pass
+
+    def _poll_epoch(self) -> None:
+        """Ask the scheduler for the current epoch record; adopt it if newer.
+
+        This is how ownership changes reach a running owner (design D1): the
+        scheduler is the authority, owners poll. The record verifies against
+        ``scheduler_pub`` when pinned (and again inside ``apply_epoch``).
+        """
+        if self._scheduler_addr is None or self.peer_id is None:
+            return
+        reply = self._peer_rpc(self._scheduler_addr, {"type": "epoch"})
+        record = (reply or {}).get("record")
+        if record and verify_epoch_record(record, signer_pub=self.scheduler_pub):
+            self.apply_epoch(record)
 
     def _replicate_once(self) -> dict:
         """One delta-sync pass: every owned key pulls from its authoritative
@@ -410,8 +454,20 @@ class ParameterServer(_ReactorServer):
                     srcs = owners[1:]  # syncing primary catches up from backups
                 else:
                     srcs = [owners[0]] + [o for o in owners[1:] if o["peer_id"] != self.peer_id]
-                if srcs:
-                    candidates[k] = [tuple(o["addr"]) for o in srcs]
+                if self._prev_epoch is not None:
+                    # Last epoch's owners are this key's lame ducks: when every
+                    # *current* replica is still syncing (a remap moved the key
+                    # wholesale), they are the ones actually holding the data.
+                    srcs += [o for o in owners_for(k, self._prev_epoch)
+                             if o["peer_id"] != self.peer_id]
+                addrs, seen = [], set()
+                for o in srcs:
+                    a = tuple(o["addr"])
+                    if a not in seen:
+                        seen.add(a)
+                        addrs.append(a)
+                if addrs:
+                    candidates[k] = addrs
         results = {k: "pending" for k in candidates}
         pending = dict(candidates)
         while pending:
@@ -450,6 +506,37 @@ class ParameterServer(_ReactorServer):
                         self._active.add(k)
                         results[k] = "active"
         return results
+
+    def start_tracker_heartbeat(self, tracker_addr, advertise_host, *, roles=("owner",),
+                                interval=30.0, capabilities=None, auth_key=None,
+                                tls=None) -> None:
+        """Register this owner with a tracker and keep the record fresh.
+
+        Registers ``(advertise_host, self.port)`` as a ``public`` peer offering
+        ``roles``, then re-registers every ``interval`` seconds (keep it under
+        the tracker's TTL -- liveness *is* the heartbeat). When this owner
+        dies, its record expires and the scheduler's epoch manager eventually
+        re-maps its keys (design D5).
+        """
+        if self.identity is None:
+            raise RuntimeError("start_tracker_heartbeat needs identity=")
+        from .tracker import register_peer  # lazy: tracker imports this module
+
+        addr = tuple(tracker_addr)
+
+        def beat():
+            while not (self._stop or self._dead):
+                try:
+                    register_peer(addr, self.identity, reachability="public",
+                                  peer_addr=(advertise_host, self.port), roles=roles,
+                                  capabilities=capabilities, auth_key=auth_key, tls=tls)
+                except (OSError, ConnectionError):
+                    pass  # tracker briefly away; the next beat retries
+                if self._repl_stop.wait(interval):
+                    return
+
+        self._beat_thread = threading.Thread(target=beat, daemon=True)
+        self._beat_thread.start()
 
     def _peer_rpc(self, addr, msg):
         sock = self._peer_conns.get(addr)
@@ -505,7 +592,11 @@ class ParameterServer(_ReactorServer):
                 self.metrics.record_invalid_reject()
                 return {"type": "ack", "applied": False}
             for k, grad in updates.items():
-                if k not in self.owned_keys or is_private_key(k) or k not in allowed:
+                if is_private_key(k) or k not in allowed:
+                    continue
+                if k not in self.owned_keys:
+                    if self._epoch is not None:  # zombie routing: make the miss visible
+                        skipped.append(k)
                     continue
                 if not self._primary_locked(k):  # backups copy state, never apply writes
                     skipped.append(k)
@@ -519,7 +610,11 @@ class ParameterServer(_ReactorServer):
                 self._bump_version_locked(k)
                 n_applied += 1
             for k, sd in private.items():
-                if k not in self.owned_keys or k not in allowed:
+                if k not in allowed:
+                    continue
+                if k not in self.owned_keys:
+                    if self._epoch is not None:
+                        skipped.append(k)
                     continue
                 if not self._primary_locked(k):
                     skipped.append(k)
@@ -591,6 +686,8 @@ class Scheduler(_ReactorServer):
         # via ``scheduler_pub=``) and epoch records can be published (Phase 2a).
         self.identity = identity
         self._epoch_record = None
+        self._watch_stop = threading.Event()  # stops the watch_tracker thread
+        self._watch_thread = None
         self.compress = check_mode(compress)  # stamped on tasks; workers follow it
         self.idle_backoff = idle_backoff      # server-paced idle polling (retry_in)
         self._worker_caps: dict = {}          # worker_id -> advertised capabilities
@@ -643,23 +740,69 @@ class Scheduler(_ReactorServer):
                 return {"type": "epoch", "record": self._epoch_record}
         return None
 
-    def publish_epoch(self, owner_records, *, k=3, salt="") -> dict:
-        """Build, sign, and serve the next owner-set epoch (Phase 2a seam).
+    def publish_epoch(self, owner_records, *, k=3, salt="", bootstrap=None) -> dict:
+        """Build, sign, and serve the next owner-set epoch.
 
         ``owner_records`` are verified, owner-eligible tracker peer records
         (e.g. ``fetch_directory(..., roles=["owner"], reachability="public")``).
-        For now the record is only *served* — via the ``epoch`` RPC here and as
-        a cached copy on the tracker (``put_epoch``); routing/replication start
-        consuming it in slice 2b.
+        The record is served via the ``epoch`` RPC (owners poll it), drives
+        per-task routing, and can be cached on the tracker (``put_epoch``).
+
+        ``bootstrap=None`` decides automatically: only the *first* epoch of a
+        run that has done no training (no prior epoch, clock at 0) is flagged,
+        so owners boot-serve their seeded banks exactly once; every later
+        epoch makes gained keys sync (see ``ParameterServer.apply_epoch``).
         """
         if self.identity is None:
             raise RuntimeError("publish_epoch needs the scheduler's identity=")
         with self._lock:
+            if bootstrap is None:
+                bootstrap = self._epoch_record is None and self._T == 0
             num = 0 if self._epoch_record is None else self._epoch_record["epoch"] + 1
             record = make_epoch_record(self.identity, epoch=num,
-                                       owner_records=owner_records, k=k, salt=salt)
+                                       owner_records=owner_records, k=k, salt=salt,
+                                       bootstrap=bootstrap)
             self._epoch_record = record
         return record
+
+    def watch_tracker(self, tracker_addr, *, k=3, salt="", owner_grace=240.0,
+                      min_epoch_interval=60.0, poll_interval=5.0, tracker_auth=None,
+                      tracker_tls=None, cache_on_tracker=True) -> "EpochManager":
+        """Drive owner-set epochs from tracker liveness (design D5).
+
+        A background thread polls the tracker's directory for ``owner``-role
+        ``public`` peers; an :class:`~opendipaco.schedule.ownership.EpochManager`
+        applies the hysteresis (an owner must be gone ``owner_grace`` seconds
+        to be dropped; bumps are batched and rate-limited to one per
+        ``min_epoch_interval``). Each due change is signed via
+        :meth:`publish_epoch` and, with ``cache_on_tracker``, cached back onto
+        the tracker for bootstrapping owners. Stops with :meth:`shutdown`.
+        """
+        if self.identity is None:
+            raise RuntimeError("watch_tracker needs the scheduler's identity=")
+        from .tracker import fetch_directory, put_epoch  # lazy: tracker imports this module
+
+        manager = EpochManager(owner_grace=owner_grace, min_epoch_interval=min_epoch_interval)
+        addr = tuple(tracker_addr)
+
+        def watch():
+            while True:
+                try:
+                    records = fetch_directory(addr, roles=["owner"], reachability="public",
+                                              auth_key=tracker_auth, tls=tracker_tls)
+                    due = manager.observe(records)
+                    if due is not None:
+                        record = self.publish_epoch(due, k=k, salt=salt)
+                        if cache_on_tracker:
+                            put_epoch(addr, record, auth_key=tracker_auth, tls=tracker_tls)
+                except (OSError, ConnectionError):
+                    pass  # tracker briefly away; next poll retries
+                if self._watch_stop.wait(poll_interval) or self._stop or self._dead:
+                    return
+
+        self._watch_thread = threading.Thread(target=watch, daemon=True)
+        self._watch_thread.start()
+        return manager
 
     def _idle(self) -> dict:
         msg = {"type": "idle"}
@@ -833,6 +976,7 @@ class Scheduler(_ReactorServer):
             self._completed = dict(state["completed"])
 
     def shutdown(self) -> None:
+        self._watch_stop.set()
         with self._lock:
             self._serving = False
         super().shutdown()

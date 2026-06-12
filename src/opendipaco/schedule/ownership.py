@@ -77,13 +77,19 @@ def owners_for(key: str, epoch_record: dict, k: int | None = None) -> list[dict]
 
 
 def make_epoch_record(identity: PeerIdentity, *, epoch: int, owner_records,
-                      k: int = DEFAULT_REPLICATION, salt: str = "") -> dict:
+                      k: int = DEFAULT_REPLICATION, salt: str = "",
+                      bootstrap: bool = False) -> dict:
     """Build + sign the authoritative owner-set record for one epoch.
 
     ``owner_records`` are verified tracker peer records; each must pass
     :func:`owner_eligible` (raise early rather than publish a half-usable
     epoch). Only ``peer_id`` and ``addr`` are carried, sorted by peer id so
     the signed bytes don't depend on directory iteration order.
+
+    ``bootstrap=True`` marks the *first* epoch of a fresh (untrained) run:
+    owners applying it serve their seeded ``(0, 0)`` banks immediately instead
+    of syncing -- without it, a brand-new cluster would deadlock with every
+    owner waiting to pull from every other. Never set it on later epochs.
     """
     owners = []
     for r in owner_records:
@@ -96,6 +102,7 @@ def make_epoch_record(identity: PeerIdentity, *, epoch: int, owner_records,
         "epoch": int(epoch),
         "k": int(k),
         "salt": salt,
+        "bootstrap": bool(bootstrap),
         "owners": owners,
         "issued_at": time.time(),
     })
@@ -137,3 +144,50 @@ def epoch_newer(a: dict, b: dict | None) -> bool:
     if b is None:
         return True
     return (a["epoch"], a["issued_at"]) > (b["epoch"], b["issued_at"])
+
+
+class EpochManager:
+    """Hysteresis + rate limiting for owner-set changes (design D5).
+
+    Feed it directory snapshots via :meth:`observe`; it answers with the owner
+    records for a *due* new epoch, or ``None``. The rules:
+
+    * an owner joins the desired set as soon as a valid eligible record is
+      seen, but **leaves only after being unseen for** ``owner_grace`` seconds
+      (a flapping owner -- gone and back within the grace -- causes no bump);
+    * an owner re-registering with a *different address* counts as a change;
+    * bumps are rate-limited to one per ``min_epoch_interval`` seconds, so a
+      burst of churn batches into a single epoch;
+    * an unchanged set never bumps.
+
+    The manager only decides *when* and *who*; signing/publishing the record
+    (and choosing the bootstrap flag) stays with the scheduler.
+    """
+
+    def __init__(self, *, owner_grace: float = 240.0, min_epoch_interval: float = 60.0):
+        self.owner_grace = owner_grace
+        self.min_epoch_interval = min_epoch_interval
+        self._seen: dict[str, tuple[float, dict]] = {}  # peer_id -> (last seen, record)
+        self._current: set | None = None                # (peer_id, addr) signature
+        self._last_bump: float | None = None
+
+    def observe(self, records, *, now: float | None = None):
+        """One directory snapshot in; the next epoch's owner records out (or None)."""
+        now = time.monotonic() if now is None else now
+        for r in records:
+            if owner_eligible(r):
+                self._seen[r["peer_id"]] = (now, r)
+        expired = [p for p, (t, _) in self._seen.items() if now - t >= self.owner_grace]
+        for p in expired:
+            del self._seen[p]
+        if not self._seen:
+            return None  # never publish an ownerless epoch; wait for the swarm
+        live = {p: rec for p, (_, rec) in self._seen.items()}
+        signature = {(p, tuple(rec["addr"])) for p, rec in live.items()}
+        if signature == self._current:
+            return None
+        if self._last_bump is not None and now - self._last_bump < self.min_epoch_interval:
+            return None  # change is pending; re-observed (and batched) next poll
+        self._current = signature
+        self._last_bump = now
+        return [live[p] for p in sorted(live)]

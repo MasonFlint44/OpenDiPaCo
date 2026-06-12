@@ -2,6 +2,7 @@ from .distributed import CoordinatorServer, run_worker
 from .identity import PeerIdentity, peer_id_of, sign_record, verify_record
 from .observability import MetricsExporter, MetricsLogger
 from .ownership import (
+    EpochManager,
     make_epoch_record,
     owner_eligible,
     owners_for,
@@ -62,6 +63,7 @@ __all__ = [
     "put_epoch",
     "get_epoch",
     "owner_eligible",
+    "EpochManager",
     "rank_owners",
     "owners_for",
     "make_epoch_record",
