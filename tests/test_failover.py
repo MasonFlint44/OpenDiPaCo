@@ -177,6 +177,57 @@ def test_zombie_fenced_and_lame_duck_lifecycle():
             ps.shutdown()
 
 
+def test_scheduler_restart_resumes_epoch_numbering(tmp_path):
+    """A restarted scheduler must publish epochs that *supersede* what live
+    owners already hold -- owners refuse anything not strictly newer, so
+    restarting the numbering at 0 would wedge failover forever. Continuity
+    comes from the resumed checkpoint and/or the tracker's cached record."""
+    cfg = _cfg()
+    sched_id = PeerIdentity.generate()
+    recs = [_owner_record(PeerIdentity.generate(), 9100)]
+    ckpt = str(tmp_path / "ck")
+
+    from opendipaco.schedule import put_epoch
+
+    tracker = Tracker(host="127.0.0.1", port=0, open_enrollment=True)
+    tracker.start()
+    taddr = ("127.0.0.1", tracker.port)
+    sched = Scheduler(cfg, _corpus(cfg), [], _diloco(), batch_size=BATCH,
+                      host="127.0.0.1", port=0, identity=sched_id)
+    try:
+        for _ in range(4):
+            record = sched.publish_epoch(recs, k=1)        # epochs 0..3
+        assert record["epoch"] == 3
+        put_epoch(taddr, record)
+        sched._checkpoint_cluster(ckpt)                    # persists the epoch number
+        sched.shutdown()
+
+        # Restart path 1: resume from the checkpoint.
+        s2 = Scheduler(cfg, _corpus(cfg), [], _diloco(), batch_size=BATCH,
+                       host="127.0.0.1", port=0, identity=sched_id)
+        s2._load_state(ckpt)
+        assert s2.publish_epoch(recs, k=1)["epoch"] == 4   # supersedes the owners' 3
+        s2.shutdown()
+
+        # Restart path 2: no checkpoint -- re-adopt the tracker's cached
+        # (self-signed) record for both routing and the numbering floor.
+        s3 = Scheduler(cfg, _corpus(cfg), [], _diloco(), batch_size=BATCH,
+                       host="127.0.0.1", port=0, identity=sched_id)
+        s3.watch_tracker(taddr, poll_interval=30.0)
+        assert s3._epoch_record is not None and s3._epoch_record["epoch"] == 3
+        assert s3.publish_epoch(recs, k=1)["epoch"] == 4
+        s3.shutdown()
+
+        # A different identity's scheduler must NOT adopt the cached record.
+        s4 = Scheduler(cfg, _corpus(cfg), [], _diloco(), batch_size=BATCH,
+                       host="127.0.0.1", port=0, identity=PeerIdentity.generate())
+        s4.watch_tracker(taddr, poll_interval=30.0)
+        assert s4._epoch_record is None
+        s4.shutdown()
+    finally:
+        tracker.shutdown()
+
+
 def test_kill_primary_mid_run_completes_with_promotion():
     """The marquee 2c scenario over real TCP: tracker liveness + watch_tracker
     drive epochs; a primary owner crashes mid-run; its record expires, the

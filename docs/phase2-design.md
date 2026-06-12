@@ -26,10 +26,20 @@ scheduler-signed **recovery manifest** + readiness gate (`fit(resume=True)`
 refuses to serve until live owners hold ≥ the manifest version for every
 key), and launch wiring (`ownership` config section, rendezvous
 scheduler/owner roles with tracker heartbeats, `run_local` rendezvous smoke).
-**All four slices have landed — Phase 2 is complete.** Still open within the
-phase's scope notes: replication-path compression and delta-encoding (D10
-bandwidth items), per-epoch-0 number reuse across scheduler restarts is
-disambiguated only by `issued_at`, and Byzantine behavior everywhere is
+**All four slices have landed — Phase 2 is complete.** Post-completion
+review fixed one more bug: a restarted scheduler reset epoch numbering to 0,
+which live owners (correctly) refuse as stale — wedging failover after any
+scheduler restart. Numbering now resumes from the cluster checkpoint and/or
+the tracker's cached self-signed record (`_epoch_floor`). Accepted residuals,
+all fail-safe or operator-addressable: (1) **total control-plane loss**
+(scheduler checkpoint *and* tracker cache both gone, owners still alive)
+restarts numbering and wedges on the next membership change — keep one of the
+two; (2) **stranded disk state**: if a full restart remaps a key to owners
+none of whom ever held it, the manifest gate refuses to serve (no silent
+loss) until a previous holder rejoins; (3) volunteer owners should configure
+a durable `transport.identity_key` — a generated identity changes the peer id
+on every restart and churns placement. Replication-path compression and
+delta-encoding stay deferred (D10), and Byzantine behavior everywhere is
 Phase 3. This expands the Phase 2 sketch in
 [internet-scale-plan.md](internet-scale-plan.md) into concrete decisions before
 code. Each decision below (D1–D10) states the options considered and the

@@ -246,6 +246,11 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None, identity=N
     scheduler.start()
     _attach_metrics(scheduler, cfg)
     if rendezvous:
+        if cfg.run.resume and cfg.run.checkpoint_dir:
+            # Load the clock + epoch floor + manifest *before* the first epoch
+            # is published: a resumed run must never re-flag bootstrap nor
+            # restart epoch numbering below what live owners hold.
+            scheduler._load_state(cfg.run.checkpoint_dir)
         scheduler.watch_tracker(
             tracker_addr or cfg.tracker_connect_addr(), k=own.k, salt=own.salt,
             owner_grace=own.owner_grace, min_epoch_interval=own.min_epoch_interval,

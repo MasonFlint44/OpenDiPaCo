@@ -527,6 +527,9 @@ class ParameterServer(_ReactorServer):
             with self._lock:
                 for k in batch:
                     pending[k] = pending[k][1:]  # this source has been consulted
+                    if k not in self.bank:  # trimmed by a concurrent apply_epoch
+                        pending.pop(k, None)
+                        continue
                     v = answers.get(k)
                     if v is not None:
                         v = tuple(v)
@@ -786,6 +789,7 @@ class Scheduler(_ReactorServer):
         # via ``scheduler_pub=``) and epoch records can be published (Phase 2a).
         self.identity = identity
         self._epoch_record = None
+        self._epoch_floor = 0  # next epoch number must be >= this (restart safety)
         self._manifest = None  # signed recovery point (design D7); gates resume
         self._watch_stop = threading.Event()  # stops the watch_tracker thread
         self._watch_thread = None
@@ -859,11 +863,17 @@ class Scheduler(_ReactorServer):
         with self._lock:
             if bootstrap is None:
                 bootstrap = self._epoch_record is None and self._T == 0
-            num = 0 if self._epoch_record is None else self._epoch_record["epoch"] + 1
+            # Numbering must survive a scheduler restart: owners refuse any
+            # record that isn't strictly newer than the one they hold, so
+            # restarting at 0 would wedge failover forever. The floor comes
+            # from the resumed checkpoint and/or the tracker's cached record.
+            num = max(self._epoch_floor,
+                      0 if self._epoch_record is None else self._epoch_record["epoch"] + 1)
             record = make_epoch_record(self.identity, epoch=num,
                                        owner_records=owner_records, k=k, salt=salt,
                                        bootstrap=bootstrap)
             self._epoch_record = record
+            self._epoch_floor = num + 1
         return record
 
     def watch_tracker(self, tracker_addr, *, k=3, salt="", owner_grace=240.0,
@@ -881,10 +891,25 @@ class Scheduler(_ReactorServer):
         """
         if self.identity is None:
             raise RuntimeError("watch_tracker needs the scheduler's identity=")
-        from .tracker import fetch_directory, put_epoch  # lazy: tracker imports this module
+        from .tracker import fetch_directory, get_epoch, put_epoch  # lazy: tracker imports this
 
         manager = EpochManager(owner_grace=owner_grace, min_epoch_interval=min_epoch_interval)
         addr = tuple(tracker_addr)
+        # Restart continuity: re-adopt our own cached record from the tracker
+        # (it is self-signed -- nobody else can plant one). This restores both
+        # the owner set for routing and the epoch numbering floor, so the next
+        # bump supersedes what live owners already hold instead of being
+        # refused as stale.
+        try:
+            cached = get_epoch(addr, signer_pub=self.identity.public_key_hex,
+                               auth_key=tracker_auth, tls=tracker_tls)
+        except (OSError, ConnectionError):
+            cached = None
+        if cached is not None:
+            with self._lock:
+                if self._epoch_record is None or epoch_newer(cached, self._epoch_record):
+                    self._epoch_record = cached
+                    self._epoch_floor = max(self._epoch_floor, cached["epoch"] + 1)
 
         def watch():
             while True:
@@ -1092,7 +1117,8 @@ class Scheduler(_ReactorServer):
             with self._lock:
                 self._manifest = manifest
         with self._lock:
-            state = {"T": self._T, "completed": dict(self._completed)}
+            state = {"T": self._T, "completed": dict(self._completed),
+                     "epoch": -1 if record is None else record["epoch"]}
         tmp = os.path.join(dirpath, "scheduler.pt.tmp")
         torch.save(state, tmp)
         os.replace(tmp, os.path.join(dirpath, "scheduler.pt"))
@@ -1105,6 +1131,7 @@ class Scheduler(_ReactorServer):
         with self._lock:
             self._T = state["T"]
             self._completed = dict(state["completed"])
+            self._epoch_floor = max(self._epoch_floor, int(state.get("epoch", -1)) + 1)
         mpath = os.path.join(dirpath, "manifest.json")
         if self.identity is not None and os.path.exists(mpath):
             with open(mpath, encoding="utf-8") as f:
