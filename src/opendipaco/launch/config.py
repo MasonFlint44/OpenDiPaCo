@@ -89,6 +89,12 @@ class TransportCfg:
     port: int = 29500
     auth_key: str | None = None
     accept_keys: list[str] = field(default_factory=list)
+    # Per-peer Ed25519 identity (Phase 1). ``identity_key`` is this node's
+    # private-key PEM (see `opendipaco gen-identity`); when set, workers
+    # authenticate by signing the server's challenge instead of HMAC.
+    # ``admitted_peers`` lists the public keys (hex) a server accepts.
+    identity_key: str | None = None
+    admitted_peers: list[str] = field(default_factory=list)
     # Sharded mode: secret shared by the scheduler + parameter servers (NOT workers)
     # that signs commit grants, so workers can't forge push weights.
     grant_key: str | None = None
@@ -119,6 +125,15 @@ class ShardedCfg:
 
 
 @dataclass
+class TrackerCfg:
+    host: str = "0.0.0.0"
+    port: int = 29600
+    ttl: float = 120.0                 # registrations expire unless re-registered
+    open_enrollment: bool = False      # True: any validly-signed record may register
+    enroll_peers: list[str] = field(default_factory=list)  # pubkeys allowed to register
+
+
+@dataclass
 class RunCfg:
     generations: int = 10
     batch_size: int = 8
@@ -143,11 +158,13 @@ class LaunchConfig:
     transport: TransportCfg = field(default_factory=TransportCfg)
     tls: TLSCfg = field(default_factory=TLSCfg)
     sharded: ShardedCfg = field(default_factory=ShardedCfg)
+    tracker: TrackerCfg = field(default_factory=TrackerCfg)
     run: RunCfg = field(default_factory=RunCfg)
 
     _SECTIONS = {  # name -> dataclass (class attr, not a field)
         "model": ModelCfg, "diloco": DiLoCoCfg, "data": DataCfg,
-        "transport": TransportCfg, "tls": TLSCfg, "sharded": ShardedCfg, "run": RunCfg,
+        "transport": TransportCfg, "tls": TLSCfg, "sharded": ShardedCfg,
+        "tracker": TrackerCfg, "run": RunCfg,
     }
 
     @classmethod

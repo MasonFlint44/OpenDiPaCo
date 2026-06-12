@@ -8,8 +8,10 @@ Subcommands (each reads a cluster config; see ``init-config``):
     opendipaco ps          --config c.yaml --shard-id N
     opendipaco worker      --config c.yaml [--max-tasks N]
     opendipaco ingest      --config c.yaml --shard-id N   # sharded resumable ingest
+    opendipaco tracker     --config c.yaml           # rendezvous directory (Phase 1)
     opendipaco init-config --out c.yaml [--mode sharded]  # write a starter config
     opendipaco gen-cert    --out certs/              # self-signed cert for TLS
+    opendipaco gen-identity --out peer.pem           # Ed25519 peer identity
 
 ``run`` is the quickest way to see a cluster work end-to-end on one box; the per-role
 commands are what you launch across hosts (same config file everywhere).
@@ -29,6 +31,7 @@ from .roles import (
     run_local,
     run_parameter_server,
     run_scheduler,
+    run_tracker,
     run_worker_role,
 )
 
@@ -116,6 +119,27 @@ def cmd_gen_cert(args) -> int:
     return 0
 
 
+def cmd_tracker(args) -> int:
+    cfg = load_config(args.config)
+    print(f"tracker on {cfg.tracker.host}:{cfg.tracker.port} "
+          f"(ttl={cfg.tracker.ttl}s, open_enrollment={cfg.tracker.open_enrollment}); "
+          f"Ctrl-C to stop", flush=True)
+    run_tracker(cfg)
+    return 0
+
+
+def cmd_gen_identity(args) -> int:
+    from ..schedule import PeerIdentity
+    ident = PeerIdentity.generate()
+    path = ident.save(args.out)
+    print(f"key:     {path}")
+    print(f"peer id: {ident.peer_id}")
+    print(f"pubkey:  {ident.public_key_hex}")
+    print("set transport.identity_key to the key path on this peer; add the pubkey")
+    print("to transport.admitted_peers (servers) / tracker.enroll_peers (tracker).")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="opendipaco", description="DiPaCo cluster launcher")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -140,6 +164,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_in = with_config("ingest", "resumably ingest a data shard")
     p_in.add_argument("--shard-id", type=int, required=True)
     p_in.set_defaults(func=cmd_ingest)
+
+    with_config("tracker", "run the rendezvous directory").set_defaults(func=cmd_tracker)
+
+    p_id = sub.add_parser("gen-identity", help="generate an Ed25519 peer identity")
+    p_id.add_argument("--out", required=True, help="path for the private-key PEM")
+    p_id.set_defaults(func=cmd_gen_identity)
 
     p_init = sub.add_parser("init-config", help="write a starter config file")
     p_init.add_argument("--out", required=True)

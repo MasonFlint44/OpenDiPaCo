@@ -682,6 +682,8 @@ def _ps_connect(addr, auth_key, max_msg_bytes, timeout, *, tls=None, server_host
         except ssl.SSLError:  # handshake/cert failure is fatal -- don't retry-to-timeout
             s.close()
             raise
+        except PermissionError:  # auth rejection is fatal too (it's an OSError subclass)
+            raise
         except OSError as e:
             last = e
             time.sleep(0.05)

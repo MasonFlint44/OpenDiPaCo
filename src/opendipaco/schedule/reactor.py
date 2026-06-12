@@ -30,7 +30,13 @@ from dataclasses import dataclass, field
 
 import torch
 
+from .identity import peer_id_of, verify_auth
 from .wire import DEFAULT_MAX_MSG_BYTES, _HEADER, acceptable_keys, decode, encode
+
+
+def _pubkey_hex(p) -> str:
+    """Normalize an admitted-peer entry (hex string or PeerIdentity) to hex."""
+    return getattr(p, "public_key_hex", p).lower()
 
 
 def _verify_mac(mac: str, nonce: bytes, keys: list) -> bool:
@@ -232,6 +238,7 @@ class _Conn:
     inbuf: bytearray = field(default_factory=bytearray)
     outbuf: bytearray = field(default_factory=bytearray)
     authed: bool = False
+    peer_id: str | None = None  # set when the peer authenticated by Ed25519 identity
     nonce: bytes | None = None
     want_write: bool = False
     closed: bool = False
@@ -308,7 +315,8 @@ class _IOThread:
 
     def _establish(self, conn: _Conn) -> None:
         """Post-(handshake) setup: challenge the peer for auth, or admit it."""
-        if self.server.auth_keys is not None:
+        srv = self.server
+        if srv.auth_keys is not None or srv.admitted_peers is not None:
             conn.nonce = os.urandom(32)
             self._queue(conn, {"type": "challenge", "nonce": conn.nonce.hex()})
         else:
@@ -389,11 +397,20 @@ class _IOThread:
     def _dispatch(self, conn: _Conn, msg: dict, nin: int) -> None:
         srv = self.server
         if not conn.authed:
-            ok = (
-                srv.auth_keys is not None and conn.nonce is not None
-                and msg.get("type") == "auth"
-                and _verify_mac(msg.get("mac", ""), conn.nonce, srv.auth_keys)
-            )
+            # Either proof is accepted: HMAC over a shared secret (the
+            # bootstrap/enrollment-token mechanism) or an Ed25519 signature
+            # from an admitted per-peer identity (revocable individually).
+            ok = False
+            if conn.nonce is not None and msg.get("type") == "auth":
+                if srv.auth_keys is not None and "mac" in msg:
+                    ok = _verify_mac(msg.get("mac", ""), conn.nonce, srv.auth_keys)
+                if not ok and srv.admitted_peers is not None and "pub" in msg:
+                    pub = msg.get("pub", "")
+                    if srv.peer_admitted(pub) and verify_auth(
+                        pub, msg.get("sig", ""), conn.nonce
+                    ):
+                        ok = True
+                        conn.peer_id = peer_id_of(pub)
             if ok:
                 conn.authed = True
                 self._queue(conn, {"type": "welcome"})
@@ -481,6 +498,7 @@ class _ReactorServer:
         port: int = 0,
         auth_key=None,
         accept_keys=None,
+        admitted_peers=None,
         max_msg_bytes: int = DEFAULT_MAX_MSG_BYTES,
         io_threads: int = 4,
         max_connections: int = 1024,
@@ -491,6 +509,14 @@ class _ReactorServer:
         # per-worker identity). ``auth_keys`` is the de-duplicated accept-list.
         self.auth_key = auth_key
         self.auth_keys = acceptable_keys(auth_key, accept_keys)
+        # ``admitted_peers``: Ed25519 public keys (hex, or PeerIdentity objects)
+        # whose signature answers the challenge -- per-peer identity alongside
+        # (or instead of) the shared-secret HMAC. None disables identity auth;
+        # an empty list enables it with nobody admitted yet (use admit_peer).
+        self._peer_lock = threading.Lock()
+        self.admitted_peers = (
+            {_pubkey_hex(p) for p in admitted_peers} if admitted_peers is not None else None
+        )
         self.max_msg_bytes = max_msg_bytes
         self.tls = tls  # server-side SSLContext; None -> plaintext (auth still applies)
         self.io_threads = max(1, io_threads)
@@ -531,6 +557,28 @@ class _ReactorServer:
     # -- subclass hook -------------------------------------------------------
     def _handle(self, msg: dict, nbytes: int):
         raise NotImplementedError
+
+    # -- per-peer identity admission ------------------------------------------
+    def peer_admitted(self, pub: str) -> bool:
+        with self._peer_lock:
+            return self.admitted_peers is not None and pub.lower() in self.admitted_peers
+
+    def admit_peer(self, pub) -> None:
+        """Admit an Ed25519 public key (hex or PeerIdentity) at runtime."""
+        with self._peer_lock:
+            if self.admitted_peers is None:
+                self.admitted_peers = set()
+            self.admitted_peers.add(_pubkey_hex(pub))
+
+    def revoke_peer(self, pub) -> None:
+        """Stop accepting this identity for *new* handshakes.
+
+        Connections it already authenticated stay up (drop them by restarting
+        the server or waiting for the peer's next reconnect to be refused).
+        """
+        with self._peer_lock:
+            if self.admitted_peers is not None:
+                self.admitted_peers.discard(_pubkey_hex(pub))
 
     # -- observability streaming --------------------------------------------
     def start_metrics_server(self, *, host: str = "0.0.0.0", port: int = 0,
