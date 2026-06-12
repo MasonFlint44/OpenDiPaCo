@@ -289,6 +289,8 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
 
 ### Phase 2 — distribute the module bank (PS → replicated owner peers)
 
+> Detailed design (decisions D1–D10, slices 2a–2d): [phase2-design.md](phase2-design.md).
+
 - **Ownership**: rendezvous hashing maps each module key to **k owner peers** (k≈3)
   drawn from the reachable, reputation-qualified tier. The owner set per key is
   published via the tracker/gossip; workers fetch from the nearest/fastest owner.
