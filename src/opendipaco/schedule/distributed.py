@@ -287,6 +287,13 @@ class CoordinatorServer(_ReactorServer):
             if not valid:
                 self.metrics.record_invalid_reject()  # dropped; the path is re-eligible
                 return False
+            # Restrict to the submitting path's own modules (path is known-valid
+            # past the fence): a lease on path A must not be able to write
+            # another path's private modules or unrelated shared ones. (The
+            # sharded path gets the same property from the grant's key list.)
+            path_keys = set(e.topology.path_module_keys(path))
+            shared = {k: v for k, v in shared.items() if k in path_keys}
+            private = {k: v for k, v in private.items() if k in path_keys}
             if self.max_update_norm is not None:
                 for delta in shared.values():
                     if clip_norm_(delta, self.max_update_norm) > self.max_update_norm:
@@ -312,8 +319,11 @@ class CoordinatorServer(_ReactorServer):
     def _nack(self, msg: dict) -> None:
         path = msg["path"]
         with self._lock:
-            if msg.get("lease") != self._lease.get(path):
-                return  # a stale nack must not free someone else's live lease
+            # Require a *live* matching lease: a stale nack must not free someone
+            # else's lease, and a nack for a never-leased path must not be able
+            # to grow ``errors`` with arbitrary keys.
+            if path not in self._inflight or msg.get("lease") != self._lease.get(path):
+                return
             self.sched.errors[path] = msg.get("error", "worker nack")
             self._inflight.pop(path, None)  # free the lease; the path becomes re-eligible
             self._lease.pop(path, None)

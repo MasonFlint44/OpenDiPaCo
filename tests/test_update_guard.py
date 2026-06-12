@@ -222,6 +222,62 @@ def test_coordinator_ignores_unknown_and_mistyped_keys():
     server.shutdown()
 
 
+def test_coordinator_restricts_submit_to_own_path_keys():
+    """A lease on path A cannot write another path's private modules (or shared
+    modules A doesn't touch): foreign keys are dropped while A's own land."""
+    bb = BackboneConfig(
+        vocab_size=48, hidden_size=32, num_attention_heads=4, intermediate_size=64,
+        layers_per_level=[1, 1], max_position_embeddings=64,
+    )
+    cfg = DiPaCoConfig(backbone=bb, level_sizes=[2, 2], sequence_length=16,
+                       embedding="private")  # per-path private modules to attack
+    eng = DiPaCoEngine(cfg, _diloco(), LocalBackend(cfg.build_topology()),
+                       seed=0, materialize="serial")
+    server = _serving_coordinator(cfg, eng)
+    task = server._next_task(
+        {"worker_id": "w", "warm_paths": [], "cached_shards": [], "have_shared": {}})
+    path_a = task["path"]
+    own_keys = set(eng.topology.path_module_keys(path_a))
+    # A private key belonging to some *other* path.
+    foreign = next(k for k in eng.bank
+                   if is_private_key(k) and k not in own_keys)
+    own_private = next(k for k in own_keys if is_private_key(k))
+
+    before_foreign = {n: v.detach().clone()
+                      for n, v in eng.bank[foreign].state_dict().items()}
+    overwrite = {k: {n: torch.zeros_like(v) for n, v in eng.bank[k].state_dict().items()}
+                 for k in (foreign, own_private)}
+    server._receive({"path": path_a, "lease": task["lease"], "shared_grad": {},
+                     "private_weights": overwrite, "loss": 0.1})
+    assert server.metrics.accepted_updates == 1      # the submit itself lands...
+    after_foreign = eng.bank[foreign].state_dict()
+    assert all(torch.equal(before_foreign[n], after_foreign[n])
+               for n in before_foreign)              # ...but the foreign key didn't
+    own_after = eng.bank[own_private].state_dict()
+    assert all(float(v.abs().max()) == 0.0 for v in own_after.values())  # own key did
+    server.shutdown()
+
+
+def test_nack_requires_live_matching_lease():
+    """A nack only counts with the current lease: bogus paths can't grow the
+    errors map, stale nacks can't free a re-leased path."""
+    cfg = _cfg()
+    eng = _engine(cfg)
+    server = _serving_coordinator(cfg, eng)
+    server._nack({"path": ("bogus", 9), "lease": None, "error": "spam"})
+    assert server.sched.errors == {}                 # never-leased -> ignored
+
+    task = server._next_task(
+        {"worker_id": "w", "warm_paths": [], "cached_shards": [], "have_shared": {}})
+    path = task["path"]
+    server._nack({"path": path, "lease": "wrong-token", "error": "stale"})
+    assert path in server._inflight                  # stale nack didn't free it
+    server._nack({"path": path, "lease": task["lease"], "error": "real failure"})
+    assert path not in server._inflight              # live nack frees the lease
+    assert server.sched.errors[path] == "real failure"
+    server.shutdown()
+
+
 # -- sharded scheduler (loss gate at commit) -------------------------------------
 
 
