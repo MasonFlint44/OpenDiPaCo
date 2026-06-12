@@ -89,6 +89,7 @@ class CoordinatorServer(_ReactorServer):
         heartbeat_timeout: float | None = None,
         auth_key: str | bytes | None = None,
         accept_keys=None,
+        admitted_peers=None,
         max_msg_bytes: int = DEFAULT_MAX_MSG_BYTES,
         staleness_bound: int | None = None,
         staleness_weight: str = "inverse",
@@ -101,8 +102,8 @@ class CoordinatorServer(_ReactorServer):
         tls=None,
     ):
         super().__init__(host=host, port=port, auth_key=auth_key, accept_keys=accept_keys,
-                         max_msg_bytes=max_msg_bytes, io_threads=io_threads,
-                         max_connections=max_connections, tls=tls)
+                         admitted_peers=admitted_peers, max_msg_bytes=max_msg_bytes,
+                         io_threads=io_threads, max_connections=max_connections, tls=tls)
         self.sched = scheduler
         self.engine = scheduler.engine
         self.corpus = corpus

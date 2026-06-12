@@ -245,7 +245,13 @@ def server_handshake(sock: socket.socket, key) -> bool:
 
 
 def client_handshake(sock: socket.socket, key) -> bool:
-    """Worker side: answer the coordinator's challenge with HMAC(key, nonce)."""
+    """Worker side: answer the coordinator's challenge.
+
+    ``key`` is either a shared secret (``str``/``bytes`` -> HMAC reply, as
+    before) or a :class:`~opendipaco.schedule.identity.PeerIdentity` (-> Ed25519
+    signature reply; the server must list the peer's public key in
+    ``admitted_peers``).
+    """
     if key is None:
         return True
     try:
@@ -253,8 +259,11 @@ def client_handshake(sock: socket.socket, key) -> bool:
         if not challenge or challenge.get("type") != "challenge":
             return False
         nonce = bytes.fromhex(challenge["nonce"])
-        mac = hmac.new(_key_bytes(key), nonce, hashlib.sha256).hexdigest()
-        send_msg(sock, {"type": "auth", "mac": mac})
+        if hasattr(key, "auth_response"):  # a PeerIdentity (duck-typed; no import)
+            send_msg(sock, {"type": "auth", **key.auth_response(nonce)})
+        else:
+            mac = hmac.new(_key_bytes(key), nonce, hashlib.sha256).hexdigest()
+            send_msg(sock, {"type": "auth", "mac": mac})
         welcome = recv_msg(sock, max_bytes=4096)
     except (OSError, ValueError):
         return False

@@ -442,4 +442,8 @@ def test_sharded_multiprocess_end_to_end():
             if p.is_alive():
                 p.terminate()
     assert result["T"] >= result["target"]
-    assert result["completed_total"] == result["T"]
+    # ``completed`` is snapshotted when fit returns but ``T`` is read after
+    # shutdown, so a late in-flight commit can make T run ahead -- the budget,
+    # not exact equality, is the meaningful invariant (same as the in-process
+    # variant's reasoning).
+    assert result["target"] <= result["completed_total"] <= result["T"]

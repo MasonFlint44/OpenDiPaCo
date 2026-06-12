@@ -1,4 +1,5 @@
 from .distributed import CoordinatorServer, run_worker
+from .identity import PeerIdentity, peer_id_of, sign_record, verify_record
 from .observability import MetricsExporter, MetricsLogger
 from .reactor import TransportMetrics
 from .scheduler import AsyncScheduler, Contribution, Preempt, TransientFault
@@ -11,6 +12,14 @@ from .sharded import (
     verify_grant,
 )
 from .tls import client_context, generate_selfsigned_cert, server_context
+from .tracker import (
+    Tracker,
+    deregister_peer,
+    fetch_directory,
+    import_records,
+    make_peer_record,
+    register_peer,
+)
 
 __all__ = [
     "AsyncScheduler",
@@ -31,4 +40,14 @@ __all__ = [
     "generate_selfsigned_cert",
     "MetricsExporter",
     "MetricsLogger",
+    "PeerIdentity",
+    "peer_id_of",
+    "sign_record",
+    "verify_record",
+    "Tracker",
+    "make_peer_record",
+    "register_peer",
+    "deregister_peer",
+    "fetch_directory",
+    "import_records",
 ]

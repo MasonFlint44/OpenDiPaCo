@@ -31,7 +31,9 @@ from ..schedule import (
     AsyncScheduler,
     CoordinatorServer,
     ParameterServer,
+    PeerIdentity,
     Scheduler,
+    Tracker,
     assign_shards,
     client_context,
     run_sharded_worker,
@@ -67,9 +69,19 @@ def _accept_keys(cfg: LaunchConfig):
 def _server_kw(cfg: LaunchConfig) -> dict:
     kw = dict(auth_key=cfg.transport.auth_key, accept_keys=_accept_keys(cfg),
               tls=build_tls_server(cfg))
+    if cfg.transport.admitted_peers:
+        kw["admitted_peers"] = list(cfg.transport.admitted_peers)
     if cfg.transport.max_msg_bytes is not None:
         kw["max_msg_bytes"] = cfg.transport.max_msg_bytes
     return kw
+
+
+def _worker_auth(cfg: LaunchConfig):
+    """The credential a worker presents: its Ed25519 identity when configured
+    (per-peer, revocable), else the shared HMAC secret."""
+    if cfg.transport.identity_key:
+        return PeerIdentity.load(cfg.transport.identity_key)
+    return cfg.transport.auth_key
 
 
 def build_documents(cfg: LaunchConfig):
@@ -252,11 +264,12 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
     model, diloco = dipaco_config(cfg.model), diloco_config(cfg.diloco)
     mt = max_tasks if max_tasks is not None else cfg.run.max_tasks
     data_dir = cfg.data.shard_cache_dir  # spec mode: cache materialized shards here
+    auth = _worker_auth(cfg)
     if cfg.mode == "sharded":
         target = scheduler_addr or cfg.connect_addr()
         run_sharded_worker(
             model, diloco, tuple(target), device=cfg.run.device, seed=cfg.run.seed,
-            auth_key=cfg.transport.auth_key, max_tasks=mt, reconnect=True,
+            auth_key=auth, max_tasks=mt, reconnect=True,
             heartbeat_interval=cfg.transport.heartbeat_interval,
             tls=build_tls_client(cfg), tls_hostname=cfg.tls.server_hostname,
             data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch)
@@ -264,7 +277,7 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
         host, port = addr or cfg.connect_addr()
         run_worker(
             model, diloco, host, port, device=cfg.run.device, seed=cfg.run.seed,
-            auth_key=cfg.transport.auth_key, max_tasks=mt,
+            auth_key=auth, max_tasks=mt,
             heartbeat_interval=cfg.transport.heartbeat_interval,
             tls=build_tls_client(cfg), tls_hostname=cfg.tls.server_hostname,
             data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch)
@@ -352,6 +365,23 @@ def _run_local_sharded(cfg: LaunchConfig):
     for w in workers:
         w.join(timeout=5)
     return sresult["r"]
+
+
+def run_tracker(cfg: LaunchConfig, *, on_start=None, stop_event=None):
+    """The rendezvous directory (Phase 1): peers register self-certifying signed
+    records; serve until stopped. Enrollment/auth from the ``tracker`` and
+    ``transport`` config sections."""
+    t = cfg.tracker
+    tracker = Tracker(host=t.host, port=t.port, ttl=t.ttl,
+                      open_enrollment=t.open_enrollment,
+                      enroll_peers=list(t.enroll_peers), **_server_kw(cfg))
+    tracker.start()
+    _attach_metrics(tracker, cfg)
+    if on_start:
+        on_start(tracker)
+    (stop_event or _wait_for_signal()).wait()
+    tracker.shutdown()
+    return tracker
 
 
 def run_ingest(cfg: LaunchConfig, shard_id: int):

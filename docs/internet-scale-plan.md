@@ -185,9 +185,11 @@ schedule semantics).
 - **1.12 Stale, alarming docstring** · [bug] · ✅ fixed — `schedule/distributed.py`'s
   module docstring claimed the wire format was `torch.save`/unpickles; it now
   describes the pickle-free codec (and the lease fence).
-- **1.13 Identity & enrollment** — per-worker HMAC keys exist but are constructor
-  args; a volunteer fleet needs real enrollment, revocation, and (for P2P) peer
-  identity. Folded into Phase 1 of §2. · [design]
+- **1.13 Identity & enrollment** · [design] · ✅ done — Phase 1 landed per-peer
+  Ed25519 identities (`schedule/identity.py`, `opendipaco gen-identity`),
+  identity-signature auth in the reactor handshake with runtime
+  admit/revoke, and tracker-level enrollment (allowlist or open, token-gated
+  via composed HMAC). A managed secret store remains out of scope.
 - **1.14 No rate limiting / abuse protection** beyond `max_connections` and the
   message-size cap; an authenticated worker can loop `request` to force large
   payloads (bandwidth amplification). · [design]
@@ -249,23 +251,41 @@ homes + one VPS) completes a multi-day training with restarts, at <1/8 today's
 bytes, with validated convergence vs. the synchronous anchor. This also retires
 §1.4 at small scale before P2P amplifies the dynamics.
 
-### Phase 1 — identity, membership, and reachability
+### Phase 1 — identity, membership, and reachability · ✅ done
 
-- **Per-peer identity**: Ed25519 keypair per peer; peer id = hash(pubkey). Add a
-  signed envelope to `wire.py` messages (sign the frame, not TLS-dependent).
-  Enrollment = tracker admits a pubkey (manual or token-gated); revocation = drop it.
-- **Tracker as rendezvous**: evolves `Scheduler` — peers register
-  `(peer_id, addr, capabilities, reachability)`; peers gossip the directory so the
-  tracker's loss degrades rather than halts the swarm.
-- **Reachability tiers, not mandatory NAT traversal**: volunteers stay dial-out-only
-  clients (today's property — keep it). Peers that *are* publicly reachable
-  (VPS donors, port-forwarded homes) self-nominate as **servers of the P2P plane**:
-  module owners (Phase 2) and relays for peer-to-peer transfers between two NATed
-  peers. UDP hole-punching (QUIC) is a later optimization, not a dependency.
-- **Build-vs-adopt decision (open, see §3)**: custom on the existing TCP reactor
-  (matches the project's zero-dep style; relay tier required) vs. adopting
-  hivemind's DHT (proven for this exact workload — Petals/OpenDiLoCo — but a heavy
-  dependency) vs. py-libp2p (immature).
+- **Per-peer identity** — ✅ `schedule/identity.py`: Ed25519 keypair per peer
+  (`PeerIdentity`, PEM key file mode 0600, `opendipaco gen-identity`); peer id =
+  sha256(pubkey). The reactor handshake accepts an identity **signature over the
+  challenge nonce** alongside HMAC (`admitted_peers=` on every server /
+  `transport.admitted_peers`; workers present `transport.identity_key`);
+  enrollment = admit a pubkey (manual, or token-gated by composing HMAC
+  underneath), revocation = `revoke_peer()` (new handshakes refused).
+  *Scope note:* instead of a per-frame wire envelope, signing landed where
+  trust is actually needed today — the challenge handshake (session identity)
+  and **self-certifying signed records** (`sign_record`/`verify_record`,
+  canonical-JSON + embedded pubkey + key-derived id). Per-frame envelopes wait
+  until Phase 2 introduces relayed data-plane messages that need them.
+- **Tracker as rendezvous** — ✅ `schedule/tracker.py` (+ `opendipaco tracker`
+  role, `tracker` config section): peers register signed records
+  (peer id, reachability, optional addr, role offers, capability profile);
+  TTL-based liveness (heartbeat = re-register; `issued_at` ordering so stale
+  relayed copies never displace newer ones); signed deregistration with
+  tombstones; enrollment allowlist (`enroll`/`expel`) or `open_enrollment`.
+  *Gossip-lite:* records verify independently of who serves them, and
+  `fetch_directory` → `import_records` bootstraps a **replacement tracker from
+  any peer's cache** (tested) — tracker loss degrades rather than halts.
+  Autonomous peer-to-peer directory gossip is deferred to Phase 2 (when peers
+  run servers that could carry it).
+- **Reachability tiers** — ✅ `"nat"` peers register addressless (dial-out-only,
+  today's workers); `"public"` peers advertise an addr + roles
+  (`owner`/`relay`), self-nominating to host the Phase 2 P2P plane. Validation
+  enforced at signing and at the tracker. UDP hole-punching remains a later
+  optimization, not a dependency.
+- **Build-vs-adopt** — ✅ **resolved: custom on the existing TCP reactor.** The
+  deciding fact: `cryptography` was already the optional `[launch]` dependency
+  (TLS cert generation), so Ed25519 costs zero new deps, and the reactor/wire
+  stack needed only an extra auth branch. hivemind/libp2p stay fallback options
+  if Phase 2's relay tier proves heavier than expected.
 
 ### Phase 2 — distribute the module bank (PS → replicated owner peers)
 
@@ -321,10 +341,10 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
 
 ## 3. Open decisions
 
-1. **Build vs. adopt the P2P substrate** (Phase 1): custom-on-reactor (zero deps,
-   most work, relay tier required) vs. hivemind DHT (proven for volunteer DL, heavy
-   dep) vs. libp2p (immature in Python). Leaning custom-on-reactor for the control
-   plane + hivemind-style relay patterns for transfers, but this deserves a spike.
+1. ~~**Build vs. adopt the P2P substrate** (Phase 1)~~ — **resolved:
+   custom-on-reactor** (Ed25519 via the already-optional `cryptography` dep; the
+   reactor needed only an extra auth branch). Revisit only if Phase 2's relay
+   tier proves heavier than expected.
 2. **Private-module policy under adversaries** (Phase 3a vs 3b above).
 3. **Quorum vs. throughput trade-off**: c-of-n aggregation multiplies compute cost
    by ~c on protected modules; how much of the bank needs it vs. spot-checking.
@@ -340,7 +360,7 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
 | ~~0d~~ ✅ | ~~Data decentralization (shard ids + worker-side ingest + local routing)~~ | **Done** — 1.3 (`data.ship: spec`; router fitting + EM still central) | M |
 | ~~0e~~ ✅ | ~~bf16 inner loop, capability negotiation, idle backoff, hygiene~~ | **Done** — 1.10 (autocast + batch caps), 1.9 (idle pacing), 1.11, 1.12 | S–M |
 | 0f | WAN validation run of the async path | 1.4 | M (mostly wall-clock) |
-| 1 | Peer identity + tracker + reachability tiers | 1.13, 1.8 (prereq) | M |
+| ~~1~~ ✅ | ~~Peer identity + tracker + reachability tiers~~ | **Done** — 1.13, 1.8 (prereq); per-frame envelopes + autonomous gossip deferred to Phase 2 | M |
 | 2 | Replicated module owners, dynamic ownership, signed manifests | 1.8 | L |
 | 3 | Robust aggregation, redundancy, reputation, private-module policy | 1.1, 1.9, 1.14 | L |
 | 4 | Decentralized scheduling (optional) | residual SPOF | L |
