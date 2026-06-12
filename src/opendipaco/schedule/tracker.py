@@ -65,14 +65,29 @@ def make_peer_record(identity: PeerIdentity, *, reachability: str = "nat",
     return sign_record(identity, record)
 
 
+# Tracker frames are JSON records, never tensors -- a much smaller message cap
+# than the transport default (4 GiB, sized for weights) bounds what one peer can
+# make the tracker buffer.
+TRACKER_MAX_MSG_BYTES = 16 * 1024 * 1024
+
+
 class Tracker(_ReactorServer):
-    """The directory server. See the module docstring for the protocol."""
+    """The directory server. See the module docstring for the protocol.
+
+    ``max_peers`` bounds the directory (identities are free to generate, so an
+    open-enrollment tracker would otherwise grow without limit; registrations
+    beyond the cap are refused "directory full"). An imported *stale* record is
+    bounded by ``ttl``: it expires like any other unless its peer heartbeats.
+    """
 
     def __init__(self, *, host: str = "0.0.0.0", port: int = 0, ttl: float = 120.0,
                  open_enrollment: bool = False, enroll_peers=None, auth_key=None,
+                 max_peers: int = 65536, max_msg_bytes: int = TRACKER_MAX_MSG_BYTES,
                  **reactor_kw):
-        super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
+        super().__init__(host=host, port=port, auth_key=auth_key,
+                         max_msg_bytes=max_msg_bytes, **reactor_kw)
         self.ttl = ttl
+        self.max_peers = max_peers
         self.open_enrollment = open_enrollment
         self._dir_lock = threading.Lock()
         self._enrolled: set[str] = {self._pub(p) for p in (enroll_peers or [])}
@@ -125,6 +140,8 @@ class Tracker(_ReactorServer):
             entry = self._peers.get(record["peer_id"])
             if entry is not None and record["issued_at"] <= entry["issued_at"]:
                 return {"type": "refused", "reason": "stale record"}
+            if entry is None and len(self._peers) >= self.max_peers:
+                return {"type": "refused", "reason": "directory full"}
             self._peers[record["peer_id"]] = {
                 "record": record, "issued_at": record["issued_at"],
                 "expires": time.monotonic() + self.ttl,

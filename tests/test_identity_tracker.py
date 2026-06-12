@@ -344,6 +344,41 @@ def test_tracker_bootstrap_from_a_peers_cache():
         b.shutdown()
 
 
+def test_tracker_directory_cap_refuses_new_peers_but_allows_heartbeats():
+    """``max_peers`` bounds the directory (identities are free to mint): new
+    registrations beyond the cap are refused while existing peers can still
+    heartbeat, and expiry frees capacity."""
+    a, b, c = (PeerIdentity.generate() for _ in range(3))
+    tracker = Tracker(host="127.0.0.1", port=0, ttl=0.3, open_enrollment=True,
+                      max_peers=2)
+    tracker.start()
+    try:
+        addr = ("127.0.0.1", tracker.port)
+        assert register_peer(addr, a, roles=["worker"])["type"] == "registered"
+        assert register_peer(addr, b, roles=["worker"])["type"] == "registered"
+        full = register_peer(addr, c, roles=["worker"])
+        assert full == {"type": "refused", "reason": "directory full"}
+        time.sleep(0.01)
+        assert register_peer(addr, a, roles=["worker"])["type"] == "registered"  # heartbeat ok
+        time.sleep(0.4)                                    # a and b expire
+        assert register_peer(addr, c, roles=["worker"])["type"] == "registered"
+    finally:
+        tracker.shutdown()
+
+
+def test_tracker_message_cap_is_record_sized():
+    """The tracker's frame cap defaults far below the tensor-sized transport
+    default — record traffic never needs gigabytes."""
+    from opendipaco.schedule.reactor import DEFAULT_MAX_MSG_BYTES
+    from opendipaco.schedule.tracker import TRACKER_MAX_MSG_BYTES
+
+    tracker = Tracker(host="127.0.0.1", port=0, open_enrollment=True)
+    try:
+        assert tracker.max_msg_bytes == TRACKER_MAX_MSG_BYTES < DEFAULT_MAX_MSG_BYTES
+    finally:
+        tracker.shutdown()
+
+
 def test_tracker_behind_enrollment_token():
     """Transport-level HMAC composes underneath: without the token you can't
     even talk to the tracker."""

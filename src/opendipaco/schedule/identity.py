@@ -12,6 +12,11 @@ trusting the relayer. This module adds:
   nonce (domain-separated), and :func:`verify_auth` checks it against the raw
   public key. The reactor accepts this alongside HMAC: HMAC remains the
   bootstrap/enrollment-token mechanism, identity is the per-peer one.
+  Like the HMAC handshake, this authenticates the *client to the server* only
+  — a peer that connects to an attacker can have its challenge response
+  relayed (classic MITM). Server authenticity and channel binding come from
+  TLS (``tls.py``), which remains the documented requirement on untrusted
+  networks; without it the transport is plaintext anyway.
 * **Signed records** — :func:`sign_record` / :func:`verify_record` make a
   JSON-scalar dict *self-certifying*: the signature covers a canonical
   encoding and embeds the public key, so a record fetched from an untrusted
