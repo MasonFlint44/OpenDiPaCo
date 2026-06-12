@@ -263,8 +263,19 @@ class ParameterServer(_ReactorServer):
         # ``bootstrap=False`` (joining a live cluster): serve nothing until the
         # replication pull catches each key up.
         self._active = set(self.owned_keys) if bootstrap else set()
-        if resume_dir is not None and os.path.exists(os.path.join(resume_dir, self._shard_name())):
-            self.load_shard(resume_dir)  # restart this shard from a checkpoint
+        self._saved_versions: dict = {}  # (dir, key) -> last persisted version
+        # Restart: load per-key checkpoint files (dynamic mode; keys gained
+        # later via apply_epoch warm-start too), else the legacy shard blob.
+        # Resumed keys must reconcile with their replicas before serving --
+        # only the universal (0, 0) state may keep boot-serving.
+        self._resume_dir = resume_dir
+        if resume_dir is not None:
+            with self._lock:
+                loaded = {k for k in self.owned_keys if self._load_module_locked(k, resume_dir)}
+            if loaded:
+                self._active -= {k for k in loaded if self._versions[k] != (0, 0)}
+            elif os.path.exists(os.path.join(resume_dir, self._shard_name())):
+                self.load_shard(resume_dir)  # restart this shard from a checkpoint
 
     @staticmethod
     def _owner_ids(key, record) -> set:
@@ -277,8 +288,15 @@ class ParameterServer(_ReactorServer):
         if kind == "push":
             return self._push(msg)
         if kind == "checkpoint":
+            if self._epoch is not None:  # dynamic mode: per-key files + versions
+                return {"type": "ack", "versions": self.save_modules(msg["dir"])}
             self.save_shard(msg["dir"])
             return {"type": "ack"}
+        if kind == "status":
+            with self._lock:
+                return {"type": "status", "epoch": self._epoch_num,
+                        "versions": {k: self._versions[k] for k in self._active
+                                     if k in self._versions}}
         return None
 
     # -- lifecycle helpers (call under self._lock) -----------------------------
@@ -314,14 +332,18 @@ class ParameterServer(_ReactorServer):
         weights, versions, state, missing = {}, {}, {}, []
         with self._lock:
             for k in msg.get("keys", []):
-                if k not in self.bank or k not in self._active:
-                    missing.append(k)  # not held / still syncing -> try a replica
+                if k not in self.bank:
+                    missing.append(k)
                     continue
                 if want_state:
                     # Replication pull: exact bytes (replicas must be bit-equal,
                     # so no wire compression here) + outer momentum, all-or-
                     # nothing per key -- an unauthorized session gets "missing",
-                    # never a silently degraded copy.
+                    # never a silently degraded copy. Syncing keys ARE served
+                    # here (the version is honest): after a full-cluster
+                    # restart, replicas reconcile by exchanging their resumed
+                    # state and adopting the max -- if syncing peers refused
+                    # each other, recovery would deadlock.
                     if not self._state_allowed_locked(k, peer_id):
                         missing.append(k)
                         continue
@@ -331,6 +353,9 @@ class ParameterServer(_ReactorServer):
                         if k in self._outer_opts:
                             state[k] = _opt_to_wire(_optimizer_state_to_cpu(
                                 self._outer_opts[k].state_dict()))
+                    continue
+                if k not in self._active:
+                    missing.append(k)  # still syncing -> the worker tries a replica
                     continue
                 if is_private_key(k):
                     if cold:  # ship the path's private modules only on a cold start
@@ -378,11 +403,17 @@ class ParameterServer(_ReactorServer):
             gained = owned - set(self.bank)
             if gained:
                 # Seeded build: gained keys start at the same (0, 0) bytes as
-                # everyone else's, so the version gate stays truthful.
+                # everyone else's, so the version gate stays truthful. A key
+                # with a local checkpoint file warm-starts from it instead and
+                # delta-syncs forward (still via the version gate).
                 full = build_module_bank(self.config, seed=self.bank_seed)
                 for k in gained:
                     self.bank[k] = full[k].to(self.device)
                     self._versions[k] = (0, 0)
+                    if not is_private_key(k) and k not in self._outer_opts:
+                        self._outer_opts[k] = make_outer_optimizer({k: self.bank[k]}, self.diloco)
+                    if self._resume_dir is not None:
+                        self._load_module_locked(k, self._resume_dir)
             for k in owned:
                 if not is_private_key(k) and k not in self._outer_opts:
                     self._outer_opts[k] = make_outer_optimizer({k: self.bank[k]}, self.diloco)
@@ -397,7 +428,10 @@ class ParameterServer(_ReactorServer):
                 self._active.discard(k)
             self.owned_keys = owned
             if bootstrap:
-                self._active |= owned
+                # Boot-serve only the universal seeded state: a key resumed
+                # from disk at v > (0, 0) must reconcile with its replicas
+                # first (they may hold newer), even under a bootstrap epoch.
+                self._active |= {k for k in owned if self._versions[k] == (0, 0)}
             self._prev_epoch = self._epoch
             self._epoch = record
             self._epoch_num = record["epoch"]
@@ -438,6 +472,7 @@ class ParameterServer(_ReactorServer):
         source -- backups from the primary (then fellow replicas), a syncing
         primary from its backups. Returns ``{key: "active" | "pending"}``.
         """
+        results: dict = {}
         with self._lock:
             epoch = self._epoch
             if epoch is None or self.peer_id is None:
@@ -468,7 +503,14 @@ class ParameterServer(_ReactorServer):
                         addrs.append(a)
                 if addrs:
                     candidates[k] = addrs
-        results = {k: "pending" for k in candidates}
+                    results[k] = "pending"
+                elif k not in self._active:
+                    # Sole owner of the key (no other replica anywhere): it is
+                    # authoritative by definition -- e.g. a k=1 restart.
+                    self._active.add(k)
+                    results[k] = "active"
+            was_active = set(self._active)
+        served: set = set()
         pending = dict(candidates)
         while pending:
             k0 = next(iter(pending))
@@ -481,30 +523,38 @@ class ParameterServer(_ReactorServer):
                                               "have": have, "include_state": True})
             except (OSError, ConnectionError):
                 reply = None
-            served = (reply or {}).get("versions") or {}
+            answers = (reply or {}).get("versions") or {}
             with self._lock:
                 for k in batch:
-                    v = served.get(k)
-                    if v is None:  # peer down / key missing there -> next candidate
-                        pending[k] = pending[k][1:]
-                        if not pending[k]:
+                    pending[k] = pending[k][1:]  # this source has been consulted
+                    v = answers.get(k)
+                    if v is not None:
+                        v = tuple(v)
+                        if v > self._versions[k]:
+                            sd = (reply.get("weights") or {}).get(k)
+                            if sd is not None:
+                                self.bank[k].load_state_dict(
+                                    {n: t.to(self.device) for n, t in sd.items()})
+                                osd = (reply.get("state") or {}).get(k)
+                                if osd is not None and k in self._outer_opts:
+                                    self._outer_opts[k].load_state_dict(_opt_from_wire(osd))
+                                self._versions[k] = v
+                        if self._versions[k] >= v:
+                            served.add(k)
+                        # An already-active key refreshes from its first
+                        # responsive source; a *syncing* key keeps consulting
+                        # every replica and adopts the max -- activating after
+                        # one answer could miss a backup that ran ahead of the
+                        # others (and of our own disk) before a crash.
+                        if k in was_active:
                             pending.pop(k)
-                        continue
-                    pending.pop(k)
-                    v = tuple(v)
-                    if v > self._versions[k]:
-                        sd = (reply.get("weights") or {}).get(k)
-                        if sd is None:
-                            continue  # source claims newer but shipped nothing; retry next pass
-                        self.bank[k].load_state_dict(
-                            {n: t.to(self.device) for n, t in sd.items()})
-                        osd = (reply.get("state") or {}).get(k)
-                        if osd is not None and k in self._outer_opts:
-                            self._outer_opts[k].load_state_dict(_opt_from_wire(osd))
-                        self._versions[k] = v
-                    if self._versions[k] >= v:  # confirmed at/ahead of the source -> serve
-                        self._active.add(k)
-                        results[k] = "active"
+                            results[k] = "active"
+                            continue
+                    if not pending[k]:
+                        pending.pop(k)
+                        if k in served:  # every replica consulted; we hold the max
+                            self._active.add(k)
+                            results[k] = "active"
         return results
 
     def start_tracker_heartbeat(self, tracker_addr, advertise_host, *, roles=("owner",),
@@ -630,6 +680,56 @@ class ParameterServer(_ReactorServer):
                     "reason": "not_primary", "epoch": epoch_num}
         return {"type": "ack", "applied": True}
 
+    # -- per-key persistence (design D7: remap-proof checkpoints) ---------------
+
+    @staticmethod
+    def _module_file(key: str) -> str:
+        # One file per module key (not per key *set* like the legacy shard blob),
+        # so ownership remaps never invalidate what is already on disk.
+        return f"module_{hashlib.sha256(key.encode()).hexdigest()[:16]}.pt"
+
+    def save_modules(self, dirpath: str) -> dict:
+        """Persist every held key to its own file; return ``{key: version}``.
+
+        Files whose version is already on disk are skipped (an idle module
+        costs nothing per checkpoint). The returned versions feed the
+        scheduler's signed recovery manifest.
+        """
+        os.makedirs(dirpath, exist_ok=True)
+        saved = {}
+        with self._lock:
+            blobs = {}
+            for k in self.bank:
+                v = self._versions.get(k, (0, 0))
+                saved[k] = v
+                if self._saved_versions.get((dirpath, k)) == v:
+                    continue
+                opt = self._outer_opts.get(k)
+                blobs[k] = {"key": k, "version": list(v),
+                            "weights": _state_to_cpu(self.bank[k].state_dict()),
+                            "outer_opt": (_optimizer_state_to_cpu(opt.state_dict())
+                                          if opt is not None else None)}
+        for k, blob in blobs.items():
+            tmp = os.path.join(dirpath, self._module_file(k) + ".tmp")
+            torch.save(blob, tmp)
+            os.replace(tmp, os.path.join(dirpath, self._module_file(k)))  # atomic
+            self._saved_versions[(dirpath, k)] = tuple(blob["version"])
+        return saved
+
+    def _load_module_locked(self, key: str, dirpath: str) -> bool:
+        """Warm-start one key from its checkpoint file (if present)."""
+        path = os.path.join(dirpath, self._module_file(key))
+        if not os.path.exists(path):
+            return False
+        blob = torch.load(path, map_location=self.device, weights_only=True)
+        self.bank[key].load_state_dict(
+            {n: v.to(self.device) for n, v in blob["weights"].items()})
+        self._versions[key] = _version_pair(blob["version"])
+        if blob.get("outer_opt") is not None and key in self._outer_opts:
+            self._outer_opts[key].load_state_dict(blob["outer_opt"])
+        self._saved_versions[(dirpath, key)] = self._versions[key]
+        return True
+
     def _shard_name(self) -> str:
         # Stable across processes (unlike per-process-salted ``hash``), so a shard
         # saved by one process is found by the restarted one with the same keys.
@@ -686,6 +786,7 @@ class Scheduler(_ReactorServer):
         # via ``scheduler_pub=``) and epoch records can be published (Phase 2a).
         self.identity = identity
         self._epoch_record = None
+        self._manifest = None  # signed recovery point (design D7); gates resume
         self._watch_stop = threading.Event()  # stops the watch_tracker thread
         self._watch_thread = None
         self.compress = check_mode(compress)  # stamped on tasks; workers follow it
@@ -921,6 +1022,13 @@ class Scheduler(_ReactorServer):
         """
         if resume and checkpoint_dir:
             self._load_state(checkpoint_dir)
+            # Recovery gate (design D7): with a manifest, don't serve until a
+            # live owner holds >= the manifest version for every key (owners
+            # reconcile among themselves via replication while we wait).
+            while self._manifest is not None and not self._stop and not self._dead:
+                if self._recovery_ready():
+                    break
+                time.sleep(0.5)
         self.total_rounds = total_generations if total_generations is not None else num_generations
         with self._lock:
             self._completed = {p: self._completed.get(p, 0) for p in self.paths}
@@ -947,19 +1055,42 @@ class Scheduler(_ReactorServer):
         return dict(self._completed)
 
     def _checkpoint_cluster(self, dirpath: str) -> None:
-        """Save the scheduler clock and trigger every parameter server to persist."""
+        """Save the scheduler clock and trigger every parameter server to persist.
+
+        In rendezvous mode the owners' checkpoint acks carry the versions they
+        persisted; their per-key maximum becomes the signed **recovery
+        manifest** (design D7) -- the floor a restarted cluster must reach
+        (some live owner holding >= the manifest version for every key) before
+        the scheduler serves tasks again.
+        """
         os.makedirs(dirpath, exist_ok=True)
         with self._lock:
-            addrs = (sorted({tuple(o["addr"]) for o in self._epoch_record["owners"]})
-                     if self._epoch_record is not None else self.ps_addrs)
+            record = self._epoch_record
+            addrs = (sorted({tuple(o["addr"]) for o in record["owners"]})
+                     if record is not None else self.ps_addrs)
+        held: dict = {}
         for addr in addrs:
             try:
                 s = _ps_connect(addr, self.auth_key, DEFAULT_MAX_MSG_BYTES, 5.0,
                                 tls=self.ps_tls, server_hostname=addr[0])
-                _rpc(s, {"type": "checkpoint", "dir": dirpath}, DEFAULT_MAX_MSG_BYTES)
+                reply = _rpc(s, {"type": "checkpoint", "dir": dirpath}, DEFAULT_MAX_MSG_BYTES)
                 s.close()
             except OSError:
-                pass  # a PS that's momentarily unreachable is checkpointed next time
+                continue  # a PS that's momentarily unreachable is checkpointed next time
+            for k, v in ((reply or {}).get("versions") or {}).items():
+                held[k] = max(held.get(k, (0, 0)), tuple(v))
+        if record is not None and self.identity is not None and held:
+            manifest = sign_record(self.identity, {
+                "kind": "manifest", "epoch": record["epoch"],
+                "keys": {k: list(v) for k, v in held.items()},
+                "issued_at": time.time(),
+            })
+            tmp = os.path.join(dirpath, "manifest.json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+            os.replace(tmp, os.path.join(dirpath, "manifest.json"))
+            with self._lock:
+                self._manifest = manifest
         with self._lock:
             state = {"T": self._T, "completed": dict(self._completed)}
         tmp = os.path.join(dirpath, "scheduler.pt.tmp")
@@ -974,6 +1105,42 @@ class Scheduler(_ReactorServer):
         with self._lock:
             self._T = state["T"]
             self._completed = dict(state["completed"])
+        mpath = os.path.join(dirpath, "manifest.json")
+        if self.identity is not None and os.path.exists(mpath):
+            with open(mpath, encoding="utf-8") as f:
+                manifest = json.load(f)
+            # Only this scheduler's own signature counts: a planted manifest
+            # could otherwise lower (or inflate) the recovery floor.
+            if (verify_record(manifest) and manifest.get("kind") == "manifest"
+                    and manifest.get("pub", "").lower() == self.identity.public_key_hex):
+                with self._lock:
+                    self._manifest = manifest
+
+    def _recovery_ready(self) -> bool:
+        """Does some live owner hold >= the manifest version for every key?
+
+        Polls the current epoch owners' ``status`` (their *active* keys). Until
+        this holds, serving tasks would train against data older than the
+        recovery point.
+        """
+        with self._lock:
+            record, manifest = self._epoch_record, self._manifest
+        if manifest is None:
+            return True
+        if record is None:
+            return False  # no owner set yet (watch_tracker hasn't published)
+        held: dict = {}
+        for addr in sorted({tuple(o["addr"]) for o in record["owners"]}):
+            try:
+                s = _ps_connect(addr, self.auth_key, DEFAULT_MAX_MSG_BYTES, 5.0,
+                                tls=self.ps_tls, server_hostname=addr[0])
+                reply = _rpc(s, {"type": "status"}, DEFAULT_MAX_MSG_BYTES)
+                s.close()
+            except (OSError, ConnectionError):
+                continue
+            for k, v in ((reply or {}).get("versions") or {}).items():
+                held[k] = max(held.get(k, (0, 0)), tuple(v))
+        return all(held.get(k, (-1, -1)) >= tuple(v) for k, v in manifest["keys"].items())
 
     def shutdown(self) -> None:
         self._watch_stop.set()

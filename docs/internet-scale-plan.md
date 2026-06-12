@@ -287,9 +287,11 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
   stack needed only an extra auth branch. hivemind/libp2p stay fallback options
   if Phase 2's relay tier proves heavier than expected.
 
-### Phase 2 — distribute the module bank (PS → replicated owner peers)
+### Phase 2 — distribute the module bank (PS → replicated owner peers) · ✅ done
 
-> Detailed design (decisions D1–D10, slices 2a–2d): [phase2-design.md](phase2-design.md).
+> Detailed design, the amendments discovered while building (seeded banks,
+> exact-byte replication, bootstrap epochs, exhaustive restart reconciliation),
+> and per-slice status: [phase2-design.md](phase2-design.md).
 
 - **Ownership**: rendezvous hashing maps each module key to **k owner peers** (k≈3)
   drawn from the reachable, reputation-qualified tier. The owner set per key is
@@ -363,7 +365,7 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
 | ~~0e~~ ✅ | ~~bf16 inner loop, capability negotiation, idle backoff, hygiene~~ | **Done** — 1.10 (autocast + batch caps), 1.9 (idle pacing), 1.11, 1.12 | S–M |
 | 0f | WAN validation run of the async path | 1.4 | M (mostly wall-clock) |
 | ~~1~~ ✅ | ~~Peer identity + tracker + reachability tiers~~ | **Done** — 1.13, 1.8 (prereq); per-frame envelopes + autonomous gossip deferred to Phase 2 | M |
-| 2 | Replicated module owners, dynamic ownership, signed manifests — **2a–2c done** (HRW placement, signed epochs, Ed25519 grants, version pairs, pull replication, fetch-any/push-primary, tracker-driven failover + promotion); 2d (persistence + manifest + launch wiring) pending | 1.8 | L |
+| ~~2~~ ✅ | ~~Replicated module owners, dynamic ownership, signed manifests~~ | **Done** — 1.8 (HRW placement, signed epochs, Ed25519 grants, version pairs, pull replication, tracker-driven failover + promotion, per-key checkpoints + recovery manifest, `ownership: rendezvous` launch mode; design + amendments in [phase2-design.md](phase2-design.md)) | L |
 | 3 | Robust aggregation, redundancy, reputation, private-module policy | 1.1, 1.9, 1.14 | L |
 | 4 | Decentralized scheduling (optional) | residual SPOF | L |
 

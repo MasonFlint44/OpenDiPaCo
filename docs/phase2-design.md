@@ -13,12 +13,24 @@ fallback, and seeded bank builds (`bank_seed`, see D5 amendment). 2c:
 poll the scheduler for epochs from their replication loop
 (`scheduler_addr=`), **bootstrap-flagged first epoch** (a fresh cluster's
 owners boot-serve their seeded banks exactly once — without it a polled first
-epoch deadlocks with everyone syncing; restart-within-epoch over a lost disk
-remains a documented hole until 2d persistence), zombie write fencing +
-one-epoch lame ducks that double as **fallback pull sources** (a wholesale
-remap can still cold-sync from last epoch's owners), and
-`start_tracker_heartbeat`. Slice 2d pending. This expands the Phase 2 sketch
-in
+epoch deadlocks with everyone syncing), zombie write fencing + one-epoch lame
+ducks that double as **fallback pull sources** (a wholesale remap can still
+cold-sync from last epoch's owners), and `start_tracker_heartbeat`. 2d:
+per-key checkpoint files (`module_<hash>.pt`, remap-proof, skip-unchanged;
+warm restarts resume at the saved version and **delta-sync, never cold-sync**),
+restart reconciliation (resumed keys stay syncing until an **exhaustive**
+pull adopts the max across all replicas — closing 2c's restart-over-lost-disk
+hole; owner-authorized pulls see syncing keys so a full-cluster restart
+reconciles instead of deadlocking; sole owners self-activate), the
+scheduler-signed **recovery manifest** + readiness gate (`fit(resume=True)`
+refuses to serve until live owners hold ≥ the manifest version for every
+key), and launch wiring (`ownership` config section, rendezvous
+scheduler/owner roles with tracker heartbeats, `run_local` rendezvous smoke).
+**All four slices have landed — Phase 2 is complete.** Still open within the
+phase's scope notes: replication-path compression and delta-encoding (D10
+bandwidth items), per-epoch-0 number reuse across scheduler restarts is
+disambiguated only by `issued_at`, and Byzantine behavior everywhere is
+Phase 3. This expands the Phase 2 sketch in
 [internet-scale-plan.md](internet-scale-plan.md) into concrete decisions before
 code. Each decision below (D1–D10) states the options considered and the
 recommendation; "open questions" at the end are the ones genuinely worth a

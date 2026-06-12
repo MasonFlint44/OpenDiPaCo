@@ -236,11 +236,22 @@ def test_kill_primary_mid_run_completes_with_promotion():
         killer.join(timeout=30)
         assert sum(completed.values()) >= sched._target  # training rode out the death
 
+        # The bump (ttl + grace after the crash) may land after fit() returns
+        # when the kill came late in the run -- wait for it, then for the
+        # surviving owners to adopt the final epoch and finish syncing.
+        survivors = pss[1:]
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            final = sched._epoch_record
+            if (final["epoch"] >= 1
+                    and all(ps._epoch_num == final["epoch"] for ps in survivors)
+                    and all(ps._active >= ps.owned_keys for ps in survivors)):
+                break
+            time.sleep(0.1)
         final = sched._epoch_record
         assert final["epoch"] >= 1                        # the death bumped the epoch
         assert victim.peer_id not in {o["peer_id"] for o in final["owners"]}
         # Every key is served by live, promoted owners under the final epoch.
-        survivors = pss[1:]
         for k in cfg.build_topology().module_keys():
             owner_ids = {o["peer_id"] for o in owners_for(k, final)}
             assert owner_ids <= {ps.peer_id for ps in survivors}
