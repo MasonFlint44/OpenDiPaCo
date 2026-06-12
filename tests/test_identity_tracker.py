@@ -81,6 +81,14 @@ def test_identity_roundtrip_and_key_file_permissions(tmp_path):
     import os
     assert (os.stat(path).st_mode & 0o777) == 0o600   # private key is owner-only
 
+    # Overwriting a pre-existing world-readable file must clamp it back to 0600
+    # (os.open's mode applies only on creation, not on O_TRUNC of an old file).
+    loose = tmp_path / "existing.pem"
+    loose.write_text("old contents")
+    os.chmod(loose, 0o644)
+    PeerIdentity.generate().save(loose)
+    assert (os.stat(loose).st_mode & 0o777) == 0o600
+
 
 def test_challenge_auth_verifies_and_rejects():
     ident = PeerIdentity.generate()

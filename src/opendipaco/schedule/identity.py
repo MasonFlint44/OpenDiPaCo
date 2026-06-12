@@ -88,6 +88,15 @@ class PeerIdentity:
             serialization.NoEncryption(),
         )
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            # The mode arg above only applies when the file is *created*; an
+            # overwritten pre-existing file would keep its old (possibly
+            # world-readable) permissions, so clamp explicitly.
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+        except OSError:
+            os.close(fd)
+            raise
         with os.fdopen(fd, "wb") as f:
             f.write(pem)
         return str(path)
