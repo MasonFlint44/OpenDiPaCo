@@ -1,6 +1,9 @@
 # Phase 2 design — distribute the module bank (PS → replicated owner peers)
 
-Status: **design — not yet implemented.** This expands the Phase 2 sketch in
+Status: **slice 2a landed** (`schedule/ownership.py`: HRW + epoch records;
+Ed25519 grants beside HMAC; scheduler `epoch` RPC + `publish_epoch`; tracker
+epoch cache with signer pinning — `put_epoch`/`get_epoch`). Slices 2b–2d
+pending. This expands the Phase 2 sketch in
 [internet-scale-plan.md](internet-scale-plan.md) into concrete decisions before
 code. Each decision below (D1–D10) states the options considered and the
 recommendation; "open questions" at the end are the ones genuinely worth a

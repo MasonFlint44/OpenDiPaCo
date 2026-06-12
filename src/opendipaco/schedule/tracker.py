@@ -34,6 +34,7 @@ import threading
 import time
 
 from .identity import PeerIdentity, sign_record, verify_record
+from .ownership import epoch_newer, verify_epoch_record
 from .reactor import DEFAULT_MAX_MSG_BYTES, _ReactorServer
 from .sharded import _ps_connect, _rpc
 
@@ -83,7 +84,7 @@ class Tracker(_ReactorServer):
     def __init__(self, *, host: str = "0.0.0.0", port: int = 0, ttl: float = 120.0,
                  open_enrollment: bool = False, enroll_peers=None, auth_key=None,
                  max_peers: int = 65536, max_msg_bytes: int = TRACKER_MAX_MSG_BYTES,
-                 **reactor_kw):
+                 epoch_signer=None, **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key,
                          max_msg_bytes=max_msg_bytes, **reactor_kw)
         self.ttl = ttl
@@ -94,6 +95,14 @@ class Tracker(_ReactorServer):
         # peer_id -> {"record": dict | None (tombstone), "issued_at": float,
         #             "expires": monotonic deadline}
         self._peers: dict[str, dict] = {}
+        # Cached owner-set epoch record (Phase 2a): a convenience copy of the
+        # scheduler's signed record, served to bootstrapping owners. The cache
+        # is not the authority -- consumers re-verify against the scheduler's
+        # pub. ``epoch_signer=`` pins who may put it; if unset, the first valid
+        # put pins the signer (set it explicitly on open-enrollment trackers,
+        # or any enrolled peer could race to pin its own "epochs").
+        self._epoch: dict | None = None
+        self._epoch_signer: str | None = self._pub(epoch_signer) if epoch_signer else None
 
     @staticmethod
     def _pub(p) -> str:
@@ -129,7 +138,25 @@ class Tracker(_ReactorServer):
             return self._directory(msg)
         if kind == "import":
             return self._import(msg.get("records") or [])
+        if kind == "epoch_put":
+            return self._epoch_put(msg.get("record"))
+        if kind == "epoch_get":
+            with self._dir_lock:
+                return {"type": "epoch", "record": self._epoch}
         return None
+
+    def _epoch_put(self, record) -> dict:
+        if not verify_epoch_record(record):
+            return {"type": "refused", "reason": "bad epoch record"}
+        pub = record["pub"].lower()
+        with self._dir_lock:
+            if self._epoch_signer is not None and pub != self._epoch_signer:
+                return {"type": "refused", "reason": "wrong signer"}
+            if not epoch_newer(record, self._epoch):
+                return {"type": "refused", "reason": "stale epoch"}
+            self._epoch_signer = pub  # first valid put pins the signer
+            self._epoch = record
+        return {"type": "epoch_cached"}
 
     def _register(self, record) -> dict:
         ok, reason = self._admit(record)
@@ -263,3 +290,22 @@ def import_records(addr, records, *, auth_key=None, tls=None, timeout: float = 1
     """Push relayed records into a tracker (bootstrap a replacement from a cache)."""
     return tracker_rpc(addr, {"type": "import", "records": list(records)},
                        auth_key=auth_key, tls=tls, timeout=timeout)
+
+
+def put_epoch(addr, record, *, auth_key=None, tls=None, timeout: float = 10.0) -> dict:
+    """Cache the scheduler's signed epoch record on a tracker (Phase 2a)."""
+    return tracker_rpc(addr, {"type": "epoch_put", "record": record},
+                       auth_key=auth_key, tls=tls, timeout=timeout)
+
+
+def get_epoch(addr, *, signer_pub=None, auth_key=None, tls=None,
+              timeout: float = 10.0) -> dict | None:
+    """Fetch the cached epoch record; re-verified locally before it is returned
+    (pass ``signer_pub`` — the scheduler's public key — to also pin the signer,
+    since the tracker cache is a convenience, not the authority)."""
+    reply = tracker_rpc(addr, {"type": "epoch_get"},
+                        auth_key=auth_key, tls=tls, timeout=timeout)
+    record = (reply or {}).get("record")
+    if record is None or not verify_epoch_record(record, signer_pub=signer_pub):
+        return None
+    return record

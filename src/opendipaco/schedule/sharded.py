@@ -59,6 +59,8 @@ from .distributed import (
     _materialize_from_spec,
 )
 from .guard import all_finite, clip_norm_, loss_ok
+from .identity import sign_record, verify_record
+from .ownership import make_epoch_record
 from .reactor import DEFAULT_MAX_MSG_BYTES, _ReactorServer
 from .scheduler import AsyncScheduler
 from .wire import _key_bytes, client_handshake, recv_msg, send_msg
@@ -79,7 +81,15 @@ def assign_shards(keys, num_shards: int) -> dict:
 # where weights live. A *grant* carries the scheduler's verdict to the servers:
 # the accepted path, the damped push weight, the keys the push may touch, and
 # the (unique) lease token. The weight/keys always come from the grant rather
-# than the worker; with a shared ``grant_key`` the grant is HMAC-signed too.
+# than the worker. Two signing modes (Phase 2a, design D3):
+#
+# * ``grant_key`` — HMAC over the canonical payload. Fine for operator-run
+#   parameter servers, but the key must be shared with every server, so any
+#   server could forge grants. Keep it secret from workers.
+# * ``identity`` — the scheduler signs with its Ed25519 ``PeerIdentity``
+#   (``sign_record``, ``kind="grant"``); owners verify against the scheduler's
+#   *public* key (``scheduler_pub=``). Nothing secret leaves the scheduler,
+#   so this is the mode for volunteer-run owners. It wins when both are set.
 
 
 def _grant_payload(grant: dict) -> bytes:
@@ -91,9 +101,12 @@ def _grant_payload(grant: dict) -> bytes:
     ).encode("utf-8")
 
 
-def make_grant(path, keys, weight: float, token: str, grant_key=None) -> dict:
+def make_grant(path, keys, weight: float, token: str, grant_key=None, *,
+               identity=None) -> dict:
     grant = {"path": list(path), "token": token, "weight": float(weight),
              "keys": sorted(keys)}
+    if identity is not None:  # Ed25519 mode: verifiable with a public key only
+        return sign_record(identity, {"kind": "grant", **grant})
     if grant_key is not None:
         grant["mac"] = hmac.new(
             _key_bytes(grant_key), _grant_payload(grant), hashlib.sha256
@@ -101,10 +114,19 @@ def make_grant(path, keys, weight: float, token: str, grant_key=None) -> dict:
     return grant
 
 
-def verify_grant(grant, grant_key) -> bool:
-    """Structurally valid and, when ``grant_key`` is set, correctly signed."""
+def verify_grant(grant, grant_key, *, scheduler_pub: str | None = None) -> bool:
+    """Structurally valid and correctly signed for the configured mode.
+
+    With ``scheduler_pub`` set, only an Ed25519 grant signed by exactly that
+    key passes (an HMAC or unsigned grant is refused — a worker must not be
+    able to downgrade the check). Otherwise ``grant_key`` selects the HMAC
+    check, and with neither set the check is structural only.
+    """
     if not isinstance(grant, dict) or not grant.get("token"):
         return False
+    if scheduler_pub is not None:
+        return (verify_record(grant) and grant.get("kind") == "grant"
+                and grant.get("pub", "").lower() == scheduler_pub.lower())
     try:
         payload = _grant_payload(grant)
     except (KeyError, TypeError):
@@ -133,13 +155,17 @@ class ParameterServer(_ReactorServer):
 
     def __init__(self, config, owned_keys, diloco, *, host="0.0.0.0", port=0,
                  auth_key=None, device="cpu", resume_dir=None, grant_key=None,
-                 max_update_norm=None, compress="none", **reactor_kw):
+                 scheduler_pub=None, max_update_norm=None, compress="none",
+                 **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.config = config
         self.diloco = diloco
         self.device = torch.device(device)
         self.owned_keys = set(owned_keys)
         self.grant_key = grant_key
+        # Ed25519 grant mode: the scheduler's *public* key. When set it is the
+        # only accepted grant form (HMAC grants are refused -- no downgrade).
+        self.scheduler_pub = scheduler_pub
         # Non-finite pushes are always refused; the optional norm cap clips
         # oversized pseudo-gradients per module (see ``guard.py``).
         self.max_update_norm = max_update_norm
@@ -189,7 +215,7 @@ class ParameterServer(_ReactorServer):
 
     def _push(self, msg: dict) -> dict:
         grant = msg.get("grant")
-        if not verify_grant(grant, self.grant_key):
+        if not verify_grant(grant, self.grant_key, scheduler_pub=self.scheduler_pub):
             return {"type": "ack", "applied": False}  # no/forged grant -> refuse
         # Decode (possibly quantized) gradients outside the lock; a malformed
         # encoding refuses the push rather than crashing the server.
@@ -275,10 +301,14 @@ class Scheduler(_ReactorServer):
                  host="0.0.0.0", port=0, auth_key=None, seed=0,
                  staleness_bound=None, staleness_weight="inverse",
                  heartbeat_timeout=30.0, ps_tls=None, grant_key=None,
-                 compress="none", idle_backoff=None, **reactor_kw):
+                 identity=None, compress="none", idle_backoff=None, **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.ps_tls = ps_tls  # client context for the scheduler's checkpoint RPCs to PSs
         self.grant_key = grant_key  # shared with the PSs (not workers) to sign grants
+        # With an Ed25519 identity, grants are signed instead (servers verify
+        # via ``scheduler_pub=``) and epoch records can be published (Phase 2a).
+        self.identity = identity
+        self._epoch_record = None
         self.compress = check_mode(compress)  # stamped on tasks; workers follow it
         self.idle_backoff = idle_backoff      # server-paced idle polling (retry_in)
         self._worker_caps: dict = {}          # worker_id -> advertised capabilities
@@ -319,7 +349,29 @@ class Scheduler(_ReactorServer):
             return self._commit(msg)
         if kind == "heartbeat":
             self._heartbeat(msg)
+            return None
+        if kind == "epoch":
+            with self._lock:
+                return {"type": "epoch", "record": self._epoch_record}
         return None
+
+    def publish_epoch(self, owner_records, *, k=3, salt="") -> dict:
+        """Build, sign, and serve the next owner-set epoch (Phase 2a seam).
+
+        ``owner_records`` are verified, owner-eligible tracker peer records
+        (e.g. ``fetch_directory(..., roles=["owner"], reachability="public")``).
+        For now the record is only *served* — via the ``epoch`` RPC here and as
+        a cached copy on the tracker (``put_epoch``); routing/replication start
+        consuming it in slice 2b.
+        """
+        if self.identity is None:
+            raise RuntimeError("publish_epoch needs the scheduler's identity=")
+        with self._lock:
+            num = 0 if self._epoch_record is None else self._epoch_record["epoch"] + 1
+            record = make_epoch_record(self.identity, epoch=num,
+                                       owner_records=owner_records, k=k, salt=salt)
+            self._epoch_record = record
+        return record
 
     def _idle(self) -> dict:
         msg = {"type": "idle"}
@@ -400,7 +452,8 @@ class Scheduler(_ReactorServer):
             # The grant carries the verdict to the parameter servers: weight and
             # allowed keys come from here, the lease token makes it single-use.
             grant = make_grant(path, self.topology.path_module_keys(path),
-                               push_weight, lease, self.grant_key)
+                               push_weight, lease, self.grant_key,
+                               identity=self.identity)
             return {"type": "commit_ack", "accepted": True,
                     "push_weight": push_weight, "grant": grant}
 
