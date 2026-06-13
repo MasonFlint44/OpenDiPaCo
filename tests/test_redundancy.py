@@ -226,6 +226,104 @@ def test_check_offered_only_to_distinct_workers_on_oversupply():
         sched.shutdown()
 
 
+# -- private-module proposal gating (D5/3a) ------------------------------------
+
+
+def _priv_cfg():
+    bb = BackboneConfig(
+        vocab_size=48, hidden_size=32, num_attention_heads=4, intermediate_size=64,
+        layers_per_level=[1, 1], max_position_embeddings=64,
+    )
+    return DiPaCoConfig(backbone=bb, level_sizes=[2, 2], sequence_length=16,
+                        embedding="private")
+
+
+def _priv_ps(**kw):
+    cfg = _priv_cfg()
+    return ParameterServer(cfg, sorted(cfg.build_topology().module_keys()),
+                           DiLoCoConfig(inner_steps=4), host="127.0.0.1", port=0, **kw)
+
+
+def _private_state(ps, key, fill):
+    return {n: torch.full_like(p, fill) for n, p in ps.bank[key].state_dict().items()}
+
+
+def test_proposal_applies_only_on_quorum_agreement():
+    """Under the proposal policy a private push is inert until ``private_quorum``
+    distinct peers agree on the exact state; then it applies."""
+    ps = _priv_ps(private_policy="proposal", private_quorum=2)
+    try:
+        k = next(x for x in ps.owned_keys if is_private_key(x))
+        path = ps._topology.paths_through_module(k)[0]
+        v0 = ps._versions[k]
+        good = _private_state(ps, k, 1.0)
+
+        # First proposal (one peer) -> held, nothing applied.
+        ps._push({"grant": make_grant(path, [k], 1.0, "g1"), "private": {k: good}},
+                 peer_id="A")
+        assert ps._versions[k] == v0
+        assert not torch.equal(next(iter(ps.bank[k].parameters())).detach(),
+                               torch.full_like(next(iter(ps.bank[k].parameters())), 1.0))
+        # A second *distinct* peer proposing the same state -> quorum -> applied.
+        ps._private_proposal({"private": {k: good}}, peer_id="B")
+        assert ps._versions[k] > v0
+        assert all(torch.equal(p.detach(), torch.full_like(p, 1.0))
+                   for p in ps.bank[k].parameters())
+    finally:
+        ps.shutdown()
+
+
+def test_lone_or_self_corroborated_proposal_never_applies():
+    """A single peer (even repeating, even via the proposal channel) can't reach
+    quorum: a malicious owner-path worker can at most stall its private module,
+    never poison it."""
+    ps = _priv_ps(private_policy="proposal", private_quorum=2)
+    try:
+        k = next(x for x in ps.owned_keys if is_private_key(x))
+        path = ps._topology.paths_through_module(k)[0]
+        v0 = ps._versions[k]
+        bad = _private_state(ps, k, 9.0)
+        for _ in range(5):  # same peer, repeated -> still one distinct identity
+            ps._push({"grant": make_grant(path, [k], 1.0, "g"), "private": {k: bad}},
+                     peer_id="ATTACKER")
+            ps._private_proposal({"private": {k: bad}}, peer_id="ATTACKER")
+        assert ps._versions[k] == v0          # never applied -> not poisoned
+        # An anonymous proposal can't complete a quorum either (no distinct id).
+        ps._private_proposal({"private": {k: bad}}, peer_id=None)
+        assert ps._versions[k] == v0
+    finally:
+        ps.shutdown()
+
+
+def test_disagreeing_proposals_do_not_corroborate():
+    """Two peers proposing *different* states don't form a quorum on either."""
+    ps = _priv_ps(private_policy="proposal", private_quorum=2)
+    try:
+        k = next(x for x in ps.owned_keys if is_private_key(x))
+        path = ps._topology.paths_through_module(k)[0]
+        v0 = ps._versions[k]
+        ps._push({"grant": make_grant(path, [k], 1.0, "g"),
+                  "private": {k: _private_state(ps, k, 1.0)}}, peer_id="A")
+        ps._private_proposal({"private": {k: _private_state(ps, k, 2.0)}}, peer_id="B")
+        assert ps._versions[k] == v0          # no two agree -> nothing applied
+    finally:
+        ps.shutdown()
+
+
+def test_overwrite_policy_applies_verbatim():
+    """The default policy is unchanged: a single private push applies at once."""
+    ps = _priv_ps(private_policy="overwrite")
+    try:
+        k = next(x for x in ps.owned_keys if is_private_key(x))
+        path = ps._topology.paths_through_module(k)[0]
+        v0 = ps._versions[k]
+        ps._push({"grant": make_grant(path, [k], 1.0, "g"),
+                  "private": {k: _private_state(ps, k, 1.0)}}, peer_id="A")
+        assert ps._versions[k] > v0           # verbatim, no corroboration needed
+    finally:
+        ps.shutdown()
+
+
 def test_no_audits_when_rate_zero():
     sched = _serving(redundancy=3, redundancy_rate=0.0)
     try:

@@ -1,14 +1,37 @@
 # Phase 3 design — Byzantine-robust aggregation (the trust wall, §1.1)
 
-Status: **slices 3a + 3b + 3c landed.** 3a: `schedule/aggregate.py` robust
-combiner + owner-side quorum buffering. 3b: `schedule/reputation.py` +
-`schedule/ratelimit.py`. 3c: version-pinned redundant execution — owner version
-history + pinned fetch, `pseudograd_digest`, scheduler audit groups (sampled
-primaries report a pinned base + digest; surplus workers re-run them cold from
-that base and report digests; agreement credits, the odd one out is debited),
-absorbing the §1.9 oversupply. Slice 3d pending. Expands the Phase 3 sketch in
+Status: **all four slices landed — Phase 3 complete.** 3a: `aggregate.py`
+robust combiner + owner-side quorum buffering. 3b: `reputation.py` +
+`ratelimit.py`. 3c: version-pinned redundant execution. 3d: private-module
+proposal-gating (owner quorum-by-agreement), the `robustness` launch-config
+section wiring 3a–3c, and `examples/validate_robustness.py` (the §1.4
+acceptance harness). `robustness: off` (default) is bit-identical to Phase 2.
+Expands the Phase 3 sketch in
 [internet-scale-plan.md](internet-scale-plan.md). Decisions D1–D8 state the
 options and the chosen path; §5 records the four operator calls.
+
+**3d amendments (discovered while building):**
+- *Private gating is owner-local quorum-by-agreement, needing no new
+  cross-node confirm protocol.* A private push is held as an inert proposal;
+  the owner applies it only when ``private_quorum`` (default 2) **distinct
+  authenticated peers** agree on the **owner-computed** digest of the exact
+  state. So a lone owner-path worker can at most *stall* its private module
+  (the update never reaches quorum), never poison it; corroboration comes from
+  redundant execution (the checkers submit ungranted proposals). The owner
+  computes the digest itself, so a worker can't claim agreement it didn't earn.
+- *Private-bearing tasks are always audited under the policy.* Without an audit
+  a proposal never gets a second corroborator, so the module would freeze;
+  the scheduler forces an audit (and a cold, reproducible primary) for any
+  path with private modules when ``private_policy: proposal``.
+- *Proposal mode needs identities.* Quorum counts distinct ``peer_id``s, so an
+  HMAC/anonymous deployment (no per-peer identity) can't corroborate — proposal
+  mode is for open-enrollment runs; a trusted HMAC cluster uses ``overwrite``.
+- *The validation harness honestly characterizes the aggregates rather than
+  rubber-stamping them:* ``trimmed_mean`` trims one extreme per side
+  (breakdown = 1 adversary, ≡ median at the default quorum 3); ``median``
+  tolerates a true minority. The §1.4 *convergence* verdict still rides the 0f
+  WAN run — the harness validates the aggregation primitive, not end-to-end
+  training.
 
 **3c amendments — the big one, found while building (the design's D2 was unsound):**
 - *D2 assumed two workers training "the same (path, generation, shard)" produce

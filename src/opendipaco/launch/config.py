@@ -163,6 +163,42 @@ class OwnershipCfg:
 
 
 @dataclass
+class RobustnessCfg:
+    """Byzantine-robustness (Phase 3; ``docs/phase3-design.md``). All off by
+    default — ``mode: off`` keeps the run bit-identical to Phase 2.
+
+    Turning ``mode: on`` enables owner-side **robust aggregation** of shared
+    modules and the reputation/rate-limit gates; ``redundancy_rate > 0`` adds
+    **redundant execution** (sampled tasks re-run and cross-checked, feeding
+    reputation); ``private_policy: proposal`` makes private-module pushes
+    proposals that apply only on agreement. These change training dynamics and
+    must be validated against the deterministic anchor (plan §1.4;
+    ``examples/validate_robustness.py``).
+    """
+
+    mode: str = "off"                  # "off" | "on" (robust aggregation + gates)
+    aggregate: str = "trimmed_mean"    # "trimmed_mean" | "median" | "mean"
+    quorum_target: int = 3             # contributions to buffer before aggregating
+    quorum_timeout: float = 30.0       # flush a partial buffer after this many seconds
+    # Redundant execution.
+    redundancy: int = 3                # replicas per audited task (1 primary + checkers)
+    redundancy_rate: float = 0.0       # fraction of tasks audited (0 = off)
+    audit_timeout: float = 60.0        # resolve an audit after this long if incomplete
+    version_history: int = 1           # owner retained versions (>1 to enable pinned checks)
+    # Reputation + rate limiting.
+    reputation_floor: float = 0.5      # fresh peers start here (Sybil: earn above it)
+    reputation_credit: float = 0.02
+    reputation_debit: float = 0.2
+    reputation_halflife: float = 3600.0
+    min_owner_reputation: float = 0.25  # below this -> demoted from the owner set
+    rate_capacity: float = 8.0          # token bucket size (scaled by reputation)
+    rate_refill_per_sec: float = 2.0
+    # Private modules.
+    private_policy: str = "overwrite"   # "overwrite" | "proposal"
+    private_quorum: int = 2             # agreeing peers needed to apply a private proposal
+
+
+@dataclass
 class RunCfg:
     generations: int = 10
     batch_size: int = 8
@@ -189,12 +225,14 @@ class LaunchConfig:
     sharded: ShardedCfg = field(default_factory=ShardedCfg)
     tracker: TrackerCfg = field(default_factory=TrackerCfg)
     ownership: OwnershipCfg = field(default_factory=OwnershipCfg)
+    robustness: RobustnessCfg = field(default_factory=RobustnessCfg)
     run: RunCfg = field(default_factory=RunCfg)
 
     _SECTIONS = {  # name -> dataclass (class attr, not a field)
         "model": ModelCfg, "diloco": DiLoCoCfg, "data": DataCfg,
         "transport": TransportCfg, "tls": TLSCfg, "sharded": ShardedCfg,
-        "tracker": TrackerCfg, "ownership": OwnershipCfg, "run": RunCfg,
+        "tracker": TrackerCfg, "ownership": OwnershipCfg,
+        "robustness": RobustnessCfg, "run": RunCfg,
     }
 
     @classmethod
