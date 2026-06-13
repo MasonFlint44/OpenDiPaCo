@@ -35,7 +35,8 @@ def test_derive_is_deterministic_across_nodes():
     a = derive_epoch(recs, k=3, salt="run")
     b = derive_epoch(list(reversed(recs)), k=3, salt="run")   # different order
     assert a["owners"] == b["owners"] and a["members_sig"] == b["members_sig"]
-    assert a["epoch"] == 0 and a["bootstrap"] and a.get("deterministic")
+    assert a["epoch"] == 0 and a.get("deterministic")
+    assert not a["bootstrap"]                                 # never bootstrap -> gained keys sync
     assert "sig" not in a and "pub" not in a                  # signer-less
 
 
@@ -110,9 +111,29 @@ def test_owner_imports_directory_and_derives_its_epoch():
         rec = o.derive_and_apply_epoch()
         assert rec is not None and o._epoch is not None
         assert len(o._epoch["owners"]) == 3
-        # It now owns (and serves) the keys HRW places on it, at seeded (0, 0).
+        # It now owns the keys HRW places on it...
         assert o.owned_keys and o.owned_keys <= o._all_keys
-        assert o.owned_keys <= o._active                      # bootstrap epoch -> active
+        # ...but with co-owners present they start SYNCING, not serving: a peer
+        # joining a live cluster must pull current state, never boot-serve (0, 0).
+        assert not o._active
+    finally:
+        o.shutdown()
+
+
+def test_sole_owner_self_activates_without_bootstrap():
+    """A genuine cold start has no peer to sync from, so the sole owner of a key
+    self-activates its seeded (0, 0) — the cold-start path that replaces an
+    explicit bootstrap flag (no joiner can be tricked by it)."""
+    ident = PeerIdentity.generate()
+    rec = _recs([ident])[0]
+    o = _dec_owner(ident, k=1)                                 # k=1 -> sole owner of every key
+    o._self_record = rec
+    try:
+        o.import_directory([rec])
+        o.derive_and_apply_epoch()
+        assert o.owned_keys and not o._active                 # syncing right after derive
+        o._replicate_once()                                   # no replicas -> self-activate
+        assert o.owned_keys <= o._active
     finally:
         o.shutdown()
 

@@ -131,6 +131,15 @@ def derive_epoch(owner_records, *, k: int = DEFAULT_REPLICATION, salt: str = "",
     Returns an **unsigned** record (``deterministic: True``); authority comes
     from every node recomputing it, not from a signature, so a relayed copy is
     only ever a hint to be re-derived and matched.
+
+    **Never** flagged ``bootstrap``: every node that starts derives its first
+    epoch with ``prev=None``, so a ``prev is None -> bootstrap`` rule would make
+    a peer *joining a running cluster* boot-serve its seeded ``(0, 0)`` bank as
+    authoritative for keys the cluster has already trained — serving stale
+    state. Gained keys therefore always **sync**; a genuine cold start (every
+    owner identical at ``(0, 0)``) self-activates through the same equal-version
+    reconciliation a full-cluster restart uses (Phase 2 2d), with no central
+    bootstrap signal to forge or get wrong.
     """
     owners = []
     for r in owner_records:
@@ -143,7 +152,7 @@ def derive_epoch(owner_records, *, k: int = DEFAULT_REPLICATION, salt: str = "",
     epoch_num = 0 if prev is None else int(prev["epoch"]) + 1
     return {
         "kind": "epoch", "epoch": epoch_num, "k": int(k), "salt": salt,
-        "bootstrap": prev is None, "owners": owners, "members_sig": sig,
+        "bootstrap": False, "owners": owners, "members_sig": sig,
         "deterministic": True, "issued_at": time.time(),
     }
 

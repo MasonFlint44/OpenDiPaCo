@@ -69,6 +69,17 @@ that ties them into a converging swarm is the final integration, owed to 0f.
   `issued_at` and raise `TypeError` mid-import, aborting a gossip cycle. Fixed:
   `_issued_at` accepts only real numbers; malformed records are skipped, not
   fatal (`test_decentralized_epochs.py`).
+- *Self-review — a joiner must not bootstrap-serve.* `derive_epoch` set
+  `bootstrap = (prev is None)`, but **every** node derives its first epoch with
+  `prev=None`, so a peer *joining a running cluster* would have boot-served its
+  seeded `(0, 0)` bank as authoritative for already-trained keys. Fixed:
+  decentralized epochs **never** bootstrap — gained keys always sync, and a
+  genuine cold start (all owners identical at `(0, 0)`) self-activates via the
+  Phase 2 2d equal-version reconciliation (each serves its honest `(0, 0)` to
+  the others and activates on the match; the P1 quorum gate only guards
+  *higher*-version adoption, so it doesn't block this). A sole owner still
+  self-activates with no replica to pull from. Tested: a joiner with co-owners
+  stays syncing (not active) after derive; a sole owner self-activates.
 
 > **Strategic note (recorded up front, honestly).** Phase 4 is the *optional
 > endgame* in the plan — *"only worth it if tracker availability actually
