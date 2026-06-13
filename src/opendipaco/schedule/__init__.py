@@ -1,6 +1,9 @@
 from .distributed import CoordinatorServer, run_worker
 from .identity import PeerIdentity, peer_id_of, sign_record, verify_record
+from .aggregate import AGGREGATES, robust_delta
 from .observability import MetricsExporter, MetricsLogger
+from .ratelimit import RateLimiter
+from .reputation import Reputation
 from .ownership import (
     EpochManager,
     make_epoch_record,
@@ -50,6 +53,10 @@ __all__ = [
     "generate_selfsigned_cert",
     "MetricsExporter",
     "MetricsLogger",
+    "robust_delta",
+    "AGGREGATES",
+    "Reputation",
+    "RateLimiter",
     "PeerIdentity",
     "peer_id_of",
     "sign_record",

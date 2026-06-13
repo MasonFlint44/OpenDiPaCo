@@ -159,6 +159,44 @@ def test_run_local_sharded_trains():
     assert not hasattr(scheduler, "bank")  # the scheduler holds no weights
 
 
+def test_robustness_config_parses_and_defaults_off():
+    cfg = LaunchConfig.from_dict(_tiny_dict())
+    assert cfg.robustness.mode == "off"          # default: no behavior change
+    assert cfg.robustness.private_policy == "overwrite"
+    cfg2 = LaunchConfig.from_dict({**_tiny_dict(), "robustness": {
+        "mode": "on", "aggregate": "median", "redundancy_rate": 0.2,
+        "private_policy": "proposal"}})
+    assert cfg2.robustness.mode == "on" and cfg2.robustness.aggregate == "median"
+    assert cfg2.robustness.redundancy_rate == 0.2
+
+
+def test_proposal_policy_rejects_guaranteed_stall_config():
+    import pytest
+    # redundancy < 2: no checker can corroborate -> private modules would freeze.
+    with pytest.raises(ValueError):
+        LaunchConfig.from_dict({**_tiny_dict(), "robustness": {
+            "private_policy": "proposal", "redundancy": 1}})
+    # quorum above the replica count: a proposal could never reach quorum.
+    with pytest.raises(ValueError):
+        LaunchConfig.from_dict({**_tiny_dict(), "robustness": {
+            "private_policy": "proposal", "redundancy": 2, "private_quorum": 3}})
+    # A sane proposal config is accepted.
+    cfg = LaunchConfig.from_dict({**_tiny_dict(), "robustness": {
+        "private_policy": "proposal", "redundancy": 3, "private_quorum": 2}})
+    assert cfg.robustness.private_policy == "proposal"
+
+
+def test_run_local_sharded_with_robustness_on():
+    """`opendipaco run` (sharded) with robustness on: owner-side robust
+    aggregation + reputation gates engaged, run still reaches its budget."""
+    d = _tiny_dict("sharded")
+    d["robustness"] = {"mode": "on", "quorum_target": 2, "quorum_timeout": 0.5}
+    cfg = LaunchConfig.from_dict(d)
+    scheduler, completed = run_local(cfg)
+    assert sum(completed.values()) >= _target(cfg)
+    assert scheduler.reputation is not None       # the gate substrate is live
+
+
 def test_advertise_host_defaults_to_bind_host():
     """A rendezvous owner's tracker record must advertise a dialable address:
     explicit ownership.advertise_host, else transport.connect_host, else the

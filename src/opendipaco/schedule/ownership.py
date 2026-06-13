@@ -164,9 +164,14 @@ class EpochManager:
     (and choosing the bootstrap flag) stays with the scheduler.
     """
 
-    def __init__(self, *, owner_grace: float = 240.0, min_epoch_interval: float = 60.0):
+    def __init__(self, *, owner_grace: float = 240.0, min_epoch_interval: float = 60.0,
+                 is_eligible=None):
         self.owner_grace = owner_grace
         self.min_epoch_interval = min_epoch_interval
+        # Optional reputation gate layered on owner_eligible: ``is_eligible(peer_id)``
+        # excludes demoted peers from the owner set (Phase 3b). The reputation
+        # floor sits above the threshold, so a fresh honest peer still qualifies.
+        self.is_eligible = is_eligible
         self._seen: dict[str, tuple[float, dict]] = {}  # peer_id -> (last seen, record)
         self._current: set | None = None                # (peer_id, addr) signature
         self._last_bump: float | None = None
@@ -175,7 +180,7 @@ class EpochManager:
         """One directory snapshot in; the next epoch's owner records out (or None)."""
         now = time.monotonic() if now is None else now
         for r in records:
-            if owner_eligible(r):
+            if owner_eligible(r) and (self.is_eligible is None or self.is_eligible(r["peer_id"])):
                 self._seen[r["peer_id"]] = (now, r)
         expired = [p for p, (t, _) in self._seen.items() if now - t >= self.owner_grace]
         for p in expired:

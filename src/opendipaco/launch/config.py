@@ -163,6 +163,66 @@ class OwnershipCfg:
 
 
 @dataclass
+class RobustnessCfg:
+    """Byzantine-robustness (Phase 3; ``docs/phase3-design.md``). All off by
+    default — ``mode: off`` keeps the run bit-identical to Phase 2.
+
+    Turning ``mode: on`` enables owner-side **robust aggregation** of shared
+    modules and the reputation/rate-limit gates; ``redundancy_rate > 0`` adds
+    **redundant execution** (sampled tasks re-run and cross-checked, feeding
+    reputation); ``private_policy: proposal`` makes private-module pushes
+    proposals that apply only on agreement. These change training dynamics and
+    must be validated against the deterministic anchor (plan §1.4;
+    ``examples/validate_robustness.py``).
+
+    **Liveness requirement for** ``private_policy: proposal``: a private module
+    advances only when ``private_quorum`` scheduler-assigned checkers
+    corroborate it, and checkers come from *surplus* workers. So it needs
+    **worker oversupply** (more workers than paths) **and**
+    ``private_quorum <= redundancy``; otherwise private modules (embedding/head)
+    silently *stall* — the run still completes (commits advance the clock), but
+    those modules never train. Use ``proposal`` only with surplus workers, or
+    keep ``private_policy: overwrite`` (the default).
+    """
+
+    mode: str = "off"                  # "off" | "on" (robust aggregation + gates)
+    aggregate: str = "trimmed_mean"    # "trimmed_mean" | "median" | "mean"
+    quorum_target: int = 3             # contributions to buffer before aggregating
+    quorum_timeout: float = 30.0       # flush a partial buffer after this many seconds
+    # Redundant execution.
+    redundancy: int = 3                # replicas per audited task (1 primary + checkers)
+    redundancy_rate: float = 0.0       # fraction of tasks audited (0 = off)
+    audit_timeout: float = 60.0        # resolve an audit after this long if incomplete
+    version_history: int = 1           # owner retained versions (>1 to enable pinned checks)
+    # Reputation + rate limiting.
+    reputation_floor: float = 0.5      # fresh peers start here (Sybil: earn above it)
+    reputation_credit: float = 0.02
+    reputation_debit: float = 0.2
+    reputation_halflife: float = 3600.0
+    min_owner_reputation: float = 0.25  # below this -> demoted from the owner set
+    rate_capacity: float = 8.0          # token bucket size (scaled by reputation)
+    rate_refill_per_sec: float = 2.0
+    # Private modules.
+    private_policy: str = "overwrite"   # "overwrite" | "proposal"
+    private_quorum: int = 2             # agreeing peers needed to apply a private proposal
+
+    def __post_init__(self):
+        # Catch the *guaranteed*-stall private-policy misconfigurations at load
+        # time (a private module could never reach quorum), rather than letting
+        # embedding/head silently freeze at runtime. The oversupply requirement
+        # is runtime-only and stays documented on the class.
+        if self.private_policy == "proposal":
+            if self.redundancy < 2:
+                raise ValueError(
+                    "private_policy: proposal needs redundancy >= 2 (a primary + "
+                    "at least one checker to corroborate); else private modules stall")
+            if self.private_quorum > self.redundancy:
+                raise ValueError(
+                    f"private_quorum ({self.private_quorum}) > redundancy "
+                    f"({self.redundancy}): a private proposal could never reach quorum")
+
+
+@dataclass
 class RunCfg:
     generations: int = 10
     batch_size: int = 8
@@ -189,12 +249,14 @@ class LaunchConfig:
     sharded: ShardedCfg = field(default_factory=ShardedCfg)
     tracker: TrackerCfg = field(default_factory=TrackerCfg)
     ownership: OwnershipCfg = field(default_factory=OwnershipCfg)
+    robustness: RobustnessCfg = field(default_factory=RobustnessCfg)
     run: RunCfg = field(default_factory=RunCfg)
 
     _SECTIONS = {  # name -> dataclass (class attr, not a field)
         "model": ModelCfg, "diloco": DiLoCoCfg, "data": DataCfg,
         "transport": TransportCfg, "tls": TLSCfg, "sharded": ShardedCfg,
-        "tracker": TrackerCfg, "ownership": OwnershipCfg, "run": RunCfg,
+        "tracker": TrackerCfg, "ownership": OwnershipCfg,
+        "robustness": RobustnessCfg, "run": RunCfg,
     }
 
     @classmethod

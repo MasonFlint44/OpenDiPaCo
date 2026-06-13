@@ -309,7 +309,11 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
   removes the central egress wall (§1.8) for the data plane. The tracker's
   remaining traffic is control-plane-tiny.
 
-### Phase 3 — Byzantine-robust aggregation (the trust wall, §1.1)
+### Phase 3 — Byzantine-robust aggregation (the trust wall, §1.1) · ✅ done
+
+> Design, the four operator decisions, and the amendments found while building
+> (async base-drift → version-pinned redundancy, owner-local private quorum):
+> [phase3-design.md](phase3-design.md).
 
 - **Quorum aggregation at owners**: an owner buffers contributions per module
   until a small quorum c (e.g. 3) arrives, then applies a **robust aggregate**
@@ -366,7 +370,7 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
 | 0f | WAN validation run of the async path | 1.4 | M (mostly wall-clock) |
 | ~~1~~ ✅ | ~~Peer identity + tracker + reachability tiers~~ | **Done** — 1.13, 1.8 (prereq); per-frame envelopes + autonomous gossip deferred to Phase 2 | M |
 | ~~2~~ ✅ | ~~Replicated module owners, dynamic ownership, signed manifests~~ | **Done** — 1.8 (HRW placement, signed epochs, Ed25519 grants, version pairs, pull replication, tracker-driven failover + promotion, per-key checkpoints + recovery manifest, `ownership: rendezvous` launch mode; design + amendments in [phase2-design.md](phase2-design.md)) | L |
-| 3 | Robust aggregation, redundancy, reputation, private-module policy | 1.1, 1.9, 1.14 | L |
+| ~~3~~ ✅ | ~~Robust aggregation, redundancy, reputation, private-module policy~~ | **Done** — 1.1 (owner-side robust aggregation, version-pinned redundant execution, reputation-gated influence, private proposal-gating), 1.9 (oversupply absorbed as redundant checks), 1.14 (per-peer rate limiting); `robustness: off` default; design + amendments in [phase3-design.md](phase3-design.md). Adversarial-dynamics harness `examples/validate_robustness.py`; the §1.4 *convergence* verdict rides the 0f WAN run | L |
 | 4 | Decentralized scheduling (optional) | residual SPOF | L |
 
 **Bottom line:** Phase 0 is the highest leverage-per-effort and is required no matter

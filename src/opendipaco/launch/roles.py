@@ -32,6 +32,8 @@ from ..schedule import (
     CoordinatorServer,
     ParameterServer,
     PeerIdentity,
+    RateLimiter,
+    Reputation,
     Scheduler,
     Tracker,
     assign_shards,
@@ -75,6 +77,34 @@ def _server_kw(cfg: LaunchConfig, extra_admitted=None) -> dict:
     if cfg.transport.max_msg_bytes is not None:
         kw["max_msg_bytes"] = cfg.transport.max_msg_bytes
     return kw
+
+
+def _scheduler_robustness_kw(cfg: LaunchConfig) -> dict:
+    """Phase 3 knobs the scheduler owns: reputation, rate limiting, redundant
+    execution, and the private-module policy."""
+    r = cfg.robustness
+    return dict(
+        reputation=Reputation(floor=r.reputation_floor, credit=r.reputation_credit,
+                              debit=r.reputation_debit, decay_halflife=r.reputation_halflife),
+        rate_limiter=RateLimiter(capacity=r.rate_capacity,
+                                 refill_per_sec=r.rate_refill_per_sec),
+        min_owner_reputation=r.min_owner_reputation,
+        redundancy=r.redundancy, redundancy_rate=r.redundancy_rate,
+        audit_timeout=r.audit_timeout, private_policy=r.private_policy)
+
+
+def _ps_robustness_kw(cfg: LaunchConfig) -> dict:
+    """Phase 3 knobs the owner/parameter-server owns: robust aggregation,
+    version history (for pinned redundant checks), and the private policy."""
+    r = cfg.robustness
+    # Pinned redundant checks need retained versions; default a small history
+    # when redundancy is on and the operator hasn't set one.
+    history = r.version_history
+    if history <= 1 and r.redundancy_rate > 0:
+        history = 4
+    return dict(robustness=r.mode, aggregate=r.aggregate, quorum_target=r.quorum_target,
+                quorum_timeout=r.quorum_timeout, version_history=history,
+                private_policy=r.private_policy, private_quorum=r.private_quorum)
 
 
 def _advertise_host(cfg: LaunchConfig) -> str:
@@ -252,7 +282,8 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None, identity=N
         heartbeat_timeout=cfg.transport.heartbeat_timeout,
         ps_tls=build_tls_client(cfg), grant_key=cfg.transport.grant_key,
         identity=ident, compress=cfg.transport.compress,
-        idle_backoff=cfg.transport.idle_backoff, **_server_kw(cfg, extra_admitted))
+        idle_backoff=cfg.transport.idle_backoff,
+        **_scheduler_robustness_kw(cfg), **_server_kw(cfg, extra_admitted))
     scheduler.start()
     _attach_metrics(scheduler, cfg)
     if rendezvous:
@@ -304,7 +335,7 @@ def run_parameter_server(cfg: LaunchConfig, shard_id: int = 0, *, port=None,
         host=cfg.transport.host, device=cfg.run.device,
         grant_key=cfg.transport.grant_key,
         max_update_norm=cfg.transport.max_update_norm, compress=cfg.transport.compress,
-        resume_dir=resume_dir)
+        resume_dir=resume_dir, **_ps_robustness_kw(cfg))
     if own.mode == "rendezvous":
         ident = _node_identity(cfg, identity, generate=True)
         ps = ParameterServer(
