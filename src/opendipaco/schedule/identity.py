@@ -112,6 +112,12 @@ class PeerIdentity:
         sig = self._key.sign(AUTH_CONTEXT + nonce)
         return {"pub": self.public_key_hex, "sig": sig.hex()}
 
+    def private_bytes_raw(self) -> bytes:
+        """The raw 32-byte Ed25519 seed. Used to derive a libp2p host key from
+        the *same* identity (W1/D4), so a peer's app-layer id and its libp2p id
+        both descend from one keypair. Sensitive — never serialize over the wire."""
+        return self._key.private_bytes_raw()
+
     # -- record signing ---------------------------------------------------------
     def sign(self, data: bytes) -> bytes:
         return self._key.sign(data)
