@@ -66,7 +66,7 @@ from .guard import all_finite, clip_norm_, loss_ok
 from .ratelimit import RateLimiter
 from .reputation import Reputation
 from .assignment import coordinator_key, is_assignee, path_primary, version_lag
-from .quorum import confirm_version, divergent_peers, read_quorum_versions
+from .quorum import confirm_version, divergent_peers, read_quorum_versions, valid_report
 from .identity import peer_id_of, sign_record, verify_record
 from .ownership import (
     EpochManager,
@@ -184,6 +184,18 @@ def _version_pair(v) -> tuple:
     """Coerce a stored version to the (epoch, counter) pair form (Phase 2b);
     pre-pair checkpoints stored bare ints, which were all epoch-0."""
     return tuple(v) if isinstance(v, (tuple, list)) else (0, int(v))
+
+
+def _safe_version(v):
+    """A *wire* version coerced to an (epoch, counter) pair, or None if
+    malformed. Decentralized sources may be Byzantine (Phase 4), so a bad
+    version in a fetch reply must be ignored — not crash the replication pass
+    (which would skip gossip/audit too). Well-formed pairs are unchanged, so the
+    central/rendezvous path behaves exactly as before."""
+    if (isinstance(v, (list, tuple)) and len(v) == 2
+            and all(isinstance(x, int) and not isinstance(x, bool) for x in v)):
+        return (int(v[0]), int(v[1]))
+    return None
 
 
 # -- parameter server --------------------------------------------------------
@@ -820,9 +832,8 @@ class ParameterServer(_ReactorServer):
                     if k not in self.bank:  # trimmed by a concurrent apply_epoch
                         pending.pop(k, None)
                         continue
-                    v = answers.get(k)
+                    v = _safe_version(answers.get(k))  # ignore a Byzantine source's malformed version
                     if v is not None:
-                        v = tuple(v)
                         if v > self._versions[k]:
                             sd = (reply.get("weights") or {}).get(k)
                             # Decentralized: adopt only quorum-confirmed bytes
@@ -1076,8 +1087,9 @@ class ParameterServer(_ReactorServer):
             except (OSError, ConnectionError):
                 reply = None
             for k, vd in ((reply or {}).get("digests") or {}).items():
-                if k in reports and vd:
-                    reports[k][pid] = (tuple(vd[0]), vd[1])
+                r = valid_report(vd)  # drop a Byzantine co-owner's malformed report
+                if k in reports and r is not None:
+                    reports[k][pid] = r
         return self._apply_digest_audit(reports)
 
     # -- directory gossip + deterministic epochs (Phase 4 D6/D7) ---------------

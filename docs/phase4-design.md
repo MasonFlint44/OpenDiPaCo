@@ -80,6 +80,18 @@ that ties them into a converging swarm is the final integration, owed to 0f.
   *higher*-version adoption, so it doesn't block this). A sole owner still
   self-activates with no replica to pull from. Tested: a joiner with co-owners
   stays syncing (not active) after derive; a sole owner self-activates.
+- *Self-review — Byzantine wire data must not wedge the replication cycle.*
+  Phase 4's threat model has owners returning *arbitrary* data, but the digest /
+  fetch reply parsing assumed well-formed versions; a malformed one (e.g. a
+  non-numeric version) raised inside `confirm_version` / `_replicate_once`, and
+  the replication loop's broad `except` then skipped the **whole**
+  replicate+gossip+audit cycle — a peer doing it every cycle would permanently
+  wedge an honest owner. Fixed: `quorum.valid_report` and `_safe_version`
+  validate every ingested `(version, digest)` / wire version and **drop**
+  malformed ones instead of raising (well-formed pairs are unchanged, so the
+  central/rendezvous path is untouched). Tested: a Byzantine source's garbage
+  digest/fetch replies are ignored — the tally still confirms the honest pair
+  and nothing is adopted, no exception.
 
 > **Strategic note (recorded up front, honestly).** Phase 4 is the *optional
 > endgame* in the plan — *"only worth it if tracker availability actually

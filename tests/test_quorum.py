@@ -70,6 +70,29 @@ def test_divergent_peers_flags_only_same_version_contradiction():
     assert divergent_peers(reports, None) == set()
 
 
+def test_valid_report_rejects_byzantine_shapes():
+    from opendipaco.schedule.quorum import valid_report
+    assert valid_report([[0, 5], "d"]) == ((0, 5), "d")
+    assert valid_report(((1, 2), "d")) == ((1, 2), "d")
+    for bad in (["evil", "d"], [[0], "d"], [[0, 1, 2], "d"], [[0, 1], 9],
+                [[0, "x"], "d"], "nope", None, [], [[True, 1], "d"]):
+        assert valid_report(bad) is None
+
+
+def test_read_quorum_versions_drops_malformed_entries():
+    """A Byzantine replica returning garbage versions must not crash the tally
+    (it would otherwise wedge the honest owner's whole replication cycle)."""
+    def rpc(addr, msg):
+        if addr == ("h", 1):
+            return {"digests": {"A": [[0, 3], "da"]}}
+        if addr == ("h", 2):
+            return {"digests": {"A": [[0, 3], "da"]}}
+        return {"digests": {"A": ["EVIL", {"not": "a digest"}]}}   # malformed
+
+    out = read_quorum_versions([("h", 1), ("h", 2), ("h", 3)], ["A"], 2, rpc)
+    assert out["A"] == ((0, 3), "da")            # honest pair confirmed, garbage ignored
+
+
 def test_read_quorum_versions_skips_unreachable_and_confirms():
     digests = {
         ("h", 1): {"A": [[0, 3], "da"], "B": [[0, 2], "db"]},
@@ -213,6 +236,32 @@ def test_replication_adopts_a_quorum_confirmed_version(monkeypatch):
         o._replicate_once()
         assert o._versions[k] == (0, 1)          # confirmed -> adopted
         assert state_digest(o.bank[k].state_dict()) == new_dig
+    finally:
+        for w in owners:
+            w.shutdown()
+
+
+def test_replication_survives_a_byzantine_malformed_fetch(monkeypatch):
+    """A Byzantine source returning a malformed version in a fetch/digest reply
+    must not raise (which the loop's broad except would turn into a permanently
+    skipped replicate+gossip+audit cycle); it's ignored, nothing adopted."""
+    owners, epoch = _owners()
+    o = owners[0]
+    try:
+        k = _backup_key(o, epoch)
+        before = o._versions[k]
+
+        def stub(addr, msg):
+            if msg["type"] == "digest":
+                return {"digests": {k: ["EVIL", 123]}}        # garbage shape
+            if msg["type"] == "fetch":
+                return {"versions": {k: "not-a-version"}, "weights": {k: {}}}
+            return {}
+
+        monkeypatch.setattr(o, "_peer_rpc", stub)
+        o._replicate_once()                                   # must not raise
+        o._audit_digests_once()                               # must not raise
+        assert o._versions[k] == before                       # nothing adopted from garbage
     finally:
         for w in owners:
             w.shutdown()

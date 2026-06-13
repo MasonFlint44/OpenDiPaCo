@@ -26,6 +26,27 @@ def _pair(v) -> tuple:
     return tuple(v) if isinstance(v, (tuple, list)) else (0, int(v))
 
 
+def valid_report(vd):
+    """A peer's ``[version, digest]`` reply entry, validated to
+    ``((epoch, counter), digest)`` or ``None``.
+
+    Byzantine owners (Phase 4's threat model) can return arbitrary wire data;
+    a non-numeric version or non-string digest would otherwise crash the tally
+    and — via the replication loop's broad ``except`` — wedge the honest owner's
+    whole replicate/gossip/audit cycle. So every ingested report passes through
+    here and malformed ones are dropped, not raised."""
+    try:
+        ver, dig = vd[0], vd[1]
+    except (TypeError, IndexError, KeyError):
+        return None
+    if not isinstance(dig, str):
+        return None
+    if not (isinstance(ver, (list, tuple)) and len(ver) == 2
+            and all(isinstance(x, int) and not isinstance(x, bool) for x in ver)):
+        return None
+    return ((int(ver[0]), int(ver[1])), dig)
+
+
 def confirm_version(reports, quorum: int):
     """The ``(version, digest)`` at the **highest version** that at least
     ``quorum`` of ``reports`` agree on, or ``None`` if none reaches quorum.
@@ -85,8 +106,9 @@ def read_quorum_versions(addrs, keys, quorum: int, rpc) -> dict:
         except (OSError, ConnectionError):
             continue
         for k, vd in ((reply or {}).get("digests") or {}).items():
-            if k in per_key and vd:
-                per_key[k].append((vd[0], vd[1]))
+            r = valid_report(vd)
+            if k in per_key and r is not None:
+                per_key[k].append(r)
     out = {}
     for k, reports in per_key.items():
         c = confirm_version(reports, quorum)
