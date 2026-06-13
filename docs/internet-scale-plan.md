@@ -7,9 +7,20 @@ transition from today's hub-and-spoke transport to a **peer-to-peer topology**.
 
 The one-line summary: **the distributed-systems machinery is the right shape, but it
 assumes every participant is honest and well-connected — the opposite of the target
-environment. Trust and bandwidth are the two walls; neither is addressed anywhere in
-the codebase yet. Nothing needs to be thrown away: the engine, wire format, reactor,
-and scheduler skeleton all evolve into the P2P design rather than being replaced.**
+environment. Trust and bandwidth are the two walls. Nothing needs to be thrown away:
+the engine, wire format, reactor, and scheduler skeleton all evolve into the P2P
+design rather than being replaced.**
+
+> **Status (2026-06):** Phases 0–4 below have **landed** (Phase 4 at the
+> control-plane level — see [phase4-design.md](phase4-design.md)). The two walls
+> are addressed *in principle*: bandwidth/SPOF by Phases 1–2, trust by Phase 3,
+> and the central scheduler itself by Phase 4. But **"architecturally complete"
+> is not "viable on consumer hardware over consumer links."** The remaining work
+> to actually meet the goal — a WAN convergence verdict, NAT traversal, real
+> bandwidth reduction, consumer-VRAM fit, churn survival, a volunteer client, and
+> the open trust/incentive questions — is tracked in
+> [viability-roadmap.md](viability-roadmap.md). Read this doc for *how we got
+> through the P2P transition*; read that one for *what's left to be viable*.
 
 Severity tags are relative to *this* goal (they differ from `remaining-gaps.md`):
 - **P0** — blocks volunteer-internet training outright
@@ -399,6 +410,14 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
 | ~~4~~ ◑ | ~~Decentralized scheduling (control plane)~~ | **Control plane done** — residual SPOF (§1.8): leaderless HRW assignment, version-vector clock, owner-minted grants, Byzantine-owner quorum reads + cross-owner digest agreement + eviction, deterministic gossip-derived epochs, `schedule: decentralized` wiring; design + amendments in [phase4-design.md](phase4-design.md). The decentralized **worker loop** + its convergence ride 0f (like Phase 3); `examples/validate_decentralized.py` validates the read-side primitive | L |
 
 **Bottom line:** Phase 0 is the highest leverage-per-effort and is required no matter
-what; Phases 1–2 remove the bandwidth/SPOF wall; Phase 3 removes the trust wall.
-Validate training dynamics (§1.4) before and during each phase that changes them —
-the synchronous engine remains the deterministic anchor throughout.
+what; Phases 1–2 remove the bandwidth/SPOF wall; Phase 3 removes the trust wall;
+Phase 4 removes the central scheduler (control-plane). Validate training dynamics
+(§1.4) before and during each phase that changes them — the synchronous engine
+remains the deterministic anchor throughout.
+
+These phases got the project through the **P2P transition**. The work that remains
+to make it *viable* on volunteer consumer hardware over consumer links — the §0f
+dynamics verdict + decentralized worker loop, NAT traversal, real bandwidth
+reduction, consumer-VRAM fit, churn survival, a volunteer client, finishing the
+data plane, and the open trust/incentive questions — is laid out in
+[viability-roadmap.md](viability-roadmap.md).
