@@ -174,6 +174,15 @@ class RobustnessCfg:
     proposals that apply only on agreement. These change training dynamics and
     must be validated against the deterministic anchor (plan §1.4;
     ``examples/validate_robustness.py``).
+
+    **Liveness requirement for** ``private_policy: proposal``: a private module
+    advances only when ``private_quorum`` scheduler-assigned checkers
+    corroborate it, and checkers come from *surplus* workers. So it needs
+    **worker oversupply** (more workers than paths) **and**
+    ``private_quorum <= redundancy``; otherwise private modules (embedding/head)
+    silently *stall* — the run still completes (commits advance the clock), but
+    those modules never train. Use ``proposal`` only with surplus workers, or
+    keep ``private_policy: overwrite`` (the default).
     """
 
     mode: str = "off"                  # "off" | "on" (robust aggregation + gates)
@@ -196,6 +205,21 @@ class RobustnessCfg:
     # Private modules.
     private_policy: str = "overwrite"   # "overwrite" | "proposal"
     private_quorum: int = 2             # agreeing peers needed to apply a private proposal
+
+    def __post_init__(self):
+        # Catch the *guaranteed*-stall private-policy misconfigurations at load
+        # time (a private module could never reach quorum), rather than letting
+        # embedding/head silently freeze at runtime. The oversupply requirement
+        # is runtime-only and stays documented on the class.
+        if self.private_policy == "proposal":
+            if self.redundancy < 2:
+                raise ValueError(
+                    "private_policy: proposal needs redundancy >= 2 (a primary + "
+                    "at least one checker to corroborate); else private modules stall")
+            if self.private_quorum > self.redundancy:
+                raise ValueError(
+                    f"private_quorum ({self.private_quorum}) > redundancy "
+                    f"({self.redundancy}): a private proposal could never reach quorum")
 
 
 @dataclass

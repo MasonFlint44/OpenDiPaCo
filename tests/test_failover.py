@@ -115,7 +115,14 @@ def test_owner_polls_scheduler_for_epochs():
         assert r1["bootstrap"] is False        # only the first epoch bootstraps
         ps._poll_epoch()
         assert ps._epoch_num == 1
-        assert ps.owned_keys < set(cfg.build_topology().module_keys())  # split now
+        # Re-derived from the new epoch's HRW placement (not "all keys" as under
+        # the sole-owner epoch 0). Compare against an independent HRW computation
+        # rather than assuming a particular split -- with k=1 over two owners,
+        # HRW *could* place every key on one of them.
+        all_keys = set(cfg.build_topology().module_keys())
+        expected = {k for k in all_keys
+                    if owners_for(k, r1)[0]["peer_id"] == own_id.peer_id}
+        assert ps.owned_keys == expected
         ps._poll_epoch()                       # idempotent on the same record
         assert ps._epoch_num == 1
     finally:
@@ -136,42 +143,48 @@ def test_zombie_fenced_and_lame_duck_lifecycle():
            for i in (ida, idb)]
     a, b = pss
     recs = [_owner_record(ida, a.port), _owner_record(idb, b.port)]
+    rec_by_id = {ida.peer_id: recs[0], idb.peer_id: recs[1]}
     epoch0 = make_epoch_record(sched_id, epoch=0, owner_records=recs, k=1, bootstrap=True)
     for ps in pss:
         ps.apply_epoch(epoch0)
         ps.start()
     try:
-        # k=1: each key has a single owner. Train one of A's keys.
-        key = next(k for k in sorted(a.owned_keys) if not is_private_key(k))
+        # k=1: each key has a single owner. Pick a shared key and derive its
+        # owner from HRW (don't assume which identity won it -- the placement is
+        # over random peer ids). ``old`` is the epoch-0 owner, ``new`` the other.
         path = cfg.build_topology().path_from_index(0)
-        grad = [torch.ones_like(p) for p in a.bank[key].parameters()]
-        assert a._push({"grant": make_grant(path, [key], 1.0, "t0"),
-                        "updates": {key: {"grad": grad}}})["applied"] is True
-        trained = {n: p.detach().clone() for n, p in a.bank[key].named_parameters()}
+        key = next(k for k in cfg.build_topology().path_module_keys(path)
+                   if not is_private_key(k))
+        old = next(ps for ps in pss if ps.peer_id == owners_for(key, epoch0)[0]["peer_id"])
+        new = next(ps for ps in pss if ps is not old)
+        only_new = [rec_by_id[new.peer_id]]
+        grad = [torch.ones_like(p) for p in old.bank[key].parameters()]
+        assert old._push({"grant": make_grant(path, [key], 1.0, "t0"),
+                          "updates": {key: {"grad": grad}}})["applied"] is True
+        trained = {n: p.detach().clone() for n, p in old.bank[key].named_parameters()}
 
-        # Epoch 1 hands everything to B. A fences writes but still serves reads.
-        epoch1 = make_epoch_record(sched_id, epoch=1, owner_records=recs[1:], k=1)
+        # Epoch 1 hands the key to ``new``. ``old`` fences writes but serves reads.
+        epoch1 = make_epoch_record(sched_id, epoch=1, owner_records=only_new, k=1)
         for ps in pss:
             ps.apply_epoch(epoch1)
-        r = a._push({"grant": make_grant(path, [key], 1.0, "t1"),
-                     "updates": {key: {"grad": grad}}})
+        r = old._push({"grant": make_grant(path, [key], 1.0, "t1"),
+                       "updates": {key: {"grad": grad}}})
         assert r["applied"] is False and r["reason"] == "not_primary" and r["epoch"] == 1
-        assert key in a._fetch({"type": "fetch", "keys": [key], "have": {}})["weights"]
+        assert key in old._fetch({"type": "fetch", "keys": [key], "have": {}})["weights"]
 
-        # B gained the key syncing; its pull sources include last epoch's owner
-        # (the lame duck A) -- that is where the trained bytes actually live.
-        assert key in b.owned_keys and key not in b._active
-        b.admit_peer(ida), a.admit_peer(idb)
-        assert b._replicate_once()[key] == "active"
-        got = dict(b.bank[key].named_parameters())
+        # ``new`` gained the key syncing; its pull sources include last epoch's
+        # owner (the lame duck ``old``) -- where the trained bytes actually live.
+        assert key in new.owned_keys and key not in new._active
+        assert new._replicate_once()[key] == "active"
+        got = dict(new.bank[key].named_parameters())
         assert all(torch.equal(trained[n], got[n]) for n in trained)
-        assert b._versions[key] == a._versions[key]
+        assert new._versions[key] == old._versions[key]
 
-        # The epoch after that, A finally drops the lame duck.
-        epoch2 = make_epoch_record(sched_id, epoch=2, owner_records=recs[1:], k=1)
-        a.apply_epoch(epoch2)
-        assert key not in a.bank
-        assert key in a._fetch({"type": "fetch", "keys": [key], "have": {}})["missing"]
+        # The epoch after that, ``old`` finally drops the lame duck.
+        epoch2 = make_epoch_record(sched_id, epoch=2, owner_records=only_new, k=1)
+        old.apply_epoch(epoch2)
+        assert key not in old.bank
+        assert key in old._fetch({"type": "fetch", "keys": [key], "have": {}})["missing"]
     finally:
         for ps in pss:
             ps.shutdown()
@@ -195,6 +208,7 @@ def test_stale_routing_push_retried_to_new_primary():
     recs = [make_peer_record(i, reachability="public",
                              addr=("127.0.0.1", ps.port), roles=("owner",))
             for i, ps in zip((ida, idb), pss)]
+    rec_by_id = {ida.peer_id: recs[0], idb.peer_id: recs[1]}
     sched = Scheduler(cfg, _corpus(cfg), [], _diloco(), batch_size=BATCH,
                       host="127.0.0.1", port=0, identity=sched_id, auth_key="t")
     socks: dict = {}
@@ -215,47 +229,50 @@ def test_stale_routing_push_retried_to_new_primary():
             ps.apply_epoch(epoch0)
             ps.start()
         path = cfg.build_topology().path_from_index(0)
+        # Derive the key's owner from HRW rather than assuming an identity won it.
         key = next(k for k in cfg.build_topology().path_module_keys(path)
-                   if not is_private_key(k) and k in a.owned_keys)  # primary: A
-        stale = {key: [("127.0.0.1", a.port)]}
-        grads = [torch.ones_like(p) for p in a.bank[key].parameters()]
+                   if not is_private_key(k))
+        old = next(ps for ps in pss if ps.peer_id == owners_for(key, epoch0)[0]["peer_id"])
+        new = next(ps for ps in pss if ps is not old)
+        stale = {key: [("127.0.0.1", old.port)]}
+        grads = [torch.ones_like(p) for p in old.bank[key].parameters()]
 
-        # The epoch moves the key to B; B syncs it from the lame duck A.
-        epoch1 = sched.publish_epoch(recs[1:], k=1)
+        # The epoch moves the key to ``new``; it syncs from the lame duck ``old``.
+        epoch1 = sched.publish_epoch([rec_by_id[new.peer_id]], k=1)
         for ps in pss:
             ps.apply_epoch(epoch1)
         # Retry the pull: a single connect can exceed its timeout under heavy
         # CPU contention (replication is eventually-consistent, so this is sound).
         deadline = time.monotonic() + 10
-        while b._replicate_once().get(key) != "active" and time.monotonic() < deadline:
+        while new._replicate_once().get(key) != "active" and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert key in b._active
+        assert key in new._active
 
-        # Stale push -> A refuses as not_primary -> retry against fresh routing.
+        # Stale push -> old refuses as not_primary -> retry against fresh routing.
         grant = make_grant(path, [key], 1.0, "tok-retry-1")
         failed = _push_group(stale, grant, {key: grads}, {}, ps_sock, drop_conn,
                              DEFAULT_MAX_MSG_BYTES)
         assert failed == {key}
-        assert b._versions[key][1] == 0          # nothing landed yet
+        assert new._versions[key][1] == 0        # nothing landed yet
         fresh = sched._handle({"type": "routing", "path": list(path)}, 0)
         assert fresh["epoch"] == 1
         retry = {k: [tuple(x) for x in v] for k, v in fresh["routing"].items() if k in failed}
-        assert retry[key][0] == ("127.0.0.1", b.port)
+        assert retry[key][0] == ("127.0.0.1", new.port)
         assert _push_group(retry, grant, {key: grads}, {}, ps_sock, drop_conn,
                            DEFAULT_MAX_MSG_BYTES) == set()
-        assert b._versions[key] == (1, 1)        # landed on the promoted primary
+        assert new._versions[key] == (1, 1)      # landed on the promoted primary
 
         # Dead-primary flavor: the old primary is gone entirely; the push
         # fails on connect, and the same retry path lands the update.
-        a.shutdown()
-        drop_conn(("127.0.0.1", a.port))
+        old.shutdown()
+        drop_conn(("127.0.0.1", old.port))
         grant2 = make_grant(path, [key], 1.0, "tok-retry-2")
         failed = _push_group(stale, grant2, {key: grads}, {}, ps_sock, drop_conn,
                              DEFAULT_MAX_MSG_BYTES)
         assert failed == {key}
         assert _push_group(retry, grant2, {key: grads}, {}, ps_sock, drop_conn,
                            DEFAULT_MAX_MSG_BYTES) == set()
-        assert b._versions[key] == (1, 2)
+        assert new._versions[key] == (1, 2)
     finally:
         sched.shutdown()
         for ps in pss:

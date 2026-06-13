@@ -23,9 +23,23 @@ options and the chosen path; §5 records the four operator calls.
   a proposal never gets a second corroborator, so the module would freeze;
   the scheduler forces an audit (and a cold, reproducible primary) for any
   path with private modules when ``private_policy: proposal``.
-- *Proposal mode needs identities.* Quorum counts distinct ``peer_id``s, so an
-  HMAC/anonymous deployment (no per-peer identity) can't corroborate — proposal
-  mode is for open-enrollment runs; a trusted HMAC cluster uses ``overwrite``.
+- *Proposal mode is bound to scheduler-issued grants* (hardened post-review):
+  the quorum counts distinct scheduler **grant tokens** (the primary's commit
+  grant + checkers' single-use check grants), not bare peer ids — two
+  colluding/Sybil peers can't fabricate agreement on garbage they were never
+  assigned to recompute. This also lets it work under HMAC (grant-verified),
+  not only identity auth.
+- *Liveness requirement (known operational gap).* A private module advances
+  only when ``private_quorum`` assigned checkers corroborate, and checkers come
+  from *surplus* workers — so proposal mode needs **worker oversupply** and
+  ``private_quorum <= redundancy``, or private modules silently **stall** (the
+  run completes, commits advance the clock, but embedding/head never train).
+  Documented on ``RobustnessCfg``; ``overwrite`` (the default) has no such
+  dependency. A startup warning / stall metric is a worthwhile follow-up.
+- *Two unbounded-growth leaks were fixed in review:* uncommitted audits now get
+  a creation deadline so an orphaned audit (primary died pre-commit) is reaped;
+  the per-key private-proposal bucket is FIFO-capped so persistent disagreement
+  can't accumulate state-dicts.
 - *The validation harness honestly characterizes the aggregates rather than
   rubber-stamping them:* ``trimmed_mean`` trims one extreme per side
   (breakdown = 1 adversary, ≡ median at the default quorum 3); ``median``
