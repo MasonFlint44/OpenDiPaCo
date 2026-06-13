@@ -34,23 +34,45 @@ Effort kind:
 
 ## 0. The gating milestone — sequence everything behind this
 
-### 0f · WAN convergence validation + the decentralized worker loop · B0 · [research + eng]
+0f was always two separable questions; splitting them is what lets most of its
+value be captured without distributed hardware.
 
-Two things, one milestone. **(a)** A real WAN run (e.g. three homes + a VPS) of
-the async path that measures convergence vs. the synchronous anchor — the
-project's standing §1.4 debt, now also the acceptance test for Phase 3's
-robustness dynamics *and* Phase 4's decentralized write path. **(b)** The
-**decentralized worker loop** that 0f must exercise: self-assign → quorum-read
-bases → commit to the coordinator → **push to all `k` owners**, plus a
-single-process `run_local` for it (today it refuses decentralized mode). Closing
-this also lands the three Phase 4 residuals recorded in
+### 0f-dynamics · *do our changes to the algorithm still converge?* · B0 · [eng] · ◑ harnessed
+
+Convergence is a property of the **algorithm, not the network**, so it runs on
+one box. `examples/validate_dynamics.py` does exactly this: it trains the
+synchronous engine (the deterministic anchor) and the **real in-process async
+sharded path** (per-contribution outer steps, inverse-staleness damping, worker
+oversupply so commits genuinely race) on the *same* corpus, layering int8
+compression (Phase 0c) and robust aggregation (Phase 3), and reports each
+variant's held-out perplexity vs. the anchor. At toy scale the async / int8 /
+robust-agg deltas **converge comparably to the anchor** (within ~1× — they
+track, sometimes beat it), and the harness self-reports `INCONCLUSIVE` rather
+than a vacuous pass when the anchor itself doesn't train at the chosen scale.
+This **de-risks the dynamics deltas** that the DiPaCo paper (synchronous) does
+not cover. *Still owed:* the same comparison at real scale, and the one delta
+this harness can't reach — Phase 4's decentralized **push-to-all-`k`** write
+path, which needs the worker loop below.
+
+### 0f-systems · *does it work over real consumer links?* · B0 · [research + eng]
+
+The half that genuinely needs **distributed hardware**: a real WAN run (e.g.
+three homes + a VPS) measuring convergence and behavior under real latency, NAT,
+asymmetric bandwidth, and real churn — and exercising the **decentralized worker
+loop** (self-assign → quorum-read bases → commit → **push to all `k` owners**,
+plus a single-process `run_local` for it; today it refuses decentralized mode).
+Closing this also lands the three Phase 4 residuals in
 [phase4-design.md](phase4-design.md): convergent/Byzantine-robust **epoch
 numbering** across joins, **owner-side α shard-size weighting** (uniform today),
 and wiring **`worker_set`** (HRW-assignee enforcement) into the launch path.
 
-*Why it gates everything:* it is cheap relative to its information value. It
-either says "the dynamics hold — now go solve NAT and bandwidth" or "they don't
-— stop building transport." Build nothing below in earnest until 0f answers.
+*Why it gates everything:* 0f-dynamics is cheap insurance (now taken) that the
+algorithm changes don't diverge; 0f-systems is the expensive proof that it
+survives the actual network. The project is currently **proceeding on the
+assumption that the synchronous DiPaCo result extrapolates** (0f-systems
+deferred for lack of multi-node hardware), with 0f-dynamics standing in as the
+on-box evidence. If a real run ever contradicts it, transport work above pauses
+until the dynamics are understood.
 
 ---
 
@@ -147,8 +169,11 @@ needs a reason to contribute. These are research-shaped, not just unbuilt.
 ## Sequencing
 
 ```
-        ┌─────────────────────────── 0f: dynamics verdict ───────────────────────────┐
-        │  (decentralized worker loop + WAN convergence run)  GATES EVERYTHING BELOW   │
+   0f-dynamics ✅ on-box (validate_dynamics.py: deltas converge at toy scale)
+        │
+        ▼
+        ┌──────────────────── 0f-systems: WAN verdict (deferred / assumed) ────────────┐
+        │  (decentralized worker loop + real multi-node run)  GATES EVERYTHING BELOW    │
         └──────────────────────────────────────┬──────────────────────────────────────┘
                                                 ▼
                         ┌───────────────────────┴───────────────────────┐
