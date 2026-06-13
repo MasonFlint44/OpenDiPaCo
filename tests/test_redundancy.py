@@ -368,6 +368,37 @@ def test_overwrite_policy_applies_verbatim():
         ps.shutdown()
 
 
+def test_uncommitted_audit_is_reaped():
+    """An audit whose primary never commits (worker died) must still expire and
+    be reaped -- otherwise it leaks and its (path, gen) slot blocks re-auditing."""
+    sched = _serving(redundancy=3, redundancy_rate=1.0, audit_timeout=0.0)
+    try:
+        task = sched._next_task({"worker_id": "P"}, peer_id="P")
+        key = (tuple(task["path"]), task["gen_id"])
+        assert key in sched._audits and sched._audits[key]["base"] is None
+        with sched._lock:
+            sched._reclaim_inflight_locked()     # the reaper sweeps timed-out audits
+        assert key not in sched._audits          # popped, not leaked
+    finally:
+        sched.shutdown()
+
+
+def test_private_proposal_bucket_is_bounded():
+    """Proposals that never reach quorum (persistent disagreement) are FIFO-capped
+    per key, not accumulated unboundedly across generations."""
+    ps = _priv_ps(private_policy="proposal", private_quorum=99)  # never reaches quorum
+    try:
+        k = next(x for x in ps.owned_keys if is_private_key(x))
+        path = ps._topology.paths_through_module(k)[0]
+        for i in range(ps._PRIVATE_PROPOSAL_MAX + 10):   # each a distinct state/grant
+            ps._private_proposal({"private": {k: _private_state(ps, k, float(i + 1))},
+                                  "grant": _grant(path, k, f"t{i}")}, peer_id=f"p{i}")
+        assert len(ps._private_proposals[k]) == ps._PRIVATE_PROPOSAL_MAX  # capped
+        assert ps._versions[k] == (0, 0)                 # quorum unreachable -> nothing applied
+    finally:
+        ps.shutdown()
+
+
 def test_no_audits_when_rate_zero():
     sched = _serving(redundancy=3, redundancy_rate=0.0)
     try:

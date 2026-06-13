@@ -196,6 +196,7 @@ class ParameterServer(_ReactorServer):
     """
 
     _SEEN_GRANTS_MAX = 4096  # replay window; older tokens age out FIFO
+    _PRIVATE_PROPOSAL_MAX = 16  # distinct held proposals per key before FIFO eviction
 
     def __init__(self, config, owned_keys, diloco, *, host="0.0.0.0", port=0,
                  auth_key=None, device="cpu", resume_dir=None, grant_key=None,
@@ -426,8 +427,16 @@ class ParameterServer(_ReactorServer):
         when ``private_quorum`` distinct grants agree. Returns whether it
         applied."""
         digest = pseudograd_digest({key: list(state.values())})
-        bucket = self._private_proposals.setdefault(key, {})
-        entry = bucket.setdefault(digest, {"state": state, "tokens": set()})
+        bucket = self._private_proposals.setdefault(key, collections.OrderedDict())
+        entry = bucket.get(digest)
+        if entry is None:
+            # Bound the per-key bucket: proposals that never reach quorum
+            # (persistent disagreement, or checkers aborting on aged-out bases)
+            # would otherwise accumulate full state-dicts across generations.
+            # Evicting the oldest can only delay an apply, never apply wrongly.
+            entry = bucket[digest] = {"state": state, "tokens": set()}
+            while len(bucket) > self._PRIVATE_PROPOSAL_MAX:
+                bucket.popitem(last=False)
         entry["tokens"].add(token)
         if len(entry["tokens"]) >= self.private_quorum:
             self._record_history_locked(key)
@@ -1250,7 +1259,11 @@ class Scheduler(_ReactorServer):
                     self._audits[(path, generation)] = {
                         "target": self.redundancy - 1, "base": None,
                         "primary_digest": None, "primary_peer": None,
-                        "checks": [], "members": {member}, "deadline": None,
+                        "checks": [], "members": {member},
+                        # A creation deadline so an audit whose primary never
+                        # commits (worker died) still expires and is reaped --
+                        # the primary's commit extends it for the checkers.
+                        "deadline": time.monotonic() + self.audit_timeout,
                         "private": has_private and self.private_policy == "proposal"}
             keys = self.topology.path_module_keys(path)
             routing = self._routing_locked(keys)
