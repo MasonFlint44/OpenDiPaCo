@@ -109,13 +109,21 @@ prefix rather than reusing `ingest_c4_shard`'s resumable bulk path. Worker-side
 `shard_cache` is still unbounded in RAM (the disk cache bounds *re-streaming*,
 not memory).
 
-#### 1.4 Async convergence is unvalidated — and it's the only mode that fits the internet · [design]
+#### 1.4 Async convergence is unvalidated — and it's the only mode that fits the internet · [design] · ◑ on-box dynamics harnessed
 
 Already the project's own P0: per-contribution Nesterov steps, inverse-staleness
 damping, dropped √P rescale. Everything validated on GPU is the *synchronous* path.
 Whether the async coordinator converges at scale is an open empirical question, and
-internet training cannot use the synchronous path. If the async dynamics don't
-converge, the transport work is moot — validate early.
+internet training cannot use the synchronous path. **◑ The dynamics half is now
+de-risked on one box:** `examples/validate_dynamics.py` trains the synchronous
+anchor and the real in-process async sharded path (+ int8, + robust aggregation)
+on the same corpus and shows the deltas converge comparably at toy scale (it
+returns `INCONCLUSIVE` rather than a false pass when the anchor itself doesn't
+train). What remains is the *systems* half — the same comparison at real scale
+over real WAN links, plus the Phase 4 decentralized write path — which needs
+multi-node hardware (the §0f-systems run; see [viability-roadmap.md](viability-roadmap.md)).
+The project currently proceeds on the assumption the synchronous result
+extrapolates, with the on-box harness as standing evidence.
 
 #### 1.5 No lease fencing — a zombie worker can hijack a re-leased path · [bug] · ✅ fixed
 
@@ -403,7 +411,7 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
 | ~~0c~~ ✅ | ~~Compression (bf16 + int8 grads + error feedback)~~ | **Done** — 1.2 (2× down / 4× up measured; delta-encoding + convergence validation remain) | M |
 | ~~0d~~ ✅ | ~~Data decentralization (shard ids + worker-side ingest + local routing)~~ | **Done** — 1.3 (`data.ship: spec`; router fitting + EM still central) | M |
 | ~~0e~~ ✅ | ~~bf16 inner loop, capability negotiation, idle backoff, hygiene~~ | **Done** — 1.10 (autocast + batch caps), 1.9 (idle pacing), 1.11, 1.12 | S–M |
-| 0f | WAN validation run of the async path | 1.4 | M (mostly wall-clock) |
+| 0f | ◑ Async-convergence validation: **dynamics half done on one box** (`examples/validate_dynamics.py` — deltas converge vs. the anchor at toy scale); **systems half** (real WAN run + decentralized worker loop) deferred for multi-node hardware, currently assumed | 1.4 | M (mostly wall-clock) |
 | ~~1~~ ✅ | ~~Peer identity + tracker + reachability tiers~~ | **Done** — 1.13, 1.8 (prereq); per-frame envelopes + autonomous gossip deferred to Phase 2 | M |
 | ~~2~~ ✅ | ~~Replicated module owners, dynamic ownership, signed manifests~~ | **Done** — 1.8 (HRW placement, signed epochs, Ed25519 grants, version pairs, pull replication, tracker-driven failover + promotion, per-key checkpoints + recovery manifest, `ownership: rendezvous` launch mode; design + amendments in [phase2-design.md](phase2-design.md)) | L |
 | ~~3~~ ✅ | ~~Robust aggregation, redundancy, reputation, private-module policy~~ | **Done** — 1.1 (owner-side robust aggregation, version-pinned redundant execution, reputation-gated influence, private proposal-gating), 1.9 (oversupply absorbed as redundant checks), 1.14 (per-peer rate limiting); `robustness: off` default; design + amendments in [phase3-design.md](phase3-design.md). Adversarial-dynamics harness `examples/validate_robustness.py`; the §1.4 *convergence* verdict rides the 0f WAN run | L |
