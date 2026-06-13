@@ -31,18 +31,35 @@ import trio
 from libp2p import new_host
 from libp2p.crypto.ed25519 import Ed25519PrivateKey
 from libp2p.crypto.keys import KeyPair
+from libp2p.peer.id import ID
 from libp2p.peer.peerinfo import PeerInfo, info_from_p2p_addr
+from libp2p.relay.circuit_v2.config import RelayConfig
+from libp2p.relay.circuit_v2.protocol import PROTOCOL_ID as CIRCUIT_HOP_PROTOCOL
+from libp2p.relay.circuit_v2.protocol import CircuitV2Protocol
+from libp2p.relay.circuit_v2.transport import CircuitV2Transport
+from libp2p.tools.async_service import background_trio_service
 
 from .identity import PeerIdentity
 from .wire import DEFAULT_MAX_MSG_BYTES, _HEADER, decode, encode
 
 RPC_PROTOCOL = "/opendipaco/rpc/1.0.0"
+_CIRCUIT_SEP = "/p2p-circuit"
 
 
 def dial_info(addr: str) -> PeerInfo:
     """A :class:`PeerInfo` from a full ``/…/p2p/<id>`` multiaddr (what
     :attr:`Libp2pTransport.addrs` advertises and a directory record carries)."""
     return info_from_p2p_addr(multiaddr.Multiaddr(addr))
+
+
+def dial_circuit(circuit_addr: str) -> tuple[PeerInfo, PeerInfo]:
+    """Split a ``<relay-ma>/p2p-circuit/p2p/<dest>`` addr into ``(dest_info,
+    relay_info)`` — what a NAT'd peer advertises (W1b/D5) and a dialer reaches it
+    through. The dest carries no transport addr; it's reached via the relay."""
+    idx = circuit_addr.find(_CIRCUIT_SEP)
+    relay_info = info_from_p2p_addr(multiaddr.Multiaddr(circuit_addr[:idx]))
+    dest_b58 = circuit_addr.rsplit("/p2p/", 1)[1]
+    return PeerInfo(ID.from_base58(dest_b58), []), relay_info
 
 
 def _derive_keypair(identity: PeerIdentity) -> KeyPair:
@@ -82,11 +99,12 @@ class Libp2pTransport:
     for inbound streams; omit it for a dial-only (worker) peer.
     """
 
-    def __init__(self, identity: PeerIdentity, *, handler=None,
+    def __init__(self, identity: PeerIdentity, *, handler=None, relay: bool = False,
                  listen_addrs=("/ip4/127.0.0.1/tcp/0",),
                  max_msg_bytes: int = DEFAULT_MAX_MSG_BYTES, start_timeout: float = 30.0):
         self.identity = identity
         self._handler = handler
+        self._relay = relay           # run Circuit Relay v2 in HOP mode (a relay peer, D6)
         self._listen = [multiaddr.Multiaddr(a) for a in listen_addrs]
         self._kp = _derive_keypair(identity)
         self.max_msg_bytes = max_msg_bytes
@@ -94,11 +112,14 @@ class Libp2pTransport:
         self._host = None
         self._token = None            # trio token: lets foreign threads call in
         self._stop = None             # trio.Event set on close
+        self._nursery = None          # for reservation refreshers (D6)
+        self._ctransport = None       # CircuitV2Transport: reserve / dial-through-relay
         self._ready = threading.Event()
         self._thread = None
         self._err = None
         self._libp2p_id = None
         self._addrs: list[str] = []
+        self._circuit_addrs: list[str] = []  # /…/p2p-circuit/p2p/<self> per reserved relay
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -121,7 +142,15 @@ class Libp2pTransport:
     async def _main(self) -> None:
         host = new_host(key_pair=self._kp)   # default security is Noise (D1/D7)
         self._host = host
-        async with host.run(self._listen):
+        # Circuit Relay v2 runs on every peer: HOP (allow_hop) on a relay so it
+        # forwards; STOP/CLIENT elsewhere so a peer can be reached through, or
+        # dial through, a relay. The relayed stream is Noise-secured end-to-end,
+        # so a relay only ever sees ciphertext (D7).
+        cproto = CircuitV2Protocol(host, allow_hop=self._relay)
+        async with host.run(self._listen), background_trio_service(cproto), \
+                trio.open_nursery() as nursery:
+            self._nursery = nursery
+            self._ctransport = CircuitV2Transport(host, cproto, RelayConfig())
             if self._handler is not None:
                 host.set_stream_handler(RPC_PROTOCOL, self._on_stream)
             self._token = trio.lowlevel.current_trio_token()
@@ -130,6 +159,7 @@ class Libp2pTransport:
             self._stop = trio.Event()
             self._ready.set()
             await self._stop.wait()
+            nursery.cancel_scope.cancel()   # stop reservation refreshers, unwind cleanly
 
     def close(self) -> None:
         if self._token is not None and self._stop is not None:
@@ -151,25 +181,65 @@ class Libp2pTransport:
         """Full dialable ``/…/p2p/<id>`` multiaddrs (for the directory record)."""
         return list(self._addrs)
 
+    @property
+    def circuit_addrs(self) -> list[str]:
+        """``/…/p2p-circuit/p2p/<self>`` addrs for each reserved relay — what a
+        NAT'd peer advertises so others can dial it through a relay (D5/D6)."""
+        return list(self._circuit_addrs)
+
+    # -- relay reservation (D6) ------------------------------------------------
+
+    def reserve_on(self, relay_addr: str) -> str | None:
+        """Reserve a forwarding slot on a relay; returns this peer's circuit addr
+        through that relay (to advertise), or None if the reservation failed. A
+        NAT'd owner reserves on k>=2 relays (D6) for failover + eclipse resistance."""
+        if self._token is None:
+            raise RuntimeError("transport not started")
+        return trio.from_thread.run(self._reserve_async, relay_addr, trio_token=self._token)
+
+    async def _reserve_async(self, relay_addr: str):
+        relay_info = dial_info(relay_addr)
+        await self._host.connect(relay_info)
+        hop = await self._host.new_stream(relay_info.peer_id, [CIRCUIT_HOP_PROTOCOL])
+        if not await self._ctransport.reserve(hop, relay_info.peer_id, self._nursery):
+            return None
+        circuit = f"{relay_addr}{_CIRCUIT_SEP}/p2p/{self.libp2p_id}"
+        if circuit not in self._circuit_addrs:
+            self._circuit_addrs.append(circuit)
+        return circuit
+
     # -- RPC (sync facade over the trio loop) ----------------------------------
 
-    def rpc(self, target: PeerInfo, msg, *, timeout: float | None = None):
-        """Open a stream to ``target``, send ``msg``, return the reply. Blocks
-        the calling (foreign) thread until the trio loop completes the round-trip."""
+    def rpc(self, target, msg, *, timeout: float | None = None):
+        """Open a stream to ``target``, send ``msg``, return the reply. ``target``
+        is a :class:`PeerInfo`, a direct ``/…/p2p/<id>`` addr, or a
+        ``/…/p2p-circuit/p2p/<id>`` circuit addr (dialed through the relay).
+        Blocks the calling thread until the trio round-trip completes."""
         if self._token is None:
             raise RuntimeError("transport not started")
         return trio.from_thread.run(self._rpc_async, target, msg, timeout,
                                     trio_token=self._token)
 
-    async def _rpc_async(self, target: PeerInfo, msg, timeout):
+    async def _rpc_async(self, target, msg, timeout):
         with trio.fail_after(timeout) if timeout else _nullcm():
-            await self._host.connect(target)
-            stream = await self._host.new_stream(target.peer_id, [RPC_PROTOCOL])
+            peer_id = await self._connect(target)
+            stream = await self._host.new_stream(peer_id, [RPC_PROTOCOL])
             try:
                 await self._send(stream, msg)
                 return await self._recv(stream)
             finally:
                 await stream.close()
+
+    async def _connect(self, target):
+        """Resolve+connect to ``target`` (direct or relayed); return its peer id."""
+        if isinstance(target, str):
+            if _CIRCUIT_SEP in target:                      # reach a NAT'd peer via its relay
+                dest, relay = dial_circuit(target)
+                await self._ctransport.dial_peer_info(dest, relay_info=relay)
+                return dest.peer_id
+            target = dial_info(target)
+        await self._host.connect(target)
+        return target.peer_id
 
     async def _on_stream(self, stream) -> None:
         try:

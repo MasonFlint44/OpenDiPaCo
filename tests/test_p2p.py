@@ -124,3 +124,64 @@ def test_parameter_server_fetch_and_push_over_libp2p():
 def _is_private(key):
     from opendipaco.topology import is_private_key
     return is_private_key(key)
+
+
+# -- W1b: Circuit Relay v2 (reach a NAT'd peer through a relay) -----------------
+
+
+def test_relayed_rpc_round_trip():
+    """A listener reachable ONLY through a relay: it reserves on the relay,
+    advertises a circuit addr, and a dialer reaches it through the relay. The
+    relay runs no RPC handler -- it purely forwards (Noise e2e: it sees only
+    ciphertext, D7)."""
+    relay = Libp2pTransport(PeerIdentity.generate(), relay=True).start()
+    seen = {}
+
+    def handler(msg):
+        seen["n"] = msg.get("n")
+        return {"type": "ack", "echo": msg.get("n")}
+
+    listener = Libp2pTransport(PeerIdentity.generate(), handler=handler).start()
+    dialer = Libp2pTransport(PeerIdentity.generate()).start()
+    try:
+        circuit = listener.reserve_on(relay.addrs[0])
+        assert circuit and "/p2p-circuit/" in circuit
+        assert circuit in listener.circuit_addrs
+        # Reach the listener through the relay -- using the circuit addr, never a
+        # direct addr of the listener.
+        reply = dialer.rpc(circuit, {"type": "ping", "n": 11}, timeout=30)
+        assert reply == {"type": "ack", "echo": 11}
+        assert seen["n"] == 11
+    finally:
+        dialer.close()
+        listener.close()
+        relay.close()
+
+
+def test_nat_owner_served_through_a_relay():
+    """The W1 payoff: a ParameterServer (owner) with no usable direct route is
+    reached through a relay -- fetch over the circuit returns its versioned
+    weights, exactly like the direct libp2p path."""
+    from opendipaco import DiLoCoConfig
+    from opendipaco.schedule import ParameterServer
+    from opendipaco.schedule.p2p import serve_over_libp2p
+
+    cfg = _cfg()
+    keys = sorted(cfg.build_topology().module_keys())
+    ps = ParameterServer(cfg, keys, DiLoCoConfig(inner_steps=4), host="127.0.0.1", port=0,
+                         identity=PeerIdentity.generate())
+    relay = Libp2pTransport(PeerIdentity.generate(), relay=True).start()
+    owner = serve_over_libp2p(ps)                 # the NAT'd owner
+    client = Libp2pTransport(PeerIdentity.generate()).start()
+    try:
+        circuit = owner.reserve_on(relay.addrs[0])
+        assert circuit in owner.circuit_addrs
+        shared = next(k for k in keys if not _is_private(k))
+        reply = client.rpc(circuit, {"type": "fetch", "keys": [shared], "have": {}}, timeout=30)
+        assert tuple(reply["versions"][shared]) == (0, 0)
+        assert shared in reply["weights"]         # weights fetched through the relay
+    finally:
+        client.close()
+        owner.close()
+        relay.close()
+        ps.shutdown()
