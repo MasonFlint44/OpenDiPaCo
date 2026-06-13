@@ -58,6 +58,7 @@ from .distributed import (
     _load_private,
     _materialize_from_spec,
 )
+from .aggregate import check_aggregate, robust_delta
 from .guard import all_finite, clip_norm_, loss_ok
 from .identity import sign_record, verify_record
 from .ownership import (
@@ -197,7 +198,8 @@ class ParameterServer(_ReactorServer):
                  scheduler_pub=None, max_update_norm=None, compress="none",
                  identity=None, epoch_record=None, replicate_interval=10.0,
                  peer_auth=None, peer_tls=None, bootstrap=True, bank_seed=0,
-                 scheduler_addr=None, **reactor_kw):
+                 scheduler_addr=None, robustness="off", quorum_target=3,
+                 quorum_timeout=30.0, aggregate="trimmed_mean", **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.config = config
         self.diloco = diloco
@@ -213,9 +215,25 @@ class ParameterServer(_ReactorServer):
         self.compress = check_mode(compress)
         self._seen_grants: collections.OrderedDict = collections.OrderedDict()
 
+        # Robust aggregation (Phase 3a, finding 1.1). ``off`` (default) is
+        # today's behavior, bit-identical: each shared push applies immediately.
+        # ``on`` buffers a shared module's contributions and applies one robust
+        # aggregate (see ``aggregate.py``) once a quorum of
+        # ``min(sharing_degree, quorum_target)`` arrives or ``quorum_timeout``
+        # elapses. Private modules are untouched here (policy 3a is slice 3d).
+        if robustness not in ("off", "on"):
+            raise ValueError(f"robustness must be 'off' or 'on', got {robustness!r}")
+        self.robust = robustness
+        self.quorum_target = max(1, int(quorum_target))
+        self.quorum_timeout = float(quorum_timeout)
+        self.aggregate = check_aggregate(aggregate)
+        self._topology = config.build_topology()
+        self._buffers: dict = {}     # key -> [(weight, [grad tensors]), ...]
+        self._buffer_ts: dict = {}   # key -> monotonic ts of the buffer's first entry
+
         self.identity = identity
         self.peer_id = getattr(identity, "peer_id", None)
-        self._all_keys = set(config.build_topology().module_keys())
+        self._all_keys = set(self._topology.module_keys())
         self._epoch = None
         self._epoch_num = 0
         if epoch_record is not None:
@@ -324,6 +342,46 @@ class ParameterServer(_ReactorServer):
     def _bump_version_locked(self, key) -> None:
         e, c = self._versions[key]
         self._versions[key] = (self._epoch_num, c + 1 if e == self._epoch_num else 1)
+
+    # -- robust aggregation (Phase 3a) -----------------------------------------
+
+    def _apply_outer_locked(self, key, weight, grad) -> None:
+        """One weighted outer step on a module (the unbuffered/``off`` path)."""
+        apply_outer_grads(self.bank[key], [weight * g.to(self.device) for g in grad])
+        self._outer_opts[key].step()
+        self._outer_opts[key].zero_grad(set_to_none=True)
+        self._bump_version_locked(key)
+
+    def _quorum_c(self, key) -> int:
+        """Contributions to buffer before aggregating: the module's sharing
+        degree, capped at ``quorum_target`` (a module shared by fewer paths than
+        the target can never reach it, so it aggregates at its full degree)."""
+        return max(1, min(self._topology.sharing_count(key), self.quorum_target))
+
+    def _flush_buffer_locked(self, key) -> None:
+        """Robustly aggregate the buffered contributions and apply one step."""
+        contribs = self._buffers.pop(key, None)
+        self._buffer_ts.pop(key, None)
+        if not contribs:
+            return
+        delta, weight_sum = robust_delta(contribs, aggregate=self.aggregate)
+        apply_outer_grads(self.bank[key], [weight_sum * d.to(self.device) for d in delta])
+        self._outer_opts[key].step()
+        self._outer_opts[key].zero_grad(set_to_none=True)
+        self._bump_version_locked(key)
+
+    def _sweep_buffers(self) -> None:
+        """Flush buffers whose oldest contribution has waited past the timeout
+        (liveness valve: a stalled path must not freeze a module forever).
+        Swept at the replication loop's cadence."""
+        if self.robust == "off":
+            return
+        now = time.monotonic()
+        with self._lock:
+            due = [k for k, ts in self._buffer_ts.items()
+                   if self._buffers.get(k) and now - ts >= self.quorum_timeout]
+            for k in due:
+                self._flush_buffer_locked(k)
 
     def _fetch(self, msg: dict, peer_id: str | None = None) -> dict:
         have = msg.get("have", {})
@@ -448,6 +506,7 @@ class ParameterServer(_ReactorServer):
             if self._stop or self._dead:
                 return
             try:
+                self._sweep_buffers()  # flush quorum buffers past their timeout
                 self._poll_epoch()
                 self._replicate_once()
             except Exception:  # noqa: BLE001 -- a peer mid-restart must not kill the puller
@@ -657,10 +716,16 @@ class ParameterServer(_ReactorServer):
                 if self.max_update_norm is not None:
                     if clip_norm_(grad, self.max_update_norm) > self.max_update_norm:
                         self.metrics.record_norm_clip()
-                apply_outer_grads(self.bank[k], [weight * g.to(self.device) for g in grad])
-                self._outer_opts[k].step()
-                self._outer_opts[k].zero_grad(set_to_none=True)
-                self._bump_version_locked(k)
+                if self.robust == "off":
+                    self._apply_outer_locked(k, weight, grad)
+                else:
+                    # Buffer; apply one robust aggregate at quorum (here) or on
+                    # timeout (the replication loop sweeps). Accepted == buffered.
+                    buf = self._buffers.setdefault(k, [])
+                    buf.append((weight, [g.to(self.device) for g in grad]))
+                    self._buffer_ts.setdefault(k, time.monotonic())
+                    if len(buf) >= self._quorum_c(k):
+                        self._flush_buffer_locked(k)
                 n_applied += 1
             for k, sd in private.items():
                 if k not in allowed:

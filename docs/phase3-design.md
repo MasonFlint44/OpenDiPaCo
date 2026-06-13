@@ -1,9 +1,26 @@
 # Phase 3 design — Byzantine-robust aggregation (the trust wall, §1.1)
 
-Status: **design — decisions locked, ready to build (see §5).** Expands the
-Phase 3 sketch in [internet-scale-plan.md](internet-scale-plan.md). Decisions
-D1–D8 state the options and the chosen path; §5 records the four operator
-calls (all taken at the recommended option).
+Status: **slice 3a landed** (`schedule/aggregate.py` robust combiner +
+owner-side quorum buffering with timeout flush; `robustness: off` default,
+bit-identical to the Phase 2 anchor). Slices 3b–3d pending. Expands the Phase 3
+sketch in [internet-scale-plan.md](internet-scale-plan.md). Decisions D1–D8
+state the options and the chosen path; §5 records the four operator calls.
+
+**3a amendments (discovered while building, like Phase 2's):**
+- *Per-key buffering, not `(key, generation)`.* The design floated bucketing by
+  generation; in the async sharded path a shared module has no single global
+  generation (each path advances independently and contributions already apply
+  against a moving base). So the buffer is **per key**, flushed at quorum or
+  timeout — matching the plan's "buffers contributions per module" wording.
+- *Direction/magnitude decoupling.* The robust step is `weight_sum × combine(gᵢ)`
+  — an **unweighted** robust direction times the **summed** weight — not a
+  combine of the weighted grads. This keeps the engine's summed-across-sharing
+  scale, makes `c=1` exactly `weight·grad` (the bit-identity seam), and denies
+  an adversary the leverage of scaling its own influence on the direction via
+  its (e.g. low-staleness) weight. Rationale in `aggregate.py`.
+- *Norm clipping stays per-contribution at push time* (counted in
+  `TransportMetrics.norm_clipped` as before); the aggregator combines
+  already-clipped grads.
 
 ## 1. Goal and trust model
 
