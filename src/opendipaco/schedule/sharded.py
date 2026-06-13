@@ -70,6 +70,7 @@ from .quorum import confirm_version, divergent_peers
 from .identity import peer_id_of, sign_record, verify_record
 from .ownership import (
     EpochManager,
+    derive_epoch,
     epoch_newer,
     make_epoch_record,
     owners_for,
@@ -228,7 +229,8 @@ class ParameterServer(_ReactorServer):
                  schedule_mode="central", salt="", lease_ttl=30.0, worker_set=None,
                  corpus_weights=None, reputation=None, rate_limiter=None,
                  min_owner_reputation=0.25, staleness_bound=None,
-                 staleness_weight="inverse", read_quorum=2, **reactor_kw):
+                 staleness_weight="inverse", read_quorum=2, k=3,
+                 directory_ttl=120.0, **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.config = config
         self.diloco = diloco
@@ -287,7 +289,8 @@ class ParameterServer(_ReactorServer):
         if epoch_record is not None:
             if self.peer_id is None:
                 raise ValueError("epoch_record= needs identity=")
-            if not verify_epoch_record(epoch_record):
+            if not verify_epoch_record(
+                    epoch_record, allow_deterministic=(schedule_mode == "decentralized")):
                 raise ValueError("invalid epoch record")
             self._epoch = epoch_record
             self._epoch_num = epoch_record["epoch"]
@@ -371,6 +374,14 @@ class ParameterServer(_ReactorServer):
         # Replicas a read cross-checks before trusting bytes, and the agreement
         # threshold for confirming a version / flagging a divergent owner (4c).
         self.read_quorum = max(1, int(read_quorum))
+        # Decentralized epochs are derived from a gossiped directory, not signed
+        # by a scheduler (D6): k + a self-certifying peer directory (peer_id ->
+        # record) the owner imports from co-owners and the seed tracker.
+        self._k = max(1, int(k))
+        self.directory_ttl = float(directory_ttl)
+        self._directory: dict = {}   # peer_id -> verified peer record (TTL-pruned)
+        self._self_record = None     # this owner's own peer record, gossiped onward
+        self._seed_addr = None       # bootstrap tracker (gossip survives its loss)
         # path tuple -> [generation, opened_at] (the per-path clock + fence).
         self._gen: dict = {}
 
@@ -390,6 +401,8 @@ class ParameterServer(_ReactorServer):
             return self._generation(msg)
         if kind == "digest":  # decentralized: cheap (version, content-digest) for quorum reads
             return self._digests(msg)
+        if kind == "directory":  # decentralized: gossip the peer directory (tracker = seed)
+            return self._directory_rpc(msg)
         if kind == "private_proposal":
             return self._private_proposal(msg, peer_id)
         if kind == "checkpoint":
@@ -648,7 +661,11 @@ class ParameterServer(_ReactorServer):
         """
         if self.peer_id is None:
             raise RuntimeError("apply_epoch needs identity=")
-        if not verify_epoch_record(record):
+        # Decentralized epochs are signer-less and derived by recomputation
+        # (D6), so accept a well-formed deterministic record; central/rendezvous
+        # epochs still require the scheduler's signature.
+        if not verify_epoch_record(
+                record, allow_deterministic=(self.schedule_mode == "decentralized")):
             raise ValueError("invalid epoch record")
         if bootstrap is None:
             bootstrap = bool(record.get("bootstrap"))
@@ -708,6 +725,7 @@ class ParameterServer(_ReactorServer):
                 self._poll_epoch()
                 self._replicate_once()
                 if self.schedule_mode == "decentralized":
+                    self._gossip_once()         # directory gossip + re-derive epoch (4d)
                     self._audit_digests_once()  # cross-check co-owners' digests (4c)
             except Exception:  # noqa: BLE001 -- a peer mid-restart must not kill the puller
                 pass
@@ -832,13 +850,21 @@ class ParameterServer(_ReactorServer):
         """
         if self.identity is None:
             raise RuntimeError("start_tracker_heartbeat needs identity=")
-        from .tracker import register_peer  # lazy: tracker imports this module
+        from .tracker import make_peer_record, register_peer  # lazy: tracker imports this
 
         addr = tuple(tracker_addr)
+        # The tracker is the bootstrap seed for gossip (D7); a fresh self-record
+        # is what this owner gossips onward so its membership propagates even
+        # after the tracker is gone.
+        self._seed_addr = addr
 
         def beat():
             while not (self._stop or self._dead):
                 try:
+                    self._self_record = make_peer_record(
+                        self.identity, reachability="public",
+                        addr=(advertise_host, self.port), roles=roles,
+                        capabilities=capabilities)
                     register_peer(addr, self.identity, reachability="public",
                                   peer_addr=(advertise_host, self.port), roles=roles,
                                   capabilities=capabilities, auth_key=auth_key, tls=tls)
@@ -1030,6 +1056,88 @@ class ParameterServer(_ReactorServer):
                 if k in reports and vd:
                     reports[k][pid] = (tuple(vd[0]), vd[1])
         return self._apply_digest_audit(reports)
+
+    # -- directory gossip + deterministic epochs (Phase 4 D6/D7) ---------------
+
+    def _prune_directory_locked(self, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        for p in [p for p, r in self._directory.items()
+                  if now - r.get("issued_at", 0) > self.directory_ttl]:
+            del self._directory[p]
+
+    def import_directory(self, records, *, now: float | None = None) -> int:
+        """Merge gossiped peer records into the local directory (newest
+        ``issued_at`` wins; expired records are dropped). Each record is
+        self-certifying, so importing from any peer is safe -- this is how the
+        swarm's membership survives the tracker (design D7)."""
+        now = time.time() if now is None else now
+        added = 0
+        with self._lock:
+            for r in records:
+                if not (isinstance(r, dict) and verify_record(r) and r.get("kind") == "peer"):
+                    continue
+                pid = r.get("peer_id")
+                if not isinstance(pid, str) or now - r.get("issued_at", 0) > self.directory_ttl:
+                    continue
+                cur = self._directory.get(pid)
+                if cur is None or r.get("issued_at", 0) > cur.get("issued_at", 0):
+                    self._directory[pid] = r
+                    added += 1
+            self._prune_directory_locked(now)
+        return added
+
+    def _directory_rpc(self, msg: dict) -> dict:
+        """Serve this owner's directory view (its own record first) so a peer can
+        gossip from it -- the tracker is only a bootstrap seed."""
+        with self._lock:
+            self._prune_directory_locked()
+            recs = [r for r in self._directory.values() if r["peer_id"] != self.peer_id]
+            if self._self_record is not None:
+                recs.append(self._self_record)
+        return {"type": "directory", "records": recs}
+
+    def derive_and_apply_epoch(self):
+        """Derive the epoch deterministically from the local directory (D6) and
+        adopt it if newer. The reputation gate excludes owners debited for
+        divergence (4c) -- this is the eviction step. Returns the live record."""
+        if self.schedule_mode != "decentralized" or self.peer_id is None:
+            return None
+        with self._lock:
+            self._prune_directory_locked()
+            recs = [r for r in self._directory.values() if r["peer_id"] != self.peer_id]
+            if self._self_record is not None:
+                recs.append(self._self_record)
+            prev = self._epoch
+        record = derive_epoch(
+            recs, k=self._k, salt=self.salt, prev=prev,
+            is_eligible=lambda pid: self.reputation.eligible(pid, self.min_owner_reputation))
+        if prev is None or epoch_newer(record, prev):
+            self.apply_epoch(record)
+            return record
+        return prev
+
+    def _gossip_once(self) -> None:
+        """Pull directories from the seed tracker + current co-owners, import
+        them, and re-derive the epoch (decentralized replication-loop step)."""
+        if self.schedule_mode != "decentralized" or self.peer_id is None:
+            return
+        with self._lock:
+            addrs = {self._seed_addr} if self._seed_addr else set()
+            self_addr = None if self._self_record is None else tuple(self._self_record["addr"])
+            if self._epoch is not None:
+                for o in self._epoch["owners"]:
+                    a = tuple(o["addr"])
+                    if a != self_addr:
+                        addrs.add(a)
+        for addr in addrs:
+            try:
+                reply = self._peer_rpc(addr, {"type": "directory"})
+            except (OSError, ConnectionError):
+                reply = None
+            recs = (reply or {}).get("records")
+            if recs:
+                self.import_directory(recs)
+        self.derive_and_apply_epoch()
 
     def _expected_grant_signer(self, grant) -> str | None:
         """The peer-id that legitimately mints a push grant for this path under

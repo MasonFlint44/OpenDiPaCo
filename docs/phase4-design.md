@@ -1,15 +1,54 @@
 # Phase 4 design — decentralized scheduling (remove the central trust root)
 
-Status: **design; no slices landed yet.** Phase 4 removes the `Scheduler` as a
-node — its jobs (lease queue, global clock, commit grants, reputation, audits,
-epoch authority) decentralize onto the existing replicated **owner** tier and
-onto the workers themselves. Three operator calls fix the scope (§5): **full**
-Byzantine-owner defense (not just availability), **leaderless** HRW
-self-assignment (no per-path coordinator), and **owner-to-owner gossip** so the
-tracker degrades to a bootstrap seed. This expands the one-paragraph Phase 4
-sketch in [internet-scale-plan.md](internet-scale-plan.md) §2. Decisions D1–D9
-state the options and the chosen path; §4 slices it 4a–4d; §5 records the
-operator decisions.
+Status: **all four slices landed — the control plane is decentralized.** 4a:
+`assignment.py` (HRW`(path, gen)` self-assignment, takeover-on-expiry,
+version-lag staleness, coordinator-key) + the `schedule.mode` seam. 4b: the
+owner becomes the path coordinator (owner-minted/owner-verified Ed25519 grants,
+version-fence, owner-local reputation + rate-limit). 4c: the Byzantine-owner
+defense (`state_digest`, `quorum.py` confirm/divergence, owner cross-check →
+reputation debit). 4d: deterministic signer-less epochs derived from a gossiped
+directory (`derive_epoch`), owner directory import/serve + gossip, the eviction
+loop closed (debit → next epoch drops the owner), launch wiring
+(`schedule: decentralized`), and `examples/validate_decentralized.py`.
+`schedule.mode: central` (default) stays bit-identical to Phase 3. Three
+operator calls fixed the scope (§5): **full** Byzantine-owner defense,
+**leaderless** HRW self-assignment, **owner-to-owner gossip**. This expands the
+one-paragraph Phase 4 sketch in [internet-scale-plan.md](internet-scale-plan.md)
+§2. Decisions D1–D9 state the options and the chosen path; §4 slices it 4a–4d;
+§5 records the operator decisions.
+
+**The remaining 0f-gated piece (stated plainly).** What is *not* yet runnable in
+one process is the **decentralized worker loop** — self-assign → quorum-read
+bases → commit to the coordinator → **push to all `k` owners** — and therefore a
+single-process `run_local` for `schedule: decentralized` (it raises with a
+pointer to the validation script and per-role launch). This is deliberate and
+consistent with the 4c boundary: a backup defending against a Byzantine
+*primary* needs that push-to-all-`k` path so each owner recomputes rather than
+trusts the primary's bytes, and whether `k` independent aggregations converge
+comparably to one-primary replication is a **dynamics** property unit tests
+can't settle — it is a 0f WAN acceptance item, like Phase 3's convergence
+verdict. Everything the defense *is built on* (assignment, grants, fence,
+digests, quorum reads, divergence detection, eviction, deterministic epochs,
+gossip import) is landed and unit/integration-tested; the end-to-end runtime
+that ties them into a converging swarm is the final integration, owed to 0f.
+
+**4d amendments (discovered while building):**
+- *No per-owner `EpochManager` in decentralized mode — directory TTL provides
+  the hysteresis.* The `EpochManager`'s grace/rate-limit timers are per-node and
+  timing-dependent, which would make owners derive *different* epochs from the
+  same membership. Instead owners derive directly from their TTL-pruned,
+  gossiped directory via `derive_epoch` (a pure function), so identical
+  directories yield identical epochs; the directory's liveness TTL is the
+  "is it still here" hysteresis. The `EpochManager` stays the central/rendezvous
+  mechanism (the scheduler runs one); decentralized mode replaces it.
+- *Epoch numbering bumps only on a membership-hash change* (`members_sig`), and
+  unchanged churn re-derives the *same* record — so the `(epoch, counter)`
+  version gate stays stable across re-derivations. Cross-node numbering
+  convergence under gossip lag is the bounded split-brain D6 already accepts
+  (version-fence + quorum reads make a transient disagreement harmless).
+- *The eviction loop is closed end-to-end:* a 4c digest-divergence debit drops a
+  co-owner below `min_owner_reputation`, and the next `derive_and_apply_epoch`'s
+  reputation gate excludes it (tested in `test_decentralized_epochs`).
 
 > **Strategic note (recorded up front, honestly).** Phase 4 is the *optional
 > endgame* in the plan — *"only worth it if tracker availability actually

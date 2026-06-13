@@ -29,6 +29,7 @@ to this same predicate.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 
 from .identity import PeerIdentity, sign_record, verify_record
@@ -108,10 +109,82 @@ def make_epoch_record(identity: PeerIdentity, *, epoch: int, owner_records,
     })
 
 
-def verify_epoch_record(record, *, signer_pub: str | None = None) -> bool:
+def _members_sig(owners) -> str:
+    """A stable hash of an owner set (peer_id + addr), so identical membership
+    maps to the same epoch on every node (Phase 4 D6)."""
+    payload = [[o["peer_id"], list(o["addr"])] for o in owners]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def derive_epoch(owner_records, *, k: int = DEFAULT_REPLICATION, salt: str = "",
+                 prev: dict | None = None, is_eligible=None) -> dict:
+    """Derive the owner-set epoch **deterministically from the directory** — no
+    central signer (Phase 4 D6). Every owner holding the same (gossiped,
+    self-certifying) directory computes the same record: the eligible owners
+    sorted by peer id, a membership hash, and an epoch number that bumps only
+    when membership changes (so unchanged churn re-derives the *same* record and
+    the version gate stays stable).
+
+    ``is_eligible(peer_id)`` layers the reputation gate on
+    :func:`owner_eligible`, so an owner debited for serving divergent weights
+    (4c) is excluded from the next derived epoch — this is the eviction step.
+    Returns an **unsigned** record (``deterministic: True``); authority comes
+    from every node recomputing it, not from a signature, so a relayed copy is
+    only ever a hint to be re-derived and matched.
+    """
+    owners = []
+    for r in owner_records:
+        if owner_eligible(r) and (is_eligible is None or is_eligible(r["peer_id"])):
+            owners.append({"peer_id": r["peer_id"], "addr": list(r["addr"])})
+    owners.sort(key=lambda o: o["peer_id"])
+    sig = _members_sig(owners)
+    if prev is not None and prev.get("members_sig") == sig and int(prev.get("k", k)) == int(k):
+        return prev  # membership unchanged -> the very same epoch
+    epoch_num = 0 if prev is None else int(prev["epoch"]) + 1
+    return {
+        "kind": "epoch", "epoch": epoch_num, "k": int(k), "salt": salt,
+        "bootstrap": prev is None, "owners": owners, "members_sig": sig,
+        "deterministic": True, "issued_at": time.time(),
+    }
+
+
+def _epoch_well_formed(record) -> bool:
+    if record.get("kind") != "epoch":
+        return False
+    if not isinstance(record.get("epoch"), int) or record["epoch"] < 0:
+        return False
+    if not isinstance(record.get("k"), int) or record["k"] < 1:
+        return False
+    if not isinstance(record.get("issued_at"), (int, float)):
+        return False
+    owners = record.get("owners")
+    if not isinstance(owners, list):
+        return False
+    seen = set()
+    for o in owners:
+        if not (isinstance(o, dict) and isinstance(o.get("peer_id"), str) and o.get("addr")):
+            return False
+        if o["peer_id"] in seen:  # duplicate ids would double an owner's HRW odds
+            return False
+        seen.add(o["peer_id"])
+    return True
+
+
+def verify_epoch_record(record, *, signer_pub: str | None = None,
+                        allow_deterministic: bool = False) -> bool:
     """Signature-valid, well-formed, and (when ``signer_pub`` is given) signed
     by that key — consumers pin the scheduler's public key here so a cached or
-    relayed copy can't be substituted by another identity."""
+    relayed copy can't be substituted by another identity.
+
+    With ``allow_deterministic`` (decentralized mode, Phase 4 D6) a
+    signer-less ``deterministic`` epoch is accepted on **structure** alone: its
+    authority is that the consumer re-derives it from its own directory, so
+    there is no signature to check. A *signed* record still takes the signed
+    path even under this flag."""
+    if not isinstance(record, dict):
+        return False
+    if allow_deterministic and record.get("deterministic") and "sig" not in record:
+        return _epoch_well_formed(record)
     if not verify_record(record) or record.get("kind") != "epoch":
         return False
     if signer_pub is not None and record.get("pub", "").lower() != signer_pub.lower():

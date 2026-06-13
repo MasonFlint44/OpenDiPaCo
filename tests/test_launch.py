@@ -219,6 +219,26 @@ def test_run_local_sharded_with_robustness_on():
     assert scheduler.reputation is not None       # the gate substrate is live
 
 
+def test_decentralized_owner_kw_built_only_in_decentralized_mode():
+    from opendipaco.launch.roles import _decentralized_owner_kw
+    assert _decentralized_owner_kw(LaunchConfig.from_dict(_tiny_dict())) == {}  # central
+    cfg = LaunchConfig.from_dict({**_tiny_dict("sharded"),
+                                  "ownership": {"mode": "rendezvous", "k": 3},
+                                  "schedule": {"mode": "decentralized", "read_quorum": 2}})
+    kw = _decentralized_owner_kw(cfg)
+    assert kw["schedule_mode"] == "decentralized" and kw["k"] == 3 and kw["read_quorum"] == 2
+    assert kw["reputation"] is not None and kw["rate_limiter"] is not None
+
+
+def test_run_local_rejects_decentralized_with_a_pointer():
+    from opendipaco.launch import run_local
+    cfg = LaunchConfig.from_dict({**_tiny_dict("sharded"),
+                                  "ownership": {"mode": "rendezvous"},
+                                  "schedule": {"mode": "decentralized"}})
+    with pytest.raises(ValueError, match="decentralized"):
+        run_local(cfg)
+
+
 def test_advertise_host_defaults_to_bind_host():
     """A rendezvous owner's tracker record must advertise a dialable address:
     explicit ownership.advertise_host, else transport.connect_host, else the

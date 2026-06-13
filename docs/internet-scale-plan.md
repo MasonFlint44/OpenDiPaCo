@@ -335,15 +335,40 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
   shared-with-robust-aggregation for internet runs. (a) preserves paper semantics;
   decide empirically.
 
-### Phase 4 — decentralized scheduling (optional endgame)
+### Phase 4 — decentralized scheduling (optional endgame) · ◑ control plane done
 
-- Replace tracker-issued leases with deterministic assignment: hash(path,
-  generation) → eligible peer set, takeover on lease expiry via the gossip layer;
-  staleness via the per-module version vectors that already exist instead of the
-  global `_T` clock.
-- The tracker degrades to a bootstrap node — the swarm survives without it.
-- Only worth it if tracker availability actually becomes the limiting factor;
-  Phases 0–3 deliver the goal without it.
+> Design, the three operator calls (full Byzantine-owner defense, leaderless
+> assignment, owner gossip), and the amendments found while building
+> (directory-TTL hysteresis instead of a per-owner EpochManager, the 0f-gated
+> worker loop): [phase4-design.md](phase4-design.md).
+
+- **Leaderless assignment** — ✅ `assignment.py`: HRW`(path, generation)` over the
+  live worker set with deterministic takeover-on-expiry replaces the scheduler's
+  lease queue; staleness is **version-vector lag** over the per-module
+  `(epoch, counter)` versions (the coordinator key's counter *is* the path's
+  generation clock) instead of the global `_T`.
+- **The owner is the trust root, sharded** — ✅ each path's primary owner mints
+  its Ed25519 commit grant (co-owners verify against the epoch record, no central
+  signer), version-fences the generation, and hosts reputation / rate-limit
+  (`schedule_mode: decentralized` on `ParameterServer`).
+- **Byzantine owners defended** — ✅ the cross-check Phase 3 deferred: **quorum
+  reads** (`quorum.py` + `state_digest`; a reader trusts only the digest a
+  majority of `k` replicas agree on) and cross-owner digest agreement that
+  debits a divergent owner's reputation toward **eviction** — closed end-to-end
+  with deterministic epochs.
+- **Deterministic epochs + gossip** — ✅ `derive_epoch` makes the owner set a
+  pure function of the self-certifying, gossiped directory (no scheduler
+  signature); owners import each other's directories so the **tracker degrades
+  to a bootstrap seed** and the swarm survives its loss.
+- **Still 0f-gated (the residual):** the decentralized **worker loop**
+  (self-assign → quorum-read → commit → **push to all `k` owners**) and a
+  single-process `run_local` for it are *not* yet runnable — the defense's
+  components are all landed and tested, but the end-to-end write path whose
+  *convergence* must be measured rides the 0f WAN run, exactly as Phase 3's
+  convergence verdict does. `examples/validate_decentralized.py` validates the
+  read-side quorum + divergence primitive (no networking), de-risking it.
+- Only worth completing if tracker/scheduler availability actually becomes the
+  limiting factor; Phases 0–3 already deliver the goal without it.
 
 ---
 
@@ -371,7 +396,7 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
 | ~~1~~ ✅ | ~~Peer identity + tracker + reachability tiers~~ | **Done** — 1.13, 1.8 (prereq); per-frame envelopes + autonomous gossip deferred to Phase 2 | M |
 | ~~2~~ ✅ | ~~Replicated module owners, dynamic ownership, signed manifests~~ | **Done** — 1.8 (HRW placement, signed epochs, Ed25519 grants, version pairs, pull replication, tracker-driven failover + promotion, per-key checkpoints + recovery manifest, `ownership: rendezvous` launch mode; design + amendments in [phase2-design.md](phase2-design.md)) | L |
 | ~~3~~ ✅ | ~~Robust aggregation, redundancy, reputation, private-module policy~~ | **Done** — 1.1 (owner-side robust aggregation, version-pinned redundant execution, reputation-gated influence, private proposal-gating), 1.9 (oversupply absorbed as redundant checks), 1.14 (per-peer rate limiting); `robustness: off` default; design + amendments in [phase3-design.md](phase3-design.md). Adversarial-dynamics harness `examples/validate_robustness.py`; the §1.4 *convergence* verdict rides the 0f WAN run | L |
-| 4 | Decentralized scheduling (optional) | residual SPOF | L |
+| ~~4~~ ◑ | ~~Decentralized scheduling (control plane)~~ | **Control plane done** — residual SPOF (§1.8): leaderless HRW assignment, version-vector clock, owner-minted grants, Byzantine-owner quorum reads + cross-owner digest agreement + eviction, deterministic gossip-derived epochs, `schedule: decentralized` wiring; design + amendments in [phase4-design.md](phase4-design.md). The decentralized **worker loop** + its convergence ride 0f (like Phase 3); `examples/validate_decentralized.py` validates the read-side primitive | L |
 
 **Bottom line:** Phase 0 is the highest leverage-per-effort and is required no matter
 what; Phases 1–2 remove the bandwidth/SPOF wall; Phase 3 removes the trust wall.

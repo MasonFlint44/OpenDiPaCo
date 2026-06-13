@@ -107,6 +107,24 @@ def _ps_robustness_kw(cfg: LaunchConfig) -> dict:
                 private_policy=r.private_policy, private_quorum=r.private_quorum)
 
 
+def _decentralized_owner_kw(cfg: LaunchConfig) -> dict:
+    """Phase 4 knobs the owner gains in ``schedule.mode: decentralized``: it
+    becomes the path coordinator (mints grants, version-fences), hosts the
+    reputation / rate-limit gates, and cross-checks co-owners (quorum reads).
+    Empty in ``central`` mode — the scheduler keeps those jobs."""
+    if cfg.schedule.mode != "decentralized":
+        return {}
+    r, s, own = cfg.robustness, cfg.schedule, cfg.ownership
+    return dict(
+        schedule_mode="decentralized", salt=own.salt, k=own.k,
+        lease_ttl=s.lease_ttl, read_quorum=s.read_quorum, directory_ttl=cfg.tracker.ttl,
+        reputation=Reputation(floor=r.reputation_floor, credit=r.reputation_credit,
+                              debit=r.reputation_debit, decay_halflife=r.reputation_halflife),
+        rate_limiter=RateLimiter(capacity=r.rate_capacity,
+                                 refill_per_sec=r.rate_refill_per_sec),
+        min_owner_reputation=r.min_owner_reputation)
+
+
 def _advertise_host(cfg: LaunchConfig) -> str:
     """The address other peers dial for this owner: the explicit
     ``ownership.advertise_host``, else ``transport.connect_host``, else the
@@ -338,13 +356,17 @@ def run_parameter_server(cfg: LaunchConfig, shard_id: int = 0, *, port=None,
         resume_dir=resume_dir, **_ps_robustness_kw(cfg))
     if own.mode == "rendezvous":
         ident = _node_identity(cfg, identity, generate=True)
+        decentralized = cfg.schedule.mode == "decentralized"
+        # Decentralized: no scheduler to poll for epochs (they're gossip-derived).
+        sched_addr = None if decentralized else (scheduler_addr or cfg.connect_addr())
         ps = ParameterServer(
             model, [], diloco, port=port if port is not None else 0,
             identity=ident,
             scheduler_pub=scheduler_pub or cfg.transport.scheduler_pub,
-            scheduler_addr=scheduler_addr or cfg.connect_addr(),
+            scheduler_addr=sched_addr,
             replicate_interval=own.replicate_interval, bank_seed=own.bank_seed,
             peer_tls=build_tls_client(cfg),
+            **_decentralized_owner_kw(cfg),
             **common, **_server_kw(cfg, extra_admitted))
         ps.start()
         ps.start_tracker_heartbeat(
@@ -397,6 +419,15 @@ def run_local(cfg: LaunchConfig):
     scheduler + ``sharded.num_shards`` parameter servers + workers. Ephemeral ports are
     wired automatically. Returns ``(server, completed)`` for the driving server.
     """
+    if cfg.schedule.mode == "decentralized":
+        # Decentralized scheduling has no scheduler node and self-assigning
+        # workers; the single-process all-in-one driver (and the worker-loop
+        # rewire it needs) is the 0f integration step. Launch the owner / worker
+        # roles individually, or use examples/validate_decentralized.py.
+        raise ValueError(
+            "run_local does not yet drive schedule.mode: decentralized in one "
+            "process; launch owner/worker roles separately (see "
+            "examples/validate_decentralized.py and docs/phase4-design.md)")
     return _run_local_sharded(cfg) if cfg.mode == "sharded" else _run_local_coordinator(cfg)
 
 

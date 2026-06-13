@@ -16,6 +16,7 @@ from .reputation import Reputation
 from .quorum import confirm_version, divergent_peers, read_quorum_versions
 from .ownership import (
     EpochManager,
+    derive_epoch,
     make_epoch_record,
     owner_eligible,
     owners_for,
@@ -87,6 +88,7 @@ __all__ = [
     "owners_for",
     "make_epoch_record",
     "verify_epoch_record",
+    "derive_epoch",
     "rank_workers",
     "responsible_rank",
     "assignee",
