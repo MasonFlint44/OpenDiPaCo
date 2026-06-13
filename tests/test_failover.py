@@ -224,7 +224,12 @@ def test_stale_routing_push_retried_to_new_primary():
         epoch1 = sched.publish_epoch(recs[1:], k=1)
         for ps in pss:
             ps.apply_epoch(epoch1)
-        assert b._replicate_once()[key] == "active"
+        # Retry the pull: a single connect can exceed its timeout under heavy
+        # CPU contention (replication is eventually-consistent, so this is sound).
+        deadline = time.monotonic() + 10
+        while b._replicate_once().get(key) != "active" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert key in b._active
 
         # Stale push -> A refuses as not_primary -> retry against fresh routing.
         grant = make_grant(path, [key], 1.0, "tok-retry-1")

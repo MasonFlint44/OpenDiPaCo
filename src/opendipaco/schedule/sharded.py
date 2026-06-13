@@ -384,11 +384,18 @@ class ParameterServer(_ReactorServer):
     # -- private proposals (Phase 3d, policy D5/3a) ----------------------------
 
     def _private_proposal(self, msg: dict, peer_id: str | None = None) -> dict:
-        """An ungranted private-state *proposal* from a redundant-execution
-        checker. Inert until ``private_quorum`` distinct authenticated peers
-        agree on the exact state -- then the owner applies it."""
+        """A private-state *proposal* from a redundant-execution checker. It must
+        carry a **scheduler-issued check grant** (single-use, scoped to the
+        path's private keys), so only peers the scheduler actually assigned to
+        recompute this work can vote -- two colluding/Sybil peers can't fabricate
+        agreement by pushing matching garbage they never earned the right to
+        propose. Inert until ``private_quorum`` distinct grants agree on the
+        owner-computed digest."""
         if self.private_policy != "proposal":
             return {"type": "ack", "applied": False, "reason": "not_proposal_mode"}
+        grant = msg.get("grant")
+        if not verify_grant(grant, self.grant_key, scheduler_pub=self.scheduler_pub):
+            return {"type": "ack", "applied": False}  # unassigned -> no vote
         try:
             states = {k: v for k, v in (msg.get("private") or {}).items()
                       if is_private_key(k)}
@@ -397,26 +404,32 @@ class ParameterServer(_ReactorServer):
         if not all_finite(states):
             self.metrics.record_invalid_reject()
             return {"type": "ack", "applied": False}
+        token, allowed = grant["token"], set(grant["keys"])
         applied = []
         with self._lock:
+            if token in self._seen_grants:
+                return {"type": "ack", "applied": False}  # replay -> no double vote
+            self._seen_grants[token] = True
+            while len(self._seen_grants) > self._SEEN_GRANTS_MAX:
+                self._seen_grants.popitem(last=False)
             for k, sd in states.items():
-                if k in self.owned_keys and self._primary_locked(k):
-                    if self._record_private_proposal_locked(k, sd, peer_id):
+                if k in self.owned_keys and k in allowed and self._primary_locked(k):
+                    if self._record_private_proposal_locked(k, sd, token):
                         applied.append(k)
         return {"type": "ack", "applied": bool(applied)}
 
-    def _record_private_proposal_locked(self, key, state, peer_id) -> bool:
+    def _record_private_proposal_locked(self, key, state, token) -> bool:
         """Tally a private proposal by its *owner-computed* digest (a worker
-        can't lie about which state it proposed) and distinct authenticated
-        peer. Apply when ``private_quorum`` distinct peers agree. Returns
-        whether it applied. An anonymous (peer_id None) proposal is recorded
-        but can't itself complete a quorum (no distinct identity)."""
+        can't lie about which state it proposed) and the distinct scheduler
+        **grant token** that authorized it (so distinct votes mean distinct
+        scheduler-assigned recomputations, not just distinct identities). Apply
+        when ``private_quorum`` distinct grants agree. Returns whether it
+        applied."""
         digest = pseudograd_digest({key: list(state.values())})
         bucket = self._private_proposals.setdefault(key, {})
-        entry = bucket.setdefault(digest, {"state": state, "peers": set()})
-        if peer_id is not None:
-            entry["peers"].add(peer_id)
-        if len(entry["peers"]) >= self.private_quorum:
+        entry = bucket.setdefault(digest, {"state": state, "tokens": set()})
+        entry["tokens"].add(token)
+        if len(entry["tokens"]) >= self.private_quorum:
             self._record_history_locked(key)
             _load_into(self, key, state)  # corroborated -> authoritative
             self._bump_version_locked(key)
@@ -476,6 +489,14 @@ class ParameterServer(_ReactorServer):
                    if self._buffers.get(k) and now - ts >= self.quorum_timeout]
             for k in due:
                 self._flush_buffer_locked(k)
+
+    def _flush_all_buffers_locked(self) -> None:
+        """Apply every pending robust buffer now. Called before persisting or
+        shutting down: buffered contributions were already *accepted* (the
+        scheduler advanced its clock), so dropping them on a checkpoint/resume
+        or an early stop would lose committed training work."""
+        for k in list(self._buffers):
+            self._flush_buffer_locked(k)
 
     def _fetch(self, msg: dict, peer_id: str | None = None) -> dict:
         have = msg.get("have", {})
@@ -776,6 +797,8 @@ class ParameterServer(_ReactorServer):
 
     def shutdown(self) -> None:
         self._repl_stop.set()
+        with self._lock:
+            self._flush_all_buffers_locked()  # don't drop accepted-but-buffered work
         for s in self._peer_conns.values():
             try:
                 s.close()
@@ -847,7 +870,9 @@ class ParameterServer(_ReactorServer):
                     continue
                 if self.private_policy == "proposal":
                     # Hold as a proposal; apply only on quorum agreement (D5/3a).
-                    self._record_private_proposal_locked(k, sd, peer_id)
+                    # The primary's own (verified, single-use) commit grant is
+                    # its vote, counted alongside the checkers' check grants.
+                    self._record_private_proposal_locked(k, sd, grant["token"])
                     n_applied += 1
                     continue
                 self._record_history_locked(k)  # retain pre-store base for auditors
@@ -880,6 +905,7 @@ class ParameterServer(_ReactorServer):
         os.makedirs(dirpath, exist_ok=True)
         saved = {}
         with self._lock:
+            self._flush_all_buffers_locked()  # don't checkpoint accepted-but-buffered work away
             blobs = {}
             for k in self.bank:
                 v = self._versions.get(k, (0, 0))
@@ -923,6 +949,7 @@ class ParameterServer(_ReactorServer):
         to ``dir/shard_<stable-hash>.pt``."""
         os.makedirs(dirpath, exist_ok=True)
         with self._lock:
+            self._flush_all_buffers_locked()  # persist accepted-but-buffered work
             blob = {"weights": {k: _state_to_cpu(m.state_dict()) for k, m in self.bank.items()},
                     "versions": dict(self._versions),
                     "outer_opts": {k: _optimizer_state_to_cpu(o.state_dict())
@@ -1182,7 +1209,8 @@ class Scheduler(_ReactorServer):
             self._reclaim_inflight_locked()
             member = peer_id or wid
             eligible = [p for p in self._completed if p not in self._inflight]
-            check_only, base, audit, check_private = False, None, False, False
+            check_only, base, audit, check_private, check_grant = (
+                False, None, False, False, None)
             rep = self.reputation.get(peer_id)
             if not eligible:
                 # No primary work: absorb the surplus as a redundant check for an
@@ -1192,8 +1220,8 @@ class Scheduler(_ReactorServer):
                     return self._idle()
                 if not self.rate_limiter.allow(peer_id, reputation=rep):
                     return self._idle()
-                path, generation, base, lease, check_private = self._reserve_check_locked(
-                    cand, member)
+                (path, generation, base, lease, check_private,
+                 check_grant) = self._reserve_check_locked(cand, member)
                 check_only = True
             else:
                 # Rate limit only the *expensive* path (issuing a task with a
@@ -1253,6 +1281,7 @@ class Scheduler(_ReactorServer):
             task["check_only"], task["base"] = True, base
             if check_private:  # also submit private proposals to the owners
                 task["private_proposal"] = True
+                task["grant"] = check_grant  # authorizes the proposal at the owner
         elif audit:
             task["audit"] = True
         return task
@@ -1273,14 +1302,35 @@ class Scheduler(_ReactorServer):
         a = self._audits[key]
         a["members"].add(member)
         path, generation = key
-        return path, generation, a["base"], uuid.uuid4().hex, bool(a.get("private"))
+        lease = uuid.uuid4().hex
+        # Record the issued lease so only this assigned checker's result counts
+        # (a peer can't fabricate audit votes by guessing an open audit).
+        a.setdefault("check_leases", {})[member] = lease
+        grant = None
+        if a.get("private"):
+            # A scheduler-signed grant scoped to the path's private keys lets the
+            # owner accept this checker's private proposal as a real vote.
+            private_keys = [k for k in self.topology.path_module_keys(path)
+                            if is_private_key(k)]
+            grant = make_grant(path, private_keys, 0.0, lease, self.grant_key,
+                               identity=self.identity)
+        return path, generation, a["base"], lease, bool(a.get("private")), grant
 
     def _commit_check(self, msg: dict, peer_id: str | None = None) -> dict:
-        """Record a checker's digest against its audit; resolve if complete."""
+        """Record a checker's digest against its audit; resolve if complete.
+
+        Only a result from a peer that was *reserved* as a checker for this
+        audit, echoing its issued lease, and voting once, is counted -- so an
+        unassigned peer can't manufacture the reputation verdict by spamming
+        ``check_only`` commits."""
         key = (tuple(msg.get("path") or ()), msg.get("gen_id"))
+        member = peer_id or msg.get("worker_id")
         with self._lock:
             a = self._audits.get(key)
-            if a is not None and not a.get("resolved"):
+            if (a is not None and not a.get("resolved")
+                    and a.get("check_leases", {}).get(member) == msg.get("lease")
+                    and member not in a.setdefault("checked", set())):
+                a["checked"].add(member)  # one vote per assigned checker
                 a["checks"].append((peer_id, msg.get("digest")))
                 self._maybe_resolve_audit_locked(key, time.monotonic())
         return {"type": "commit_ack", "check": True}
@@ -1741,7 +1791,8 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
                 for addr, states in by_owner.items():
                     try:
                         _rpc(ps_sock(addr),
-                             {"type": "private_proposal", "private": states}, max_msg_bytes)
+                             {"type": "private_proposal", "private": states,
+                              "grant": task.get("grant")}, max_msg_bytes)
                     except (OSError, ConnectionError):
                         ps_conns.pop(addr, None)  # owner away; corroboration just waits
             engine._opt_state.pop(path, None)  # leave no warm trace of the check

@@ -127,9 +127,46 @@ def _audit_primary(sched, peer, digest, base=None):
 
 
 def _check(sched, key, peer, digest):
+    """Reserve a checker slot (as _next_task's oversupply branch does), then
+    commit its result echoing the issued lease -- only an assigned checker's
+    vote counts."""
     path, gen = key
+    with sched._lock:
+        _, _, _, lease, _, _ = sched._reserve_check_locked(key, peer)
     sched._commit_check({"check_only": True, "path": list(path), "gen_id": gen,
-                         "digest": digest}, peer_id=peer)
+                         "digest": digest, "lease": lease, "worker_id": peer},
+                        peer_id=peer)
+
+
+def test_unassigned_check_commit_is_ignored():
+    """A peer that wasn't reserved as a checker can't manufacture the verdict by
+    spamming check_only commits (Codex P1): unassigned/forged-lease results
+    don't count toward the audit."""
+    sched = _serving(redundancy=3, redundancy_rate=1.0)
+    try:
+        key = _audit_primary(sched, "P", "X")
+        # An unassigned peer with a guessed lease -- ignored, audit stays open.
+        for i in range(5):
+            sched._commit_check({"check_only": True, "path": list(key[0]),
+                                 "gen_id": key[1], "digest": "FORGED",
+                                 "lease": f"guess{i}", "worker_id": "ATTACKER"},
+                                peer_id="ATTACKER")
+        assert key in sched._audits and not sched._audits[key]["checks"]
+        # A reserved checker echoing the wrong lease also doesn't count.
+        with sched._lock:
+            _, _, _, real_lease, _, _ = sched._reserve_check_locked(key, "C1")
+        sched._commit_check({"check_only": True, "path": list(key[0]), "gen_id": key[1],
+                             "digest": "X", "lease": "wrong", "worker_id": "C1"},
+                            peer_id="C1")
+        assert not sched._audits[key]["checks"]
+        # The same checker can't double-vote with its real lease either.
+        for _ in range(3):
+            sched._commit_check({"check_only": True, "path": list(key[0]), "gen_id": key[1],
+                                 "digest": "X", "lease": real_lease, "worker_id": "C1"},
+                                peer_id="C1")
+        assert len(sched._audits[key]["checks"]) == 1
+    finally:
+        sched.shutdown()
 
 
 def test_audit_all_agree_credits_everyone():
@@ -240,6 +277,9 @@ def _priv_cfg():
 
 def _priv_ps(**kw):
     cfg = _priv_cfg()
+    # grant_key set so proposals must carry a *real* scheduler grant (forged /
+    # replayed ones are refused) -- the gate that binds proposals to assignments.
+    kw.setdefault("grant_key", "sched-secret")
     return ParameterServer(cfg, sorted(cfg.build_topology().module_keys()),
                            DiLoCoConfig(inner_steps=4), host="127.0.0.1", port=0, **kw)
 
@@ -248,9 +288,13 @@ def _private_state(ps, key, fill):
     return {n: torch.full_like(p, fill) for n, p in ps.bank[key].state_dict().items()}
 
 
+def _grant(path, k, token):
+    return make_grant(path, [k], 0.0, token, grant_key="sched-secret")
+
+
 def test_proposal_applies_only_on_quorum_agreement():
     """Under the proposal policy a private push is inert until ``private_quorum``
-    distinct peers agree on the exact state; then it applies."""
+    distinct scheduler-issued grants agree on the exact state; then it applies."""
     ps = _priv_ps(private_policy="proposal", private_quorum=2)
     try:
         k = next(x for x in ps.owned_keys if is_private_key(x))
@@ -258,14 +302,12 @@ def test_proposal_applies_only_on_quorum_agreement():
         v0 = ps._versions[k]
         good = _private_state(ps, k, 1.0)
 
-        # First proposal (one peer) -> held, nothing applied.
-        ps._push({"grant": make_grant(path, [k], 1.0, "g1"), "private": {k: good}},
-                 peer_id="A")
+        # The primary's granted push -> held as one vote, nothing applied yet.
+        ps._push({"grant": _grant(path, k, "primary"), "private": {k: good}}, peer_id="A")
         assert ps._versions[k] == v0
-        assert not torch.equal(next(iter(ps.bank[k].parameters())).detach(),
-                               torch.full_like(next(iter(ps.bank[k].parameters())), 1.0))
-        # A second *distinct* peer proposing the same state -> quorum -> applied.
-        ps._private_proposal({"private": {k: good}}, peer_id="B")
+        # A checker's proposal with a *distinct* grant agreeing -> quorum -> applied.
+        ps._private_proposal({"private": {k: good}, "grant": _grant(path, k, "check1")},
+                             peer_id="B")
         assert ps._versions[k] > v0
         assert all(torch.equal(p.detach(), torch.full_like(p, 1.0))
                    for p in ps.bank[k].parameters())
@@ -273,38 +315,40 @@ def test_proposal_applies_only_on_quorum_agreement():
         ps.shutdown()
 
 
-def test_lone_or_self_corroborated_proposal_never_applies():
-    """A single peer (even repeating, even via the proposal channel) can't reach
-    quorum: a malicious owner-path worker can at most stall its private module,
-    never poison it."""
+def test_lone_or_forged_proposal_never_applies():
+    """One assigned actor holds one grant; replaying it or forging a second
+    can't reach quorum -- a malicious owner-path worker can at most stall its
+    private module, never poison it."""
     ps = _priv_ps(private_policy="proposal", private_quorum=2)
     try:
         k = next(x for x in ps.owned_keys if is_private_key(x))
         path = ps._topology.paths_through_module(k)[0]
         v0 = ps._versions[k]
         bad = _private_state(ps, k, 9.0)
-        for _ in range(5):  # same peer, repeated -> still one distinct identity
-            ps._push({"grant": make_grant(path, [k], 1.0, "g"), "private": {k: bad}},
-                     peer_id="ATTACKER")
-            ps._private_proposal({"private": {k: bad}}, peer_id="ATTACKER")
-        assert ps._versions[k] == v0          # never applied -> not poisoned
-        # An anonymous proposal can't complete a quorum either (no distinct id).
-        ps._private_proposal({"private": {k: bad}}, peer_id=None)
+        ps._push({"grant": _grant(path, k, "primary"), "private": {k: bad}}, peer_id="ATK")
+        for _ in range(5):  # replay the same grant -> rejected, no second vote
+            ps._private_proposal({"private": {k: bad}, "grant": _grant(path, k, "primary")},
+                                 peer_id="ATK")
         assert ps._versions[k] == v0
+        # A forged grant (wrong key) is refused outright -- can't conjure a vote.
+        forged = make_grant(path, [k], 0.0, "forged", grant_key="wrong")
+        ps._private_proposal({"private": {k: bad}, "grant": forged}, peer_id="ATK2")
+        assert ps._versions[k] == v0          # never applied -> not poisoned
     finally:
         ps.shutdown()
 
 
 def test_disagreeing_proposals_do_not_corroborate():
-    """Two peers proposing *different* states don't form a quorum on either."""
+    """Two distinct grants proposing *different* states form a quorum on neither."""
     ps = _priv_ps(private_policy="proposal", private_quorum=2)
     try:
         k = next(x for x in ps.owned_keys if is_private_key(x))
         path = ps._topology.paths_through_module(k)[0]
         v0 = ps._versions[k]
-        ps._push({"grant": make_grant(path, [k], 1.0, "g"),
+        ps._push({"grant": _grant(path, k, "primary"),
                   "private": {k: _private_state(ps, k, 1.0)}}, peer_id="A")
-        ps._private_proposal({"private": {k: _private_state(ps, k, 2.0)}}, peer_id="B")
+        ps._private_proposal({"private": {k: _private_state(ps, k, 2.0)},
+                              "grant": _grant(path, k, "check1")}, peer_id="B")
         assert ps._versions[k] == v0          # no two agree -> nothing applied
     finally:
         ps.shutdown()
@@ -317,7 +361,7 @@ def test_overwrite_policy_applies_verbatim():
         k = next(x for x in ps.owned_keys if is_private_key(x))
         path = ps._topology.paths_through_module(k)[0]
         v0 = ps._versions[k]
-        ps._push({"grant": make_grant(path, [k], 1.0, "g"),
+        ps._push({"grant": _grant(path, k, "g"),
                   "private": {k: _private_state(ps, k, 1.0)}}, peer_id="A")
         assert ps._versions[k] > v0           # verbatim, no corroboration needed
     finally:
