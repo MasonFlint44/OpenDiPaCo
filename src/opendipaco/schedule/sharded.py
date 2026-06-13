@@ -51,6 +51,7 @@ from .compress import (
     maybe_dequantize,
     pseudograd_digest,
     restore_shard,
+    state_digest,
 )
 from .distributed import (
     _build_worker_engine,
@@ -64,9 +65,12 @@ from .aggregate import check_aggregate, robust_delta
 from .guard import all_finite, clip_norm_, loss_ok
 from .ratelimit import RateLimiter
 from .reputation import Reputation
-from .identity import sign_record, verify_record
+from .assignment import coordinator_key, is_assignee, path_primary, version_lag
+from .quorum import confirm_version, divergent_peers, read_quorum_versions, valid_report
+from .identity import peer_id_of, sign_record, verify_record
 from .ownership import (
     EpochManager,
+    derive_epoch,
     epoch_newer,
     make_epoch_record,
     owners_for,
@@ -148,6 +152,22 @@ def verify_grant(grant, grant_key, *, scheduler_pub: str | None = None) -> bool:
     return hmac.compare_digest(grant.get("mac", ""), expected)
 
 
+def grant_signed_by(grant, expected_peer_id: str | None) -> bool:
+    """Decentralized grant check (Phase 4 D3): an Ed25519 grant signed by exactly
+    ``expected_peer_id`` — the path's primary owner, who mints the grant in place
+    of the (absent) scheduler. Co-owners derive ``expected_peer_id`` from the
+    epoch record, so no shared secret and no central signer are involved; an
+    HMAC/unsigned grant or a grant from any other identity is refused."""
+    if not isinstance(grant, dict) or not grant.get("token") or expected_peer_id is None:
+        return False
+    if not (verify_record(grant) and grant.get("kind") == "grant"):
+        return False
+    try:
+        return peer_id_of(grant.get("pub", "")) == expected_peer_id
+    except (ValueError, TypeError):
+        return False
+
+
 def _opt_to_wire(sd: dict) -> dict:
     """Optimizer state_dicts key their ``state`` by parameter *index* (int) --
     the wire codec only takes str dict keys, so stringify for transport."""
@@ -164,6 +184,18 @@ def _version_pair(v) -> tuple:
     """Coerce a stored version to the (epoch, counter) pair form (Phase 2b);
     pre-pair checkpoints stored bare ints, which were all epoch-0."""
     return tuple(v) if isinstance(v, (tuple, list)) else (0, int(v))
+
+
+def _safe_version(v):
+    """A *wire* version coerced to an (epoch, counter) pair, or None if
+    malformed. Decentralized sources may be Byzantine (Phase 4), so a bad
+    version in a fetch reply must be ignored — not crash the replication pass
+    (which would skip gossip/audit too). Well-formed pairs are unchanged, so the
+    central/rendezvous path behaves exactly as before."""
+    if (isinstance(v, (list, tuple)) and len(v) == 2
+            and all(isinstance(x, int) and not isinstance(x, bool) for x in v)):
+        return (int(v[0]), int(v[1]))
+    return None
 
 
 # -- parameter server --------------------------------------------------------
@@ -205,7 +237,12 @@ class ParameterServer(_ReactorServer):
                  peer_auth=None, peer_tls=None, bootstrap=True, bank_seed=0,
                  scheduler_addr=None, robustness="off", quorum_target=3,
                  quorum_timeout=30.0, aggregate="trimmed_mean", version_history=1,
-                 private_policy="overwrite", private_quorum=2, **reactor_kw):
+                 private_policy="overwrite", private_quorum=2,
+                 schedule_mode="central", salt="", lease_ttl=30.0, worker_set=None,
+                 corpus_weights=None, reputation=None, rate_limiter=None,
+                 min_owner_reputation=0.25, staleness_bound=None,
+                 staleness_weight="inverse", read_quorum=2, k=3,
+                 directory_ttl=120.0, **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.config = config
         self.diloco = diloco
@@ -264,7 +301,8 @@ class ParameterServer(_ReactorServer):
         if epoch_record is not None:
             if self.peer_id is None:
                 raise ValueError("epoch_record= needs identity=")
-            if not verify_epoch_record(epoch_record):
+            if not verify_epoch_record(
+                    epoch_record, allow_deterministic=(schedule_mode == "decentralized")):
                 raise ValueError("invalid epoch record")
             self._epoch = epoch_record
             self._epoch_num = epoch_record["epoch"]
@@ -320,6 +358,45 @@ class ParameterServer(_ReactorServer):
             elif os.path.exists(os.path.join(resume_dir, self._shard_name())):
                 self.load_shard(resume_dir)  # restart this shard from a checkpoint
 
+        # Decentralized coordination (Phase 4, design D2/D3/D5): with no
+        # scheduler, each path's *primary owner of its coordinator key* becomes
+        # that path's coordinator -- it tracks the path's generation counter
+        # (the version-fence), mints the Ed25519 commit grant (signed with its
+        # own identity, verified by co-owners against the epoch record), and
+        # hosts the reputation / rate-limit gates for commits it serves. All off
+        # in ``central`` mode, which leaves the scheduler the trust root.
+        if schedule_mode not in ("central", "decentralized"):
+            raise ValueError(f"schedule_mode must be 'central' or 'decentralized', "
+                             f"got {schedule_mode!r}")
+        self.schedule_mode = schedule_mode
+        self.salt = salt
+        self.lease_ttl = float(lease_ttl)
+        # () -> iterable of live worker peer-ids (the gossiped directory in 4d);
+        # None -> skip the HRW-assignee check and rely on the version-fence alone.
+        self.worker_set = worker_set
+        # path_index -> alpha shard weight (from the data spec's token counts);
+        # absent entries default to 1.0 (uniform).
+        self.corpus_weights = dict(corpus_weights or {})
+        self.reputation = reputation if reputation is not None else Reputation()
+        self.rate_limiter = rate_limiter if rate_limiter is not None else RateLimiter()
+        self.min_owner_reputation = min_owner_reputation
+        self.staleness_weight = staleness_weight
+        self.staleness_bound = (staleness_bound if staleness_bound is not None
+                                else 2 * len(self._topology.paths()))
+        # Replicas a read cross-checks before trusting bytes, and the agreement
+        # threshold for confirming a version / flagging a divergent owner (4c).
+        self.read_quorum = max(1, int(read_quorum))
+        # Decentralized epochs are derived from a gossiped directory, not signed
+        # by a scheduler (D6): k + a self-certifying peer directory (peer_id ->
+        # record) the owner imports from co-owners and the seed tracker.
+        self._k = max(1, int(k))
+        self.directory_ttl = float(directory_ttl)
+        self._directory: dict = {}   # peer_id -> verified peer record (TTL-pruned)
+        self._self_record = None     # this owner's own peer record, gossiped onward
+        self._seed_addr = None       # bootstrap tracker (gossip survives its loss)
+        # path tuple -> [generation, opened_at] (the per-path clock + fence).
+        self._gen: dict = {}
+
     @staticmethod
     def _owner_ids(key, record) -> set:
         return {o["peer_id"] for o in owners_for(key, record)}
@@ -330,6 +407,14 @@ class ParameterServer(_ReactorServer):
             return self._fetch(msg, peer_id)
         if kind == "push":
             return self._push(msg, peer_id)
+        if kind == "commit":  # decentralized: this owner coordinates the path
+            return self._commit(msg, peer_id)
+        if kind == "generation":  # decentralized: report a path's current (g, opened_at)
+            return self._generation(msg)
+        if kind == "digest":  # decentralized: cheap (version, content-digest) for quorum reads
+            return self._digests(msg)
+        if kind == "directory":  # decentralized: gossip the peer directory (tracker = seed)
+            return self._directory_rpc(msg)
         if kind == "private_proposal":
             return self._private_proposal(msg, peer_id)
         if kind == "checkpoint":
@@ -588,7 +673,11 @@ class ParameterServer(_ReactorServer):
         """
         if self.peer_id is None:
             raise RuntimeError("apply_epoch needs identity=")
-        if not verify_epoch_record(record):
+        # Decentralized epochs are signer-less and derived by recomputation
+        # (D6), so accept a well-formed deterministic record; central/rendezvous
+        # epochs still require the scheduler's signature.
+        if not verify_epoch_record(
+                record, allow_deterministic=(self.schedule_mode == "decentralized")):
             raise ValueError("invalid epoch record")
         if bootstrap is None:
             bootstrap = bool(record.get("bootstrap"))
@@ -647,6 +736,9 @@ class ParameterServer(_ReactorServer):
                 self._sweep_buffers()  # flush quorum buffers past their timeout
                 self._poll_epoch()
                 self._replicate_once()
+                if self.schedule_mode == "decentralized":
+                    self._gossip_once()         # directory gossip + re-derive epoch (4d)
+                    self._audit_digests_once()  # cross-check co-owners' digests (4c)
             except Exception:  # noqa: BLE001 -- a peer mid-restart must not kill the puller
                 pass
 
@@ -707,6 +799,19 @@ class ParameterServer(_ReactorServer):
                     self._active.add(k)
                     results[k] = "active"
             was_active = set(self._active)
+        # Decentralized safety (Codex P1): a Byzantine source can serve a poisoned
+        # higher version; adopting it blindly would let it reach read-quorum (the
+        # source + the deceived backup) and be *confirmed* before the audit runs.
+        # So in decentralized mode never mutate local state to a version whose
+        # (version, digest) isn't already agreed by a quorum of the key's
+        # replicas -- an unconfirmed higher version is left for a later pass.
+        confirmed: dict = {}
+        if self.schedule_mode == "decentralized" and epoch is not None and candidates:
+            addrs = sorted({tuple(o["addr"]) for k in candidates
+                            for o in owners_for(k, epoch)})
+            confirmed = read_quorum_versions(
+                addrs, list(candidates), self.read_quorum,
+                lambda a, m: self._peer_rpc(a, m))
         served: set = set()
         pending = dict(candidates)
         while pending:
@@ -727,11 +832,20 @@ class ParameterServer(_ReactorServer):
                     if k not in self.bank:  # trimmed by a concurrent apply_epoch
                         pending.pop(k, None)
                         continue
-                    v = answers.get(k)
+                    v = _safe_version(answers.get(k))  # ignore a Byzantine source's malformed version
                     if v is not None:
-                        v = tuple(v)
                         if v > self._versions[k]:
                             sd = (reply.get("weights") or {}).get(k)
+                            # Decentralized: adopt only quorum-confirmed bytes
+                            # (the offered version's digest must match what a
+                            # quorum of replicas agreed, so poison can't sneak in
+                            # via a single source). Central/rendezvous: trust the
+                            # authoritative source as before (Phase 2).
+                            if sd is not None and self.schedule_mode == "decentralized":
+                                c = confirmed.get(k)
+                                if not (c is not None and tuple(c[0]) == v
+                                        and state_digest(sd) == c[1]):
+                                    sd = None  # unconfirmed -> leave for a later pass
                             if sd is not None:
                                 self.bank[k].load_state_dict(
                                     {n: t.to(self.device) for n, t in sd.items()})
@@ -770,13 +884,21 @@ class ParameterServer(_ReactorServer):
         """
         if self.identity is None:
             raise RuntimeError("start_tracker_heartbeat needs identity=")
-        from .tracker import register_peer  # lazy: tracker imports this module
+        from .tracker import make_peer_record, register_peer  # lazy: tracker imports this
 
         addr = tuple(tracker_addr)
+        # The tracker is the bootstrap seed for gossip (D7); a fresh self-record
+        # is what this owner gossips onward so its membership propagates even
+        # after the tracker is gone.
+        self._seed_addr = addr
 
         def beat():
             while not (self._stop or self._dead):
                 try:
+                    self._self_record = make_peer_record(
+                        self.identity, reachability="public",
+                        addr=(advertise_host, self.port), roles=roles,
+                        capabilities=capabilities)
                     register_peer(addr, self.identity, reachability="public",
                                   peer_addr=(advertise_host, self.port), roles=roles,
                                   capabilities=capabilities, auth_key=auth_key, tls=tls)
@@ -816,9 +938,272 @@ class ParameterServer(_ReactorServer):
         self._peer_conns.clear()
         super().shutdown()
 
+    # -- decentralized coordination (Phase 4 D2/D3/D5) -------------------------
+
+    def _coordinates_locked(self, path) -> bool:
+        """Is this owner the coordinator for ``path`` -- the active primary of
+        the path's :func:`coordinator_key`? Only the coordinator advances the
+        path's generation and mints its grants."""
+        if self.schedule_mode != "decentralized" or self._epoch is None:
+            return False
+        ck = coordinator_key(self._topology.path_module_keys(path))
+        return self._primary_locked(ck)
+
+    def _generation(self, msg: dict) -> dict:
+        """Report a coordinated path's current generation, so a self-assigning
+        worker knows which generation to commit (the version-fence value)."""
+        try:
+            path = tuple(msg["path"])
+        except (KeyError, TypeError):
+            return {"type": "generation", "ok": False}
+        with self._lock:
+            if not self._coordinates_locked(path):
+                return {"type": "generation", "ok": False, "epoch": self._epoch_num}
+            g, _ = self._gen.setdefault(path, [0, time.monotonic()])
+            return {"type": "generation", "ok": True, "generation": g,
+                    "epoch": self._epoch_num, "lease_ttl": self.lease_ttl,
+                    "staleness_bound": self.staleness_bound}
+
+    def _commit(self, msg: dict, peer_id: str | None = None) -> dict:
+        """A self-assigned worker commits ``(path, generation)`` to its
+        coordinator (this owner), which version-fences the slot, verifies the
+        worker is the HRW assignee, gates on reputation/rate-limit/loss/staleness
+        exactly as the central scheduler did, then **mints an Ed25519 grant
+        signed with its own identity** (the path's co-owners verify it against
+        the epoch record). Replaces ``Scheduler._commit`` in decentralized mode;
+        the central path is untouched."""
+        if self.schedule_mode != "decentralized":
+            return {"type": "commit_ack", "accepted": False, "reason": "not_decentralized"}
+        try:
+            path = tuple(msg["path"])
+        except (KeyError, TypeError):
+            return {"type": "commit_ack", "accepted": False}
+        rep_outcome = None  # True credit (accepted) / False debit (bad loss) / None neutral
+        try:
+            with self._lock:
+                if not self._coordinates_locked(path):
+                    return {"type": "commit_ack", "accepted": False,
+                            "reason": "not_coordinator", "epoch": self._epoch_num}
+                entry = self._gen.setdefault(path, [0, time.monotonic()])
+                g, opened = entry
+                if msg.get("generation") != g:
+                    # Version-fence: the slot already advanced (someone committed
+                    # this generation) or the worker is stale -> dropped commit.
+                    return {"type": "commit_ack", "accepted": False,
+                            "reason": "stale_generation", "generation": g}
+                # HRW-assignee check: load distribution + anti-grab. Skipped when
+                # no worker directory is available, leaving the fence as the gate.
+                member = peer_id or msg.get("worker_id")
+                workers = list(self.worker_set() or []) if self.worker_set else []
+                if workers and not is_assignee(
+                        member, path, g, workers, salt=self.salt,
+                        elapsed=time.monotonic() - opened, lease_ttl=self.lease_ttl):
+                    return {"type": "commit_ack", "accepted": False, "reason": "not_assignee"}
+                rep = self.reputation.get(peer_id)
+                if not self.rate_limiter.allow(peer_id, reputation=rep):
+                    return {"type": "commit_ack", "accepted": False, "reason": "throttled"}
+                if not loss_ok(msg.get("loss"), empty=bool(msg.get("empty"))):
+                    self.metrics.record_invalid_reject()
+                    rep_outcome = False
+                    return {"type": "commit_ack", "accepted": False, "reason": "bad_loss"}
+                # Staleness = version-vector lag over the path keys this owner
+                # holds (>= the coordinator key, whose counter tracks this path's
+                # generations). Cross-epoch / remapped base -> drop (Phase 2
+                # failover semantics).
+                base = {k: v for k, v in (msg.get("base_versions") or {}).items()
+                        if k in self._versions}
+                lag = version_lag(base, {k: self._versions[k] for k in base})
+                if lag is None or lag > self.staleness_bound:
+                    self.metrics.record_stale_reject()
+                    return {"type": "commit_ack", "accepted": False, "reason": "stale"}
+                entry[0], entry[1] = g + 1, time.monotonic()  # fence closes, slot reopens
+                damp = 1.0 / (1.0 + lag) if self.staleness_weight == "inverse" else 1.0
+                push_weight = self.corpus_weights.get(self._topology.path_index(path), 1.0) * damp
+                grant = make_grant(path, self._topology.path_module_keys(path),
+                                   push_weight, uuid.uuid4().hex, identity=self.identity)
+                self.metrics.record_update(lag)
+                rep_outcome = True
+                return {"type": "commit_ack", "accepted": True, "generation": g + 1,
+                        "push_weight": push_weight, "grant": grant}
+        finally:
+            if rep_outcome is True:
+                self.reputation.credit(peer_id)
+            elif rep_outcome is False:
+                self.reputation.debit(peer_id)
+
+    def _digests(self, msg: dict) -> dict:
+        """Cheap ``{key: [version, content-digest]}`` for this owner's active
+        keys, so a reader cross-checks across replicas (quorum reads) without
+        pulling weights. States are snapshotted under the lock and hashed
+        outside it."""
+        requested = msg.get("keys")
+        with self._lock:
+            sel = set(requested) & self._active if requested else set(self._active)
+            snap = {k: (self._versions[k], _state_to_cpu(self.bank[k].state_dict()))
+                    for k in sel if k in self.bank}
+            epoch = self._epoch_num
+        digests = {k: [list(v), state_digest(sd)] for k, (v, sd) in snap.items()}
+        return {"type": "digest", "digests": digests, "epoch": epoch}
+
+    def _apply_digest_audit(self, reports_by_key: dict) -> dict:
+        """Confirm each key's value by quorum and debit the owner-behaviour
+        reputation of any replica whose digest at the confirmed version
+        contradicts the majority (design D4). ``reports_by_key`` is
+        ``{key: {peer_id: (version, digest)}}``; returns the flagged peers per
+        key. Pure given the reports, so the network gather (below) and tests
+        share one rule."""
+        flagged: dict = {}
+        for k, reports in reports_by_key.items():
+            confirmed = confirm_version(list(reports.values()), self.read_quorum)
+            bad = divergent_peers(reports, confirmed)
+            for pid in bad:
+                self.reputation.debit(pid)  # owner-behaviour debit -> eviction (4d)
+            if bad:
+                flagged[k] = bad
+        return flagged
+
+    def _audit_digests_once(self) -> dict:
+        """Gather co-owners' digests for the keys this owner holds and audit
+        them (decentralized replication-loop step). A co-owner mid-restart that
+        doesn't answer simply isn't in the tally — no false blame."""
+        if self.schedule_mode != "decentralized" or self._epoch is None or self.peer_id is None:
+            return {}
+        with self._lock:
+            epoch = self._epoch
+            keys = sorted(self.owned_keys & self._active)
+            snap = {k: (self._versions[k], _state_to_cpu(self.bank[k].state_dict()))
+                    for k in keys if k in self.bank}
+        reports: dict = {k: {self.peer_id: (tuple(v), state_digest(sd))}
+                         for k, (v, sd) in snap.items()}
+        by_peer: dict = {}  # peer_id -> (addr, [keys it co-owns with us])
+        for k in reports:
+            for o in owners_for(k, epoch):
+                if o["peer_id"] == self.peer_id:
+                    continue
+                by_peer.setdefault(o["peer_id"], (tuple(o["addr"]), []))[1].append(k)
+        for pid, (addr, ks) in by_peer.items():
+            try:
+                reply = self._peer_rpc(addr, {"type": "digest", "keys": ks})
+            except (OSError, ConnectionError):
+                reply = None
+            for k, vd in ((reply or {}).get("digests") or {}).items():
+                r = valid_report(vd)  # drop a Byzantine co-owner's malformed report
+                if k in reports and r is not None:
+                    reports[k][pid] = r
+        return self._apply_digest_audit(reports)
+
+    # -- directory gossip + deterministic epochs (Phase 4 D6/D7) ---------------
+
+    @staticmethod
+    def _issued_at(record) -> float | None:
+        """A record's ``issued_at`` if it is a real number, else None.
+        ``verify_record`` only checks the signature, so a validly-signed but
+        malformed record (non-numeric ``issued_at``) must be rejected before any
+        TTL arithmetic (Codex P2) -- otherwise one bad record aborts gossip."""
+        ts = record.get("issued_at")
+        return float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else None
+
+    def _prune_directory_locked(self, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        for p in [p for p, r in self._directory.items()
+                  if (t := self._issued_at(r)) is None or now - t > self.directory_ttl]:
+            del self._directory[p]
+
+    def import_directory(self, records, *, now: float | None = None) -> int:
+        """Merge gossiped peer records into the local directory (newest
+        ``issued_at`` wins; expired/malformed records are dropped). Each record
+        is self-certifying, so importing from any peer is safe -- this is how the
+        swarm's membership survives the tracker (design D7)."""
+        now = time.time() if now is None else now
+        added = 0
+        with self._lock:
+            for r in records:
+                if not (isinstance(r, dict) and verify_record(r) and r.get("kind") == "peer"):
+                    continue
+                pid = r.get("peer_id")
+                ts = self._issued_at(r)
+                if not isinstance(pid, str) or ts is None or now - ts > self.directory_ttl:
+                    continue
+                cur = self._directory.get(pid)
+                if cur is None or ts > self._issued_at(cur):
+                    self._directory[pid] = r
+                    added += 1
+            self._prune_directory_locked(now)
+        return added
+
+    def _directory_rpc(self, msg: dict) -> dict:
+        """Serve this owner's directory view (its own record first) so a peer can
+        gossip from it -- the tracker is only a bootstrap seed."""
+        with self._lock:
+            self._prune_directory_locked()
+            recs = [r for r in self._directory.values() if r["peer_id"] != self.peer_id]
+            if self._self_record is not None:
+                recs.append(self._self_record)
+        return {"type": "directory", "records": recs}
+
+    def derive_and_apply_epoch(self):
+        """Derive the epoch deterministically from the local directory (D6) and
+        adopt it if newer. The reputation gate excludes owners debited for
+        divergence (4c) -- this is the eviction step. Returns the live record."""
+        if self.schedule_mode != "decentralized" or self.peer_id is None:
+            return None
+        with self._lock:
+            self._prune_directory_locked()
+            recs = [r for r in self._directory.values() if r["peer_id"] != self.peer_id]
+            if self._self_record is not None:
+                recs.append(self._self_record)
+            prev = self._epoch
+        record = derive_epoch(
+            recs, k=self._k, salt=self.salt, prev=prev,
+            is_eligible=lambda pid: self.reputation.eligible(pid, self.min_owner_reputation))
+        if prev is None or epoch_newer(record, prev):
+            self.apply_epoch(record)
+            return record
+        return prev
+
+    def _gossip_once(self) -> None:
+        """Pull directories from the seed tracker + current co-owners, import
+        them, and re-derive the epoch (decentralized replication-loop step)."""
+        if self.schedule_mode != "decentralized" or self.peer_id is None:
+            return
+        with self._lock:
+            addrs = {self._seed_addr} if self._seed_addr else set()
+            self_addr = None if self._self_record is None else tuple(self._self_record["addr"])
+            if self._epoch is not None:
+                for o in self._epoch["owners"]:
+                    a = tuple(o["addr"])
+                    if a != self_addr:
+                        addrs.add(a)
+        for addr in addrs:
+            try:
+                reply = self._peer_rpc(addr, {"type": "directory"})
+            except (OSError, ConnectionError):
+                reply = None
+            recs = (reply or {}).get("records")
+            if recs:
+                self.import_directory(recs)
+        self.derive_and_apply_epoch()
+
+    def _expected_grant_signer(self, grant) -> str | None:
+        """The peer-id that legitimately mints a push grant for this path under
+        the current epoch -- the primary owner of the path's coordinator key
+        (decentralized mode). The grant carries the path; the epoch resolves the
+        primary, so co-owners agree without a shared secret."""
+        try:
+            path_keys = self._topology.path_module_keys(tuple(grant["path"]))
+        except (KeyError, TypeError, ValueError, IndexError):
+            return None
+        prim = path_primary(path_keys, self._epoch) if self._epoch is not None else None
+        return prim["peer_id"] if prim else None
+
     def _push(self, msg: dict, peer_id: str | None = None) -> dict:
         grant = msg.get("grant")
-        if not verify_grant(grant, self.grant_key, scheduler_pub=self.scheduler_pub):
+        if self.schedule_mode == "decentralized":
+            # No scheduler: the grant must be signed by the path's primary owner.
+            ok = grant_signed_by(grant, self._expected_grant_signer(grant))
+        else:
+            ok = verify_grant(grant, self.grant_key, scheduler_pub=self.scheduler_pub)
+        if not ok:
             return {"type": "ack", "applied": False}  # no/forged grant -> refuse
         # Decode (possibly quantized) gradients outside the lock; a malformed
         # encoding refuses the push rather than crashing the server.

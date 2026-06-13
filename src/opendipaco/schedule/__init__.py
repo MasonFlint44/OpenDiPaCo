@@ -1,11 +1,22 @@
 from .distributed import CoordinatorServer, run_worker
 from .identity import PeerIdentity, peer_id_of, sign_record, verify_record
 from .aggregate import AGGREGATES, robust_delta
+from .assignment import (
+    assignee,
+    coordinator_key,
+    is_assignee,
+    path_primary,
+    rank_workers,
+    responsible_rank,
+    version_lag,
+)
 from .observability import MetricsExporter, MetricsLogger
 from .ratelimit import RateLimiter
 from .reputation import Reputation
+from .quorum import confirm_version, divergent_peers, read_quorum_versions
 from .ownership import (
     EpochManager,
+    derive_epoch,
     make_epoch_record,
     owner_eligible,
     owners_for,
@@ -18,6 +29,7 @@ from .sharded import (
     ParameterServer,
     Scheduler,
     assign_shards,
+    grant_signed_by,
     make_grant,
     run_sharded_worker,
     verify_grant,
@@ -48,6 +60,7 @@ __all__ = [
     "assign_shards",
     "make_grant",
     "verify_grant",
+    "grant_signed_by",
     "server_context",
     "client_context",
     "generate_selfsigned_cert",
@@ -75,4 +88,15 @@ __all__ = [
     "owners_for",
     "make_epoch_record",
     "verify_epoch_record",
+    "derive_epoch",
+    "rank_workers",
+    "responsible_rank",
+    "assignee",
+    "is_assignee",
+    "version_lag",
+    "coordinator_key",
+    "path_primary",
+    "confirm_version",
+    "divergent_peers",
+    "read_quorum_versions",
 ]

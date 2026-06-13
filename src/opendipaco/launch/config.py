@@ -223,6 +223,38 @@ class RobustnessCfg:
 
 
 @dataclass
+class ScheduleCfg:
+    """Control-plane topology (Phase 4; ``docs/phase4-design.md``).
+
+    ``central`` (default) keeps today's single :class:`Scheduler` node: the
+    global ``_T`` clock, the lease queue, scheduler-signed grants, and the
+    scheduler as the run's trust root — bit-identical to Phase 3.
+
+    ``decentralized`` removes the scheduler as a node. Work assignment becomes
+    leaderless (HRW over ``(path, generation)`` and the live worker set, with
+    deterministic takeover on lease expiry), the clock becomes the per-module
+    ``(epoch, counter)`` version vectors, grants are minted by each path's
+    primary **owner**, reputation/audits/rate-limits shard onto the owner tier,
+    owners cross-check each other (quorum reads + replicated-aggregation digest
+    agreement) so a minority of Byzantine owners is tolerated, and the tracker
+    degrades to a bootstrap seed (owners gossip the directory). It *implies*
+    ``ownership: rendezvous`` (it is built on the replicated owner tier) and
+    changes training dynamics, so it must be validated against the anchor like
+    every other dynamics change (plan §1.4).
+    """
+
+    mode: str = "central"              # "central" | "decentralized"
+    lease_ttl: float = 30.0            # rank-0's window before takeover-on-expiry
+    gossip_interval: float = 10.0      # owner-to-owner directory pull cadence
+    read_quorum: int = 2               # replicas a fetch cross-checks (Byzantine reads)
+
+    def __post_init__(self):
+        if self.mode not in ("central", "decentralized"):
+            raise ValueError(
+                f"schedule.mode must be 'central' or 'decentralized', got {self.mode!r}")
+
+
+@dataclass
 class RunCfg:
     generations: int = 10
     batch_size: int = 8
@@ -250,13 +282,14 @@ class LaunchConfig:
     tracker: TrackerCfg = field(default_factory=TrackerCfg)
     ownership: OwnershipCfg = field(default_factory=OwnershipCfg)
     robustness: RobustnessCfg = field(default_factory=RobustnessCfg)
+    schedule: ScheduleCfg = field(default_factory=ScheduleCfg)
     run: RunCfg = field(default_factory=RunCfg)
 
     _SECTIONS = {  # name -> dataclass (class attr, not a field)
         "model": ModelCfg, "diloco": DiLoCoCfg, "data": DataCfg,
         "transport": TransportCfg, "tls": TLSCfg, "sharded": ShardedCfg,
         "tracker": TrackerCfg, "ownership": OwnershipCfg,
-        "robustness": RobustnessCfg, "run": RunCfg,
+        "robustness": RobustnessCfg, "schedule": ScheduleCfg, "run": RunCfg,
     }
 
     @classmethod
@@ -269,6 +302,13 @@ class LaunchConfig:
             raise ValueError(f"unknown top-level config keys: {sorted(d)}")
         if kw["mode"] not in ("coordinator", "sharded"):
             raise ValueError(f"mode must be 'coordinator' or 'sharded', got {kw['mode']!r}")
+        # Decentralized scheduling is built on the replicated owner tier, so it
+        # requires rendezvous ownership (Phase 4 D9). Catch the mismatch at load
+        # rather than half-wiring a run with no owners to mint grants.
+        if kw["schedule"].mode == "decentralized" and kw["ownership"].mode != "rendezvous":
+            raise ValueError(
+                "schedule.mode: decentralized requires ownership.mode: rendezvous "
+                "(it builds on the replicated owner tier)")
         return cls(**kw)
 
     def connect_addr(self) -> tuple[str, int]:
