@@ -66,7 +66,7 @@ from .guard import all_finite, clip_norm_, loss_ok
 from .ratelimit import RateLimiter
 from .reputation import Reputation
 from .assignment import coordinator_key, is_assignee, path_primary, version_lag
-from .quorum import confirm_version, divergent_peers
+from .quorum import confirm_version, divergent_peers, read_quorum_versions
 from .identity import peer_id_of, sign_record, verify_record
 from .ownership import (
     EpochManager,
@@ -787,6 +787,19 @@ class ParameterServer(_ReactorServer):
                     self._active.add(k)
                     results[k] = "active"
             was_active = set(self._active)
+        # Decentralized safety (Codex P1): a Byzantine source can serve a poisoned
+        # higher version; adopting it blindly would let it reach read-quorum (the
+        # source + the deceived backup) and be *confirmed* before the audit runs.
+        # So in decentralized mode never mutate local state to a version whose
+        # (version, digest) isn't already agreed by a quorum of the key's
+        # replicas -- an unconfirmed higher version is left for a later pass.
+        confirmed: dict = {}
+        if self.schedule_mode == "decentralized" and epoch is not None and candidates:
+            addrs = sorted({tuple(o["addr"]) for k in candidates
+                            for o in owners_for(k, epoch)})
+            confirmed = read_quorum_versions(
+                addrs, list(candidates), self.read_quorum,
+                lambda a, m: self._peer_rpc(a, m))
         served: set = set()
         pending = dict(candidates)
         while pending:
@@ -812,6 +825,16 @@ class ParameterServer(_ReactorServer):
                         v = tuple(v)
                         if v > self._versions[k]:
                             sd = (reply.get("weights") or {}).get(k)
+                            # Decentralized: adopt only quorum-confirmed bytes
+                            # (the offered version's digest must match what a
+                            # quorum of replicas agreed, so poison can't sneak in
+                            # via a single source). Central/rendezvous: trust the
+                            # authoritative source as before (Phase 2).
+                            if sd is not None and self.schedule_mode == "decentralized":
+                                c = confirmed.get(k)
+                                if not (c is not None and tuple(c[0]) == v
+                                        and state_digest(sd) == c[1]):
+                                    sd = None  # unconfirmed -> leave for a later pass
                             if sd is not None:
                                 self.bank[k].load_state_dict(
                                     {n: t.to(self.device) for n, t in sd.items()})
@@ -1059,16 +1082,25 @@ class ParameterServer(_ReactorServer):
 
     # -- directory gossip + deterministic epochs (Phase 4 D6/D7) ---------------
 
+    @staticmethod
+    def _issued_at(record) -> float | None:
+        """A record's ``issued_at`` if it is a real number, else None.
+        ``verify_record`` only checks the signature, so a validly-signed but
+        malformed record (non-numeric ``issued_at``) must be rejected before any
+        TTL arithmetic (Codex P2) -- otherwise one bad record aborts gossip."""
+        ts = record.get("issued_at")
+        return float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else None
+
     def _prune_directory_locked(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
         for p in [p for p, r in self._directory.items()
-                  if now - r.get("issued_at", 0) > self.directory_ttl]:
+                  if (t := self._issued_at(r)) is None or now - t > self.directory_ttl]:
             del self._directory[p]
 
     def import_directory(self, records, *, now: float | None = None) -> int:
         """Merge gossiped peer records into the local directory (newest
-        ``issued_at`` wins; expired records are dropped). Each record is
-        self-certifying, so importing from any peer is safe -- this is how the
+        ``issued_at`` wins; expired/malformed records are dropped). Each record
+        is self-certifying, so importing from any peer is safe -- this is how the
         swarm's membership survives the tracker (design D7)."""
         now = time.time() if now is None else now
         added = 0
@@ -1077,10 +1109,11 @@ class ParameterServer(_ReactorServer):
                 if not (isinstance(r, dict) and verify_record(r) and r.get("kind") == "peer"):
                     continue
                 pid = r.get("peer_id")
-                if not isinstance(pid, str) or now - r.get("issued_at", 0) > self.directory_ttl:
+                ts = self._issued_at(r)
+                if not isinstance(pid, str) or ts is None or now - ts > self.directory_ttl:
                     continue
                 cur = self._directory.get(pid)
-                if cur is None or r.get("issued_at", 0) > cur.get("issued_at", 0):
+                if cur is None or ts > self._issued_at(cur):
                     self._directory[pid] = r
                     added += 1
             self._prune_directory_locked(now)

@@ -50,6 +50,26 @@ that ties them into a converging swarm is the final integration, owed to 0f.
   co-owner below `min_owner_reputation`, and the next `derive_and_apply_epoch`'s
   reputation gate excludes it (tested in `test_decentralized_epochs`).
 
+**Post-PR review fixes (Codex, PR #5):**
+- *P1 — replication must quorum-confirm before adopting (the Byzantine-primary
+  hole).* The 4c digest audit ran *after* `_replicate_once` had already adopted
+  a higher version from a single source — so a Byzantine primary could serve a
+  poisoned `v+1` to one backup, and the audit would then see two matching `v+1`
+  digests (primary + deceived backup) and **confirm the poison**. Fixed: in
+  decentralized mode the replication loop first computes a quorum-confirmed
+  `{key: (version, digest)}` over the key's replicas and adopts offered bytes
+  **only** when their version+`state_digest` match the confirmed entry; an
+  unconfirmed higher version is left for a later pass (a Byzantine source ends up
+  alone and ahead, serving poison to nobody who quorum-checks). This makes the
+  *read/adoption* safety against a Byzantine primary real **now** — only the
+  *flagging* of such a primary and overall convergence stay on the 0f write-path
+  list. (`test_quorum.py`: poison rejected, quorum-confirmed progress adopted.)
+- *P2 — validate `issued_at` before TTL math.* `verify_record` checks only the
+  signature, so a validly-signed gossip record could carry a non-numeric
+  `issued_at` and raise `TypeError` mid-import, aborting a gossip cycle. Fixed:
+  `_issued_at` accepts only real numbers; malformed records are skipped, not
+  fatal (`test_decentralized_epochs.py`).
+
 > **Strategic note (recorded up front, honestly).** Phase 4 is the *optional
 > endgame* in the plan — *"only worth it if tracker availability actually
 > becomes the limiting factor; Phases 0–3 deliver the goal without it."* Two

@@ -158,6 +158,28 @@ def test_owner_eviction_loop_excludes_a_divergent_owner():
         o.shutdown()
 
 
+def test_import_skips_malformed_issued_at(monkeypatch):
+    """Codex P2: verify_record only checks the signature, so a validly-signed
+    record can still carry a non-numeric issued_at. Importing it must skip the
+    record, not raise (one bad record would otherwise abort the gossip cycle)."""
+    from opendipaco.schedule.identity import sign_record
+    good_ident, evil_ident = PeerIdentity.generate(), PeerIdentity.generate()
+    good = make_peer_record(good_ident, reachability="public",
+                            addr=("127.0.0.1", 9000), roles=("owner",))
+    # A correctly-signed peer record whose issued_at is a string.
+    evil = sign_record(evil_ident, {"kind": "peer", "reachability": "public",
+                                    "addr": ["127.0.0.1", 9001], "roles": ["owner"],
+                                    "capabilities": {}, "issued_at": "soon"})
+    o = _dec_owner(PeerIdentity.generate())
+    try:
+        n = o.import_directory([evil, good])     # must not raise
+        assert n == 1                            # only the well-formed record imported
+        assert good_ident.peer_id in o._directory
+        assert evil_ident.peer_id not in o._directory
+    finally:
+        o.shutdown()
+
+
 def test_central_owner_ignores_decentralized_rpcs():
     ps = ParameterServer(_cfg(), sorted(_cfg().build_topology().module_keys()),
                          DiLoCoConfig(inner_steps=4), host="127.0.0.1", port=0)

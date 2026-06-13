@@ -154,6 +154,70 @@ def test_byzantine_owner_is_outvoted_and_flagged():
             w.shutdown()
 
 
+def _backup_key(owner, epoch):
+    """A key this owner is a *backup* (not primary) of — so _replicate_once pulls it."""
+    from opendipaco.schedule import owners_for
+    return next(k for k in sorted(owner.owned_keys)
+                if owners_for(k, epoch)[0]["peer_id"] != owner.peer_id)
+
+
+def test_replication_rejects_unconfirmed_poison(monkeypatch):
+    """Codex P1: a Byzantine source serving a poisoned higher version must NOT
+    be adopted — adopting it blindly would let it reach read-quorum and be
+    confirmed before the audit runs. The decentralized adoption gate requires a
+    quorum-confirmed digest first."""
+    owners, epoch = _owners()
+    o = owners[0]
+    try:
+        k = _backup_key(o, epoch)
+        before = {n: p.detach().clone() for n, p in o.bank[k].named_parameters()}
+        honest = {kk: [[0, 0], "honest"] for kk in o.owned_keys}
+        poison = {n: t + 7.0 for n, t in o.bank[k].state_dict().items()}
+
+        def stub(addr, msg):
+            keys = msg.get("keys") or []
+            if msg["type"] == "digest":          # quorum says k is still (0, 0)
+                return {"digests": {kk: honest[kk] for kk in keys if kk in honest}}
+            if msg["type"] == "fetch":           # a source offers a poisoned (0, 1)
+                return {"versions": {k: [0, 1]}, "weights": {k: poison}} if k in keys else {}
+            return {}
+
+        monkeypatch.setattr(o, "_peer_rpc", stub)
+        o._replicate_once()
+        assert o._versions[k] == (0, 0)          # unconfirmed (0,1) not adopted
+        assert all(torch.equal(before[n], p) for n, p in o.bank[k].named_parameters())
+    finally:
+        for w in owners:
+            w.shutdown()
+
+
+def test_replication_adopts_a_quorum_confirmed_version(monkeypatch):
+    """The flip side: a higher version whose digest a quorum agrees on IS
+    adopted — the gate blocks poison, not honest progress."""
+    owners, epoch = _owners()
+    o = owners[0]
+    try:
+        k = _backup_key(o, epoch)
+        new_sd = {n: t + 1.0 for n, t in o.bank[k].state_dict().items()}
+        new_dig = state_digest(new_sd)
+
+        def stub(addr, msg):
+            keys = msg.get("keys") or []
+            if msg["type"] == "digest":          # quorum agrees on (0,1) == new_dig
+                return {"digests": {k: [[0, 1], new_dig]} if k in keys else {}}
+            if msg["type"] == "fetch":
+                return {"versions": {k: [0, 1]}, "weights": {k: new_sd}} if k in keys else {}
+            return {}
+
+        monkeypatch.setattr(o, "_peer_rpc", stub)
+        o._replicate_once()
+        assert o._versions[k] == (0, 1)          # confirmed -> adopted
+        assert state_digest(o.bank[k].state_dict()) == new_dig
+    finally:
+        for w in owners:
+            w.shutdown()
+
+
 def test_audit_does_not_blame_a_lagging_owner():
     owners, _ = _owners(reputation=Reputation(floor=0.5, debit=0.3))
     try:
