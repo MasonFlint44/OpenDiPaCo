@@ -186,6 +186,28 @@ def test_proposal_policy_rejects_guaranteed_stall_config():
     assert cfg.robustness.private_policy == "proposal"
 
 
+def test_schedule_config_parses_and_defaults_central():
+    cfg = LaunchConfig.from_dict(_tiny_dict())
+    assert cfg.schedule.mode == "central"        # default: today's single scheduler
+    assert cfg.schedule.lease_ttl == 30.0 and cfg.schedule.read_quorum == 2
+    cfg2 = LaunchConfig.from_dict({**_tiny_dict(), "ownership": {"mode": "rendezvous"},
+                                   "schedule": {"mode": "decentralized", "lease_ttl": 12.0}})
+    assert cfg2.schedule.mode == "decentralized" and cfg2.schedule.lease_ttl == 12.0
+
+
+def test_decentralized_requires_rendezvous_ownership():
+    # Built on the replicated owner tier -> needs rendezvous ownership; the
+    # default static ownership has no owners to mint grants, so reject at load.
+    with pytest.raises(ValueError):
+        LaunchConfig.from_dict({**_tiny_dict(), "schedule": {"mode": "decentralized"}})
+    with pytest.raises(ValueError):
+        LaunchConfig.from_dict({**_tiny_dict(), "schedule": {"mode": "potato"}})
+    # The matching pair is accepted.
+    ok = LaunchConfig.from_dict({**_tiny_dict(), "ownership": {"mode": "rendezvous"},
+                                 "schedule": {"mode": "decentralized"}})
+    assert ok.schedule.mode == "decentralized"
+
+
 def test_run_local_sharded_with_robustness_on():
     """`opendipaco run` (sharded) with robustness on: owner-side robust
     aggregation + reputation gates engaged, run still reaches its budget."""

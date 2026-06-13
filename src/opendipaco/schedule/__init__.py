@@ -1,6 +1,15 @@
 from .distributed import CoordinatorServer, run_worker
 from .identity import PeerIdentity, peer_id_of, sign_record, verify_record
 from .aggregate import AGGREGATES, robust_delta
+from .assignment import (
+    assignee,
+    coordinator_key,
+    is_assignee,
+    path_primary,
+    rank_workers,
+    responsible_rank,
+    version_lag,
+)
 from .observability import MetricsExporter, MetricsLogger
 from .ratelimit import RateLimiter
 from .reputation import Reputation
@@ -75,4 +84,11 @@ __all__ = [
     "owners_for",
     "make_epoch_record",
     "verify_epoch_record",
+    "rank_workers",
+    "responsible_rank",
+    "assignee",
+    "is_assignee",
+    "version_lag",
+    "coordinator_key",
+    "path_primary",
 ]
