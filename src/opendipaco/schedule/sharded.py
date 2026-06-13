@@ -32,6 +32,7 @@ import hmac
 import json
 import math
 import os
+import random
 import ssl
 import threading
 import time
@@ -48,6 +49,7 @@ from .compress import (
     compress_shard,
     compress_state,
     maybe_dequantize,
+    pseudograd_digest,
     restore_shard,
 )
 from .distributed import (
@@ -201,7 +203,8 @@ class ParameterServer(_ReactorServer):
                  identity=None, epoch_record=None, replicate_interval=10.0,
                  peer_auth=None, peer_tls=None, bootstrap=True, bank_seed=0,
                  scheduler_addr=None, robustness="off", quorum_target=3,
-                 quorum_timeout=30.0, aggregate="trimmed_mean", **reactor_kw):
+                 quorum_timeout=30.0, aggregate="trimmed_mean", version_history=1,
+                 **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.config = config
         self.diloco = diloco
@@ -232,6 +235,12 @@ class ParameterServer(_ReactorServer):
         self._topology = config.build_topology()
         self._buffers: dict = {}     # key -> [(weight, [grad tensors]), ...]
         self._buffer_ts: dict = {}   # key -> monotonic ts of the buffer's first entry
+        # Version history (Phase 3c): retain the last ``version_history`` states
+        # per key so a redundant-execution checker can fetch the *exact base* a
+        # primary trained against even after the module has advanced. 1 (default)
+        # = off, no snapshots, zero cost on the normal path.
+        self.version_history = max(1, int(version_history))
+        self._history: dict = {}     # key -> OrderedDict[version -> cpu state_dict]
 
         self.identity = identity
         self.peer_id = getattr(identity, "peer_id", None)
@@ -345,10 +354,34 @@ class ParameterServer(_ReactorServer):
         e, c = self._versions[key]
         self._versions[key] = (self._epoch_num, c + 1 if e == self._epoch_num else 1)
 
+    def _pinned_state_locked(self, key, version):
+        """The CPU state of ``key`` at exactly ``version`` (live or retained),
+        or None if that version is no longer available."""
+        if key not in self.bank:
+            return None
+        if version == self._versions[key]:
+            return _state_to_cpu(self.bank[key].state_dict())
+        hist = self._history.get(key)
+        if hist is not None and version in hist:
+            return _state_to_cpu(hist[version])
+        return None
+
+    def _record_history_locked(self, key) -> None:
+        """Snapshot the *current* (pre-mutation) state under its version, so a
+        redundant-execution checker can later fetch this exact base (Phase 3c).
+        No-op unless ``version_history > 1``."""
+        if self.version_history <= 1:
+            return
+        hist = self._history.setdefault(key, collections.OrderedDict())
+        hist[self._versions[key]] = _state_to_cpu(self.bank[key].state_dict())
+        while len(hist) > self.version_history:
+            hist.popitem(last=False)
+
     # -- robust aggregation (Phase 3a) -----------------------------------------
 
     def _apply_outer_locked(self, key, weight, grad) -> None:
         """One weighted outer step on a module (the unbuffered/``off`` path)."""
+        self._record_history_locked(key)  # retain the pre-step base for auditors
         apply_outer_grads(self.bank[key], [weight * g.to(self.device) for g in grad])
         self._outer_opts[key].step()
         self._outer_opts[key].zero_grad(set_to_none=True)
@@ -367,6 +400,7 @@ class ParameterServer(_ReactorServer):
         if not contribs:
             return
         delta, weight_sum = robust_delta(contribs, aggregate=self.aggregate)
+        self._record_history_locked(key)
         apply_outer_grads(self.bank[key], [weight_sum * d.to(self.device) for d in delta])
         self._outer_opts[key].step()
         self._outer_opts[key].zero_grad(set_to_none=True)
@@ -389,11 +423,24 @@ class ParameterServer(_ReactorServer):
         have = msg.get("have", {})
         cold = msg.get("cold", False)
         want_state = bool(msg.get("include_state"))
+        pin = msg.get("pin") or {}  # {key: version}: redundant-execution checker
         weights, versions, state, missing = {}, {}, {}, []
         with self._lock:
             for k in msg.get("keys", []):
                 if k not in self.bank:
                     missing.append(k)
+                    continue
+                if k in pin:
+                    # Pinned fetch: serve the exact version the audited primary
+                    # trained against (live, or a retained snapshot), so a
+                    # checker reproduces the computation. Aged-out -> missing,
+                    # and the auditor aborts (no false disagreement).
+                    snap = self._pinned_state_locked(k, tuple(pin[k]))
+                    if snap is None:
+                        missing.append(k)
+                    else:
+                        weights[k] = compress_state(snap, self.compress)
+                        versions[k] = tuple(pin[k])
                     continue
                 if want_state:
                     # Replication pull: exact bytes (replicas must be bit-equal,
@@ -421,6 +468,7 @@ class ParameterServer(_ReactorServer):
                     if cold:  # ship the path's private modules only on a cold start
                         weights[k] = compress_state(
                             _state_to_cpu(self.bank[k].state_dict()), self.compress)
+                        versions[k] = self._versions[k]  # so an auditor can pin it
                 else:
                     versions[k] = self._versions[k]
                     if tuple(have.get(k) or ()) != self._versions[k]:  # ship only stale
@@ -739,6 +787,7 @@ class ParameterServer(_ReactorServer):
                 if not self._primary_locked(k):
                     skipped.append(k)
                     continue
+                self._record_history_locked(k)  # retain pre-store base for auditors
                 _load_into(self, k, sd)  # store latest private (authoritative-local)
                 self._bump_version_locked(k)
                 n_applied += 1
@@ -850,6 +899,7 @@ class Scheduler(_ReactorServer):
                  heartbeat_timeout=30.0, ps_tls=None, grant_key=None,
                  identity=None, compress="none", idle_backoff=None,
                  reputation=None, rate_limiter=None, min_owner_reputation=0.25,
+                 redundancy=3, redundancy_rate=0.0, audit_timeout=60.0,
                  **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.ps_tls = ps_tls  # client context for the scheduler's checkpoint RPCs to PSs
@@ -861,6 +911,16 @@ class Scheduler(_ReactorServer):
         self.reputation = reputation if reputation is not None else Reputation()
         self.rate_limiter = rate_limiter if rate_limiter is not None else RateLimiter()
         self.min_owner_reputation = min_owner_reputation
+        # Redundant execution (Phase 3c): a sampled fraction of tasks are
+        # *audited* -- the primary reports a pinned base + digest, and surplus
+        # workers re-run it from that exact base as checkers. Disagreement burns
+        # reputation, agreement rewards it; this also absorbs the §1.9 oversupply
+        # (surplus workers do checks instead of idling). rate 0.0 (default) =
+        # off, no audits, byte-identical to Phase 2.
+        self.redundancy = max(1, int(redundancy))
+        self.redundancy_rate = float(redundancy_rate)
+        self.audit_timeout = float(audit_timeout)
+        self._audits: dict = {}  # (path, gen) -> audit record
         # With an Ed25519 identity, grants are signed instead (servers verify
         # via ``scheduler_pub=``) and epoch records can be published (Phase 2a).
         self.identity = identity
@@ -1053,32 +1113,55 @@ class Scheduler(_ReactorServer):
             if not self._routing and self._epoch_record is None:
                 return self._idle()  # rendezvous mode before the first epoch
             self._reclaim_inflight_locked()
+            member = peer_id or wid
             eligible = [p for p in self._completed if p not in self._inflight]
+            check_only, base, audit = False, None, False
+            rep = self.reputation.get(peer_id)
             if not eligible:
-                return self._idle()
-            # Rate limit only the *expensive* path (issuing a task with a
-            # weight/shard payload): a throttled peer gets a cheap backoff idle,
-            # not a disconnect (§1.14). Reputation scales its bucket.
-            if not self.rate_limiter.allow(peer_id, reputation=self.reputation.get(peer_id)):
-                return self._idle()
-            path = min(eligible, key=lambda p: (self._completed[p], p not in warm, p))
-            lease = uuid.uuid4().hex  # unique per lease; fences commit/heartbeat
-            self._owner[path] = wid
-            self._inflight[path] = time.monotonic() + self.heartbeat_timeout
-            self._issued[path] = self._T
-            self._lease[path] = lease
-            generation = self._completed[path]
+                # No primary work: absorb the surplus as a redundant check for an
+                # open audit (§1.9), if one needs this distinct worker.
+                cand = self._find_check_locked(member)
+                if cand is None:
+                    return self._idle()
+                if not self.rate_limiter.allow(peer_id, reputation=rep):
+                    return self._idle()
+                path, generation, base, lease = self._reserve_check_locked(cand, member)
+                check_only = True
+            else:
+                # Rate limit only the *expensive* path (issuing a task with a
+                # weight/shard payload): a throttled peer gets a cheap backoff
+                # idle, not a disconnect (§1.14). Reputation scales its bucket.
+                if not self.rate_limiter.allow(peer_id, reputation=rep):
+                    return self._idle()
+                path = min(eligible, key=lambda p: (self._completed[p], p not in warm, p))
+                lease = uuid.uuid4().hex  # unique per lease; fences commit/heartbeat
+                self._owner[path] = wid
+                self._inflight[path] = time.monotonic() + self.heartbeat_timeout
+                self._issued[path] = self._T
+                self._lease[path] = lease
+                generation = self._completed[path]
+                # Sample this task for an audit: the primary will report a pinned
+                # base + digest, and checkers re-run it from that base.
+                if (self.redundancy_rate > 0 and self.redundancy > 1
+                        and (path, generation) not in self._audits
+                        and random.random() < self.redundancy_rate):
+                    audit = True
+                    self._audits[(path, generation)] = {
+                        "target": self.redundancy - 1, "base": None,
+                        "primary_digest": None, "primary_peer": None,
+                        "checks": [], "members": {member}, "deadline": None}
             keys = self.topology.path_module_keys(path)
             routing = self._routing_locked(keys)
-        # Data plane: shard bytes, or just the recipe for a spec corpus.
+        # Data plane: shard bytes, or just the recipe for a spec corpus. A check
+        # is cold, so it always gets the shard (ignores the worker's cache).
         shard, shard_spec = None, None
-        if path not in cached:
+        if check_only or path not in cached:
             if hasattr(self.corpus, "spec"):
                 shard_spec = {"path_index": self.topology.path_index(path),
                               "spec": self.corpus.spec}
             else:
                 shard = self.corpus.shard(self.topology.path_index(path))
-        return {
+        task = {
             "type": "task",
             "gen_id": generation,
             "lease": lease,
@@ -1092,8 +1175,80 @@ class Scheduler(_ReactorServer):
             "total_rounds": self.total_rounds,
             "seed": self.seed,
         }
+        if check_only:
+            task["check_only"], task["base"] = True, base
+        elif audit:
+            task["audit"] = True
+        return task
+
+    # -- redundant execution (Phase 3c) ----------------------------------------
+
+    def _find_check_locked(self, member):
+        """An open audit that still needs a checker and that ``member`` hasn't
+        already taken a slot in (a peer must not check its own work)."""
+        for key, a in self._audits.items():
+            if a["base"] is None or a.get("resolved") or member in a["members"]:
+                continue
+            if len(a["members"]) - 1 < a["target"]:  # members includes the primary
+                return key
+        return None
+
+    def _reserve_check_locked(self, key, member):
+        a = self._audits[key]
+        a["members"].add(member)
+        path, generation = key
+        return path, generation, a["base"], uuid.uuid4().hex
+
+    def _commit_check(self, msg: dict, peer_id: str | None = None) -> dict:
+        """Record a checker's digest against its audit; resolve if complete."""
+        key = (tuple(msg.get("path") or ()), msg.get("gen_id"))
+        with self._lock:
+            a = self._audits.get(key)
+            if a is not None and not a.get("resolved"):
+                a["checks"].append((peer_id, msg.get("digest")))
+                self._maybe_resolve_audit_locked(key, time.monotonic())
+        return {"type": "commit_ack", "check": True}
+
+    def _maybe_resolve_audit_locked(self, key, now) -> None:
+        a = self._audits.get(key)
+        if a is None or a.get("resolved"):
+            return
+        complete = a["base"] is not None and len(a["checks"]) >= a["target"]
+        timed_out = a["deadline"] is not None and now >= a["deadline"]
+        if complete or timed_out:
+            self._resolve_audit_locked(key)
+
+    def _resolve_audit_locked(self, key) -> None:
+        """Tally the audited replicas' digests and adjust reputation: agreement
+        with a majority credits, the odd one out is debited. Needs >= 2 present
+        and >= 2 agreeing to assign blame (a 2-way split is inconclusive)."""
+        a = self._audits.pop(key, None)
+        if a is None:
+            return
+        present = []
+        if a["primary_digest"] is not None:
+            present.append((a["primary_peer"], a["primary_digest"]))
+        present += [(p, d) for p, d in a["checks"] if d is not None]
+        digests = [d for _, d in present]
+        if len(digests) >= 2:
+            top, n = collections.Counter(digests).most_common(1)[0]
+            if n >= 2:  # a real agreeing majority -> blame is assignable
+                for peer, d in present:
+                    if peer is None:
+                        continue  # anonymous/HMAC: untracked
+                    if d == top:
+                        self.reputation.credit(peer)
+                    else:
+                        self.reputation.debit(peer)
+                        self.metrics.record_invalid_reject()
+
+    def _resolve_audits_locked(self, now) -> None:
+        for key in list(self._audits):
+            self._maybe_resolve_audit_locked(key, now)
 
     def _commit(self, msg: dict, peer_id: str | None = None) -> dict:
+        if msg.get("check_only"):
+            return self._commit_check(msg, peer_id)
         path = msg["path"]
         # Reputation verdict, applied after the lock: ``True`` credit (accepted),
         # ``False`` debit (the worker reported a non-finite loss -- diverged or
@@ -1118,8 +1273,9 @@ class Scheduler(_ReactorServer):
                     self.metrics.record_invalid_reject()
                     rep = False
                     return {"type": "commit_ack", "accepted": False}
+                gen = self._completed.get(path, 0)
                 self._T += 1
-                self._completed[path] = self._completed.get(path, 0) + 1
+                self._completed[path] = gen + 1
                 damp = 1.0 / (1.0 + staleness) if self.staleness_weight == "inverse" else 1.0
                 push_weight = self.corpus.shard_weight(self.topology.path_index(path)) * damp
                 self.metrics.record_update(staleness)
@@ -1128,6 +1284,16 @@ class Scheduler(_ReactorServer):
                 grant = make_grant(path, self.topology.path_module_keys(path),
                                    push_weight, lease, self.grant_key,
                                    identity=self.identity)
+                # If this primary was sampled for an audit, record the base it
+                # pinned + its digest and open the window for checkers (D2).
+                a = self._audits.get((tuple(path), gen))
+                if a is not None and a["base"] is None:
+                    a["base"] = msg.get("base")
+                    a["primary_digest"] = msg.get("digest")
+                    a["primary_peer"] = peer_id
+                    a["deadline"] = time.monotonic() + self.audit_timeout
+                    if a["base"] is None:  # primary couldn't pin (empty/no base) -> drop
+                        self._audits.pop((tuple(path), gen), None)
                 rep = True
                 return {"type": "commit_ack", "accepted": True,
                         "push_weight": push_weight, "grant": grant}
@@ -1151,6 +1317,7 @@ class Scheduler(_ReactorServer):
                 self._lease.pop(path, None)  # invalidate the token: zombies can't commit
                 self._owner[path] = None
                 self.metrics.reclaims += 1
+        self._resolve_audits_locked(now)  # close out timed-out / complete audits
 
     def fit(self, num_generations: int, *, total_generations=None, log_every=0,
             reclaim_interval=0.05, checkpoint_dir=None, checkpoint_every=0, resume=False):
@@ -1298,6 +1465,10 @@ class Scheduler(_ReactorServer):
 # -- sharded worker ----------------------------------------------------------
 
 
+class _CheckAborted(Exception):
+    """A redundant-execution check can't reproduce its pinned base (aged out)."""
+
+
 def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
                        auth_key=None, max_tasks=None, heartbeat_interval=3.0,
                        poll_interval=0.02, max_msg_bytes=DEFAULT_MAX_MSG_BYTES,
@@ -1409,12 +1580,22 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
         engine.total_rounds = task["total_rounds"]
         # Routing values are replica addr lists in rank order (primary first).
         routing = {k: [tuple(a) for a in addrs] for k, addrs in task["routing"].items()}
-        cold = path not in warm
+        check_only = bool(task.get("check_only"))
+        audit = bool(task.get("audit"))
+        # A check pins the audited primary's exact base; an audited primary (and
+        # any check) runs *cold* so the computation is reproducible by replicas
+        # -- a warm inner-optimizer state can't cross the wire (a core invariant).
+        pin = {k: tuple(v) for k, v in (task.get("base") or {}).items()} if check_only else None
+        cold = (path not in warm) or audit or check_only
 
-        def fetch_keys():
+        def fetch_keys(pin=None):
             """Fetch each key from its first responsive replica: prefer an
             already-connected owner, else rank order; a replica that is down or
-            still syncing ("missing") falls back to the next one (design D8)."""
+            still syncing ("missing") falls back to the next one (design D8).
+
+            With ``pin={key: version}`` (a redundant-execution check) the owner
+            must serve those exact versions; an aged-out pin can't be reproduced,
+            so it raises ``_CheckAborted`` and the caller abstains."""
             pending = {
                 k: [a for a in addrs if a in ps_conns] + [a for a in addrs if a not in ps_conns]
                 for k, addrs in routing.items()
@@ -1422,11 +1603,13 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
             while pending:
                 addr = next(iter(pending.values()))[0]
                 batch = [k for k, cands in pending.items() if cands[0] == addr]
+                req = {"type": "fetch", "keys": batch, "cold": cold,
+                       "have": {} if pin else
+                               {k: versions.get(k) for k in batch if not is_private_key(k)}}
+                if pin:
+                    req["pin"] = {k: list(pin[k]) for k in batch if k in pin}
                 try:
-                    reply = _rpc(ps_sock(addr), {
-                        "type": "fetch", "keys": batch, "cold": cold,
-                        "have": {k: versions.get(k) for k in batch if not is_private_key(k)},
-                    }, max_msg_bytes)
+                    reply = _rpc(ps_sock(addr), req, max_msg_bytes)
                     if reply is None:
                         raise OSError(f"replica {addr} closed")
                 except (OSError, ConnectionError):
@@ -1442,17 +1625,49 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
                 versions.update(reply.get("versions", {}))
                 for k in batch:
                     if k in missing:
+                        if pin:
+                            raise _CheckAborted  # pinned base gone -> can't reproduce
                         pending[k] = pending[k][1:]
                         if not pending[k]:
                             raise OSError(f"no replica could serve {k}")
                     else:
                         pending.pop(k)
 
+        def load_shard_locked():
+            if task.get("shard") is not None:
+                shard_cache[path] = restore_shard(task["shard"])
+            elif task.get("shard_spec") is not None and path not in shard_cache:
+                shard_cache[path] = _materialize_from_spec(task["shard_spec"], data_ctx)
+            return shard_cache[path]
+
+        if check_only:
+            # A pure verification replica: reproduce the primary's update from its
+            # pinned base and report only a digest -- never push, never warm.
+            digest = None
+            try:
+                fetch_keys(pin)
+                engine._opt_state.pop(path, None)  # cold
+                contrib = worker._train_path(path, load_shard_locked(),
+                                             task["batch_size"], task["gen_id"])
+                if not contrib.empty:
+                    digest = pseudograd_digest(contrib.shared_delta)
+            except _CheckAborted:
+                pass  # abstain: the base aged out
+            engine._opt_state.pop(path, None)  # leave no warm trace of the check
+            ack = _rpc_send(sch, send_lock, max_msg_bytes,
+                            {"type": "commit", "check_only": True, "path": path,
+                             "worker_id": wid, "lease": lease, "digest": digest,
+                             "gen_id": task["gen_id"]})
+            if ack is None:
+                raise OSError("scheduler disconnected during check commit")
+            continue
+
         stop_beat = threading.Event()
         beat = threading.Thread(target=_sch_heartbeat,
                                 args=(sch_send, stop_beat, heartbeat_interval, wid, lease, path),
                                 daemon=True)
         beat.start()
+        base, digest = None, None
         try:
             if fault_hook is not None:
                 fault_hook(path, 1)
@@ -1460,19 +1675,21 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
             if cold:
                 engine._opt_state.pop(path, None)  # reset Adam on a cold start
                 residuals.pop(path, None)          # and any stale error-feedback carry
-            if task.get("shard") is not None:
-                shard_cache[path] = restore_shard(task["shard"])
-            elif task.get("shard_spec") is not None and path not in shard_cache:
-                shard_cache[path] = _materialize_from_spec(task["shard_spec"], data_ctx)
-            shard = shard_cache[path]
+            shard = load_shard_locked()
             contrib = worker._train_path(path, shard, task["batch_size"], task["gen_id"])
+            if audit and not contrib.empty:
+                # Pin the exact base for checkers, and digest this contribution.
+                base = {k: list(versions[k]) for k in routing if k in versions}
+                digest = pseudograd_digest(contrib.shared_delta)
         finally:
             stop_beat.set()
             beat.join(timeout=1)
 
-        ack = _rpc_send(sch, send_lock, max_msg_bytes,
-                        {"type": "commit", "path": path, "worker_id": wid, "lease": lease,
-                         "loss": contrib.loss, "empty": contrib.empty})
+        commit = {"type": "commit", "path": path, "worker_id": wid, "lease": lease,
+                  "loss": contrib.loss, "empty": contrib.empty}
+        if audit:
+            commit["digest"], commit["base"] = digest, base
+        ack = _rpc_send(sch, send_lock, max_msg_bytes, commit)
         if ack is None:
             raise OSError("scheduler disconnected during commit")
         if ack.get("accepted"):

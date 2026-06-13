@@ -1,13 +1,43 @@
 # Phase 3 design — Byzantine-robust aggregation (the trust wall, §1.1)
 
-Status: **slices 3a + 3b landed.** 3a: `schedule/aggregate.py` robust combiner
-+ owner-side quorum buffering. 3b: `schedule/reputation.py` +
-`schedule/ratelimit.py` — per-peer reputation (scheduler-scored from commit
-outcomes, gates owner eligibility via the `EpochManager` predicate, scales the
-rate limiter, checkpoint-persisted) and a per-peer token bucket against
-bandwidth amplification (§1.14). Slices 3c–3d pending. Expands the Phase 3
-sketch in [internet-scale-plan.md](internet-scale-plan.md). Decisions D1–D8
-state the options and the chosen path; §5 records the four operator calls.
+Status: **slices 3a + 3b + 3c landed.** 3a: `schedule/aggregate.py` robust
+combiner + owner-side quorum buffering. 3b: `schedule/reputation.py` +
+`schedule/ratelimit.py`. 3c: version-pinned redundant execution — owner version
+history + pinned fetch, `pseudograd_digest`, scheduler audit groups (sampled
+primaries report a pinned base + digest; surplus workers re-run them cold from
+that base and report digests; agreement credits, the odd one out is debited),
+absorbing the §1.9 oversupply. Slice 3d pending. Expands the Phase 3 sketch in
+[internet-scale-plan.md](internet-scale-plan.md). Decisions D1–D8 state the
+options and the chosen path; §5 records the four operator calls.
+
+**3c amendments — the big one, found while building (the design's D2 was unsound):**
+- *D2 assumed two workers training "the same (path, generation, shard)" produce
+  the same update. Under async they don't:* the pseudo-gradient is `global −
+  local`, so it depends entirely on the **base weights** fetched, and in the
+  async sharded path the base is a moving target (any push between two workers'
+  fetches changes it). A brittle digest over a drifting base would **falsely
+  debit honest workers** — worse than no redundancy. Surfaced to the operator;
+  resolved by **version-pinned reproducible bases** (chosen over coarse
+  statistical agreement / deferral).
+- *Mechanism:* owners keep a bounded **version history** per key
+  (`version_history`, default 1 = off) so a checker can fetch the *exact*
+  version the primary trained against even after the module advanced
+  (`_fetch(pin={key: version})`; aged-out → `missing` → the audit abstains, no
+  false blame). Audited tasks (primary **and** checkers) run **cold** — a warm
+  inner-optimizer state can't cross the wire (a core invariant), so
+  reproducibility requires resetting it; this perturbs the audited fraction's
+  training slightly, a documented cost.
+- *Detection, not prevention.* The audited primary **still pushes immediately**
+  (critical-path speed preserved); checkers run *after* it, from the pinned
+  base in owner history, and disagreement adjusts reputation. A bad primary's
+  update lands once, then its reputation tanks (demotion + lease deprioritization
+  from 3b) and — for shared modules — robust aggregation (3a) already diluted
+  it. *Prevention* (hold-until-agreed) for the modules that most need it
+  (private, single-contributor) is slice 3d's proposal-gating, built on this
+  same checker mechanism.
+- *Memory/throughput cost is gated:* `redundancy_rate=0` (default) creates no
+  audits and `version_history=1` snapshots nothing — the normal path is
+  byte-identical to Phase 2. Costs are paid only when redundancy is switched on.
 
 **3b amendments (discovered while building):**
 - *Floor sits **above** the owner-eligibility threshold, by design.* The

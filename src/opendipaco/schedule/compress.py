@@ -29,6 +29,10 @@ convergence impact belongs to the plan's §0f WAN validation.
 
 from __future__ import annotations
 
+import hashlib
+import math
+import struct
+
 import torch
 
 MODES = ("none", "bf16", "int8")
@@ -82,6 +86,32 @@ def _quantize_int8(t: torch.Tensor) -> tuple[dict, torch.Tensor]:
         return {"q": q, "s": 0.0}, t.clone()
     q = torch.round(t / scale).clamp_(-127, 127).to(torch.int8)
     return {"q": q, "s": scale}, t - q.float() * scale
+
+
+def pseudograd_digest(shared_delta: dict) -> str:
+    """A stable hash of a contribution's shared pseudo-gradients, for redundant-
+    execution agreement (Phase 3c).
+
+    Two workers training the same (path, generation, shard) from the same base
+    weights produce the *same* update; the digest lets the scheduler check that
+    cheaply without holding the tensors. Quantizing each tensor to symmetric
+    int8 before hashing collapses the low-order fp differences that
+    nondeterministic kernels introduce across heterogeneous hardware, so honest
+    replicas agree while a materially different (e.g. fabricated or sign-flipped)
+    update lands on a different digest. Keys are hashed in sorted order so the
+    digest is independent of dict iteration order.
+    """
+    h = hashlib.sha256()
+    for key in sorted(shared_delta):
+        h.update(key.encode("utf-8"))
+        for t in shared_delta[key]:
+            payload, _ = _quantize_int8(t)
+            q, s = payload["q"], payload["s"]
+            # Bucket the scale coarsely: tiny absmax jitter shouldn't flip the
+            # digest, but an order-of-magnitude difference should.
+            h.update(struct.pack(">q", round(math.log(s) * 1e3) if s > 0 else 0))
+            h.update(q.numpy().tobytes())
+    return h.hexdigest()
 
 
 def compress_delta(delta, mode: str, carry=None):
