@@ -1,10 +1,34 @@
 # Phase 3 design — Byzantine-robust aggregation (the trust wall, §1.1)
 
-Status: **slice 3a landed** (`schedule/aggregate.py` robust combiner +
-owner-side quorum buffering with timeout flush; `robustness: off` default,
-bit-identical to the Phase 2 anchor). Slices 3b–3d pending. Expands the Phase 3
+Status: **slices 3a + 3b landed.** 3a: `schedule/aggregate.py` robust combiner
++ owner-side quorum buffering. 3b: `schedule/reputation.py` +
+`schedule/ratelimit.py` — per-peer reputation (scheduler-scored from commit
+outcomes, gates owner eligibility via the `EpochManager` predicate, scales the
+rate limiter, checkpoint-persisted) and a per-peer token bucket against
+bandwidth amplification (§1.14). Slices 3c–3d pending. Expands the Phase 3
 sketch in [internet-scale-plan.md](internet-scale-plan.md). Decisions D1–D8
 state the options and the chosen path; §5 records the four operator calls.
+
+**3b amendments (discovered while building):**
+- *Floor sits **above** the owner-eligibility threshold, by design.* The
+  Sybil tension — "new peers start low" vs. "a fresh cluster needs owners" —
+  resolves by making reputation *exclude proven-bad* peers, not *require a
+  track record*: floor `0.5` > `min_owner_reputation` `0.25`, so a brand-new
+  honest peer bootstraps as an owner, and only a peer **debited below** the
+  gate is demoted. Lease priority/throttle still favor proven peers (floor is
+  below the earned maximum).
+- *Reputation/rate-limiting key on the **authenticated** `peer_id`* (threaded
+  from the reactor in 2b), never the self-assigned `worker_id`. A contribution
+  with no identity (`peer_id is None`, HMAC trusted-cluster mode) is untracked
+  and ungated — reputation is the open-enrollment defense, off by construction
+  when everyone already shares a secret.
+- *Demotion is grace-paced, not instant.* A peer dropped below the gate stops
+  being refreshed in the `EpochManager` and leaves the owner set after
+  `owner_grace` (the same hysteresis as a dead owner), avoiding flap; its
+  in-flight damage is contained by robust aggregation (3a) meanwhile.
+- *Owner-behavior reputation is not yet a signal.* 3b scores **worker**
+  behavior (commit accept/reject); detecting an owner serving bad weights
+  needs the cross-checks of 3c. Documented, not silently assumed.
 
 **3a amendments (discovered while building, like Phase 2's):**
 - *Per-key buffering, not `(key, generation)`.* The design floated bucketing by

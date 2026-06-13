@@ -60,6 +60,8 @@ from .distributed import (
 )
 from .aggregate import check_aggregate, robust_delta
 from .guard import all_finite, clip_norm_, loss_ok
+from .ratelimit import RateLimiter
+from .reputation import Reputation
 from .identity import sign_record, verify_record
 from .ownership import (
     EpochManager,
@@ -846,10 +848,19 @@ class Scheduler(_ReactorServer):
                  host="0.0.0.0", port=0, auth_key=None, seed=0,
                  staleness_bound=None, staleness_weight="inverse",
                  heartbeat_timeout=30.0, ps_tls=None, grant_key=None,
-                 identity=None, compress="none", idle_backoff=None, **reactor_kw):
+                 identity=None, compress="none", idle_backoff=None,
+                 reputation=None, rate_limiter=None, min_owner_reputation=0.25,
+                 **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.ps_tls = ps_tls  # client context for the scheduler's checkpoint RPCs to PSs
         self.grant_key = grant_key  # shared with the PSs (not workers) to sign grants
+        # Reputation (Phase 3b): scores authenticated peers from commit outcomes,
+        # gates owner eligibility (>= min_owner_reputation; the floor sits above
+        # it so fresh peers bootstrap), and scales the rate limiter. Both default
+        # to constructed instances; pass configured ones, or None to disable.
+        self.reputation = reputation if reputation is not None else Reputation()
+        self.rate_limiter = rate_limiter if rate_limiter is not None else RateLimiter()
+        self.min_owner_reputation = min_owner_reputation
         # With an Ed25519 identity, grants are signed instead (servers verify
         # via ``scheduler_pub=``) and epoch records can be published (Phase 2a).
         self.identity = identity
@@ -899,9 +910,9 @@ class Scheduler(_ReactorServer):
     def _handle(self, msg: dict, nbytes: int, peer_id: str | None = None):
         kind = msg.get("type")
         if kind == "request":
-            return self._next_task(msg)
+            return self._next_task(msg, peer_id)
         if kind == "commit":
-            return self._commit(msg)
+            return self._commit(msg, peer_id)
         if kind == "routing":
             return self._fresh_routing(msg)
         if kind == "heartbeat":
@@ -960,7 +971,9 @@ class Scheduler(_ReactorServer):
             raise RuntimeError("watch_tracker needs the scheduler's identity=")
         from .tracker import fetch_directory, get_epoch, put_epoch  # lazy: tracker imports this
 
-        manager = EpochManager(owner_grace=owner_grace, min_epoch_interval=min_epoch_interval)
+        manager = EpochManager(
+            owner_grace=owner_grace, min_epoch_interval=min_epoch_interval,
+            is_eligible=lambda pid: self.reputation.eligible(pid, self.min_owner_reputation))
         addr = tuple(tracker_addr)
         # Restart continuity: re-adopt our own cached record from the tracker
         # (it is self-signed -- nobody else can plant one). This restores both
@@ -1027,7 +1040,7 @@ class Scheduler(_ReactorServer):
         except (KeyError, IndexError, TypeError, ValueError):
             return {"type": "routing", "routing": None}  # malformed path
 
-    def _next_task(self, req: dict) -> dict:
+    def _next_task(self, req: dict, peer_id: str | None = None) -> dict:
         wid = req.get("worker_id")
         warm = {tuple(p) for p in req.get("warm_paths", [])}
         cached = {tuple(p) for p in req.get("cached_shards", [])}
@@ -1042,6 +1055,11 @@ class Scheduler(_ReactorServer):
             self._reclaim_inflight_locked()
             eligible = [p for p in self._completed if p not in self._inflight]
             if not eligible:
+                return self._idle()
+            # Rate limit only the *expensive* path (issuing a task with a
+            # weight/shard payload): a throttled peer gets a cheap backoff idle,
+            # not a disconnect (§1.14). Reputation scales its bucket.
+            if not self.rate_limiter.allow(peer_id, reputation=self.reputation.get(peer_id)):
                 return self._idle()
             path = min(eligible, key=lambda p: (self._completed[p], p not in warm, p))
             lease = uuid.uuid4().hex  # unique per lease; fences commit/heartbeat
@@ -1075,37 +1093,49 @@ class Scheduler(_ReactorServer):
             "seed": self.seed,
         }
 
-    def _commit(self, msg: dict) -> dict:
+    def _commit(self, msg: dict, peer_id: str | None = None) -> dict:
         path = msg["path"]
-        with self._lock:
-            lease = self._lease.get(path)
-            if path not in self._inflight or msg.get("lease") != lease:
-                # stale / already freed / not the current lease holder
-                return {"type": "commit_ack", "accepted": False}
-            staleness = self._T - self._issued.get(path, self._T)
-            self._inflight.pop(path, None)
-            self._lease.pop(path, None)
-            if staleness > self.staleness_bound:
-                self.metrics.record_stale_reject()
-                return {"type": "commit_ack", "accepted": False}
-            # A non-finite inner loss means the worker's training diverged (or its
-            # hardware is faulty) -- don't grant a push for it. The empty-shard
-            # no-op convention (loss=NaN, nothing to push) stays accepted.
-            if not loss_ok(msg.get("loss"), empty=bool(msg.get("empty"))):
-                self.metrics.record_invalid_reject()
-                return {"type": "commit_ack", "accepted": False}
-            self._T += 1
-            self._completed[path] = self._completed.get(path, 0) + 1
-            damp = 1.0 / (1.0 + staleness) if self.staleness_weight == "inverse" else 1.0
-            push_weight = self.corpus.shard_weight(self.topology.path_index(path)) * damp
-            self.metrics.record_update(staleness)
-            # The grant carries the verdict to the parameter servers: weight and
-            # allowed keys come from here, the lease token makes it single-use.
-            grant = make_grant(path, self.topology.path_module_keys(path),
-                               push_weight, lease, self.grant_key,
-                               identity=self.identity)
-            return {"type": "commit_ack", "accepted": True,
-                    "push_weight": push_weight, "grant": grant}
+        # Reputation verdict, applied after the lock: ``True`` credit (accepted),
+        # ``False`` debit (the worker reported a non-finite loss -- diverged or
+        # faulty), ``None`` neutral (stale / lost-lease: timing, not behavior).
+        rep = None
+        try:
+            with self._lock:
+                lease = self._lease.get(path)
+                if path not in self._inflight or msg.get("lease") != lease:
+                    # stale / already freed / not the current lease holder
+                    return {"type": "commit_ack", "accepted": False}
+                staleness = self._T - self._issued.get(path, self._T)
+                self._inflight.pop(path, None)
+                self._lease.pop(path, None)
+                if staleness > self.staleness_bound:
+                    self.metrics.record_stale_reject()
+                    return {"type": "commit_ack", "accepted": False}
+                # A non-finite inner loss means the worker's training diverged (or
+                # its hardware is faulty) -- don't grant a push for it. The
+                # empty-shard no-op convention (loss=NaN, nothing) stays accepted.
+                if not loss_ok(msg.get("loss"), empty=bool(msg.get("empty"))):
+                    self.metrics.record_invalid_reject()
+                    rep = False
+                    return {"type": "commit_ack", "accepted": False}
+                self._T += 1
+                self._completed[path] = self._completed.get(path, 0) + 1
+                damp = 1.0 / (1.0 + staleness) if self.staleness_weight == "inverse" else 1.0
+                push_weight = self.corpus.shard_weight(self.topology.path_index(path)) * damp
+                self.metrics.record_update(staleness)
+                # The grant carries the verdict to the parameter servers: weight
+                # and allowed keys come from here, the lease token makes it single-use.
+                grant = make_grant(path, self.topology.path_module_keys(path),
+                                   push_weight, lease, self.grant_key,
+                                   identity=self.identity)
+                rep = True
+                return {"type": "commit_ack", "accepted": True,
+                        "push_weight": push_weight, "grant": grant}
+        finally:
+            if rep is True:
+                self.reputation.credit(peer_id)
+            elif rep is False:
+                self.reputation.debit(peer_id)
 
     def _heartbeat(self, msg: dict) -> None:
         path = msg["path"]
@@ -1205,7 +1235,8 @@ class Scheduler(_ReactorServer):
                 self._manifest = manifest
         with self._lock:
             state = {"T": self._T, "completed": dict(self._completed),
-                     "epoch": -1 if record is None else record["epoch"]}
+                     "epoch": -1 if record is None else record["epoch"],
+                     "reputation": self.reputation.snapshot()}
         tmp = os.path.join(dirpath, "scheduler.pt.tmp")
         torch.save(state, tmp)
         os.replace(tmp, os.path.join(dirpath, "scheduler.pt"))
@@ -1219,6 +1250,7 @@ class Scheduler(_ReactorServer):
             self._T = state["T"]
             self._completed = dict(state["completed"])
             self._epoch_floor = max(self._epoch_floor, int(state.get("epoch", -1)) + 1)
+        self.reputation.restore(state.get("reputation") or {})
         mpath = os.path.join(dirpath, "manifest.json")
         if self.identity is not None and os.path.exists(mpath):
             with open(mpath, encoding="utf-8") as f:
