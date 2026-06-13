@@ -30,7 +30,7 @@ def _build_module(topo: PathTopology, bb, key: str) -> nn.Module:
     return BlockModule(bb, topo.layers_of_key(key), topo.offset_of_key(key))
 
 
-def build_module_bank(config: DiPaCoConfig) -> dict[str, nn.Module]:
+def build_module_bank(config: DiPaCoConfig, *, seed: int | None = None) -> dict[str, nn.Module]:
     """Create one authoritative instance of every module in the topology.
 
     With ``identical_expert_init`` (the default, matching the paper's ``θ̄``), all
@@ -38,7 +38,16 @@ def build_module_bank(config: DiPaCoConfig) -> dict[str, nn.Module]:
     per-path copies of a private module -- start identical and diverge only via
     training. Otherwise each gets an independent random init. The returned dict is
     the canonical set of weights the outer optimizer maintains.
+
+    ``seed`` makes the build a pure function of (config, seed): two processes
+    that pass the same seed get bit-identical banks. Replicated module owners
+    rely on this -- version ``(0, 0)`` must mean the same bytes on every owner
+    (``schedule/sharded.py``). ``None`` keeps today's ambient-RNG behavior.
     """
+    if seed is not None:
+        with torch.random.fork_rng(devices=[]):  # don't disturb the caller's RNG
+            torch.manual_seed(seed)
+            return build_module_bank(config)
     bb = config.backbone
     topo = config.build_topology()
     bank: dict[str, nn.Module] = {}

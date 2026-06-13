@@ -95,6 +95,9 @@ class TransportCfg:
     # ``admitted_peers`` lists the public keys (hex) a server accepts.
     identity_key: str | None = None
     admitted_peers: list[str] = field(default_factory=list)
+    # Rendezvous ownership: the scheduler's public key (hex). Owners verify
+    # epoch records and Ed25519 commit grants against it.
+    scheduler_pub: str | None = None
     # Sharded mode: secret shared by the scheduler + parameter servers (NOT workers)
     # that signs commit grants, so workers can't forge push weights.
     grant_key: str | None = None
@@ -127,10 +130,36 @@ class ShardedCfg:
 @dataclass
 class TrackerCfg:
     host: str = "0.0.0.0"
+    connect_host: str | None = None    # address peers dial (defaults from host)
     port: int = 29600
     ttl: float = 120.0                 # registrations expire unless re-registered
     open_enrollment: bool = False      # True: any validly-signed record may register
     enroll_peers: list[str] = field(default_factory=list)  # pubkeys allowed to register
+
+
+@dataclass
+class OwnershipCfg:
+    """Dynamic module ownership (Phase 2; ``docs/phase2-design.md``).
+
+    ``static`` keeps today's fixed ``assign_shards`` parameter servers.
+    ``rendezvous`` derives ownership from tracker liveness: owners register
+    with the tracker, the scheduler signs owner-set epochs (HRW placement,
+    ``k`` replicas per key, primary-only writes, pull replication), and
+    failover is automatic. Rendezvous mode needs the ``tracker`` section, a
+    scheduler ``transport.identity_key``, and ``transport.scheduler_pub`` on
+    the owners/parameter servers.
+    """
+
+    mode: str = "static"               # "static" | "rendezvous"
+    k: int = 3                         # replicas per module key (rank 0 = primary)
+    salt: str = ""                     # run-level placement salt (changing it remaps all)
+    bank_seed: int = 0                 # shared init seed: (0,0) = same bytes everywhere
+    replicate_interval: float = 10.0   # backup pull cadence = the failover loss window
+    owner_grace: float = 240.0         # owner unseen this long -> dropped next epoch
+    min_epoch_interval: float = 60.0   # at most one epoch bump per this many seconds
+    epoch_poll_interval: float = 5.0   # scheduler's tracker-directory poll cadence
+    heartbeat_interval: float = 30.0   # owner -> tracker re-registration (keep < ttl)
+    advertise_host: str | None = None  # address other peers dial for this owner
 
 
 @dataclass
@@ -159,12 +188,13 @@ class LaunchConfig:
     tls: TLSCfg = field(default_factory=TLSCfg)
     sharded: ShardedCfg = field(default_factory=ShardedCfg)
     tracker: TrackerCfg = field(default_factory=TrackerCfg)
+    ownership: OwnershipCfg = field(default_factory=OwnershipCfg)
     run: RunCfg = field(default_factory=RunCfg)
 
     _SECTIONS = {  # name -> dataclass (class attr, not a field)
         "model": ModelCfg, "diloco": DiLoCoCfg, "data": DataCfg,
         "transport": TransportCfg, "tls": TLSCfg, "sharded": ShardedCfg,
-        "tracker": TrackerCfg, "run": RunCfg,
+        "tracker": TrackerCfg, "ownership": OwnershipCfg, "run": RunCfg,
     }
 
     @classmethod
@@ -182,6 +212,12 @@ class LaunchConfig:
     def connect_addr(self) -> tuple[str, int]:
         """Address a worker dials for the coordinator/scheduler."""
         t = self.transport
+        host = t.connect_host or (t.host if t.host not in ("0.0.0.0", "::") else "127.0.0.1")
+        return host, t.port
+
+    def tracker_connect_addr(self) -> tuple[str, int]:
+        """Address peers dial for the tracker."""
+        t = self.tracker
         host = t.connect_host or (t.host if t.host not in ("0.0.0.0", "::") else "127.0.0.1")
         return host, t.port
 

@@ -1,6 +1,14 @@
 from .distributed import CoordinatorServer, run_worker
 from .identity import PeerIdentity, peer_id_of, sign_record, verify_record
 from .observability import MetricsExporter, MetricsLogger
+from .ownership import (
+    EpochManager,
+    make_epoch_record,
+    owner_eligible,
+    owners_for,
+    rank_owners,
+    verify_epoch_record,
+)
 from .reactor import TransportMetrics
 from .scheduler import AsyncScheduler, Contribution, Preempt, TransientFault
 from .sharded import (
@@ -16,8 +24,10 @@ from .tracker import (
     Tracker,
     deregister_peer,
     fetch_directory,
+    get_epoch,
     import_records,
     make_peer_record,
+    put_epoch,
     register_peer,
 )
 
@@ -50,4 +60,12 @@ __all__ = [
     "deregister_peer",
     "fetch_directory",
     "import_records",
+    "put_epoch",
+    "get_epoch",
+    "owner_eligible",
+    "EpochManager",
+    "rank_owners",
+    "owners_for",
+    "make_epoch_record",
+    "verify_epoch_record",
 ]

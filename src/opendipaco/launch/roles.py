@@ -66,14 +66,35 @@ def _accept_keys(cfg: LaunchConfig):
     return list(cfg.transport.accept_keys) or None
 
 
-def _server_kw(cfg: LaunchConfig) -> dict:
+def _server_kw(cfg: LaunchConfig, extra_admitted=None) -> dict:
     kw = dict(auth_key=cfg.transport.auth_key, accept_keys=_accept_keys(cfg),
               tls=build_tls_server(cfg))
-    if cfg.transport.admitted_peers:
-        kw["admitted_peers"] = list(cfg.transport.admitted_peers)
+    admitted = list(cfg.transport.admitted_peers) + list(extra_admitted or [])
+    if admitted:
+        kw["admitted_peers"] = admitted
     if cfg.transport.max_msg_bytes is not None:
         kw["max_msg_bytes"] = cfg.transport.max_msg_bytes
     return kw
+
+
+def _advertise_host(cfg: LaunchConfig) -> str:
+    """The address other peers dial for this owner: the explicit
+    ``ownership.advertise_host``, else ``transport.connect_host``, else the
+    bind host when it is a real address (same defaulting as ``connect_addr``
+    -- only a wildcard bind falls back to loopback)."""
+    t = cfg.transport
+    return (cfg.ownership.advertise_host or t.connect_host
+            or (t.host if t.host not in ("0.0.0.0", "::") else "127.0.0.1"))
+
+
+def _node_identity(cfg: LaunchConfig, identity=None, *, generate=False):
+    """This node's Ed25519 identity: an explicit object, the configured key
+    file, or (rendezvous in-process smoke) a freshly generated one."""
+    if identity is not None:
+        return identity
+    if cfg.transport.identity_key:
+        return PeerIdentity.load(cfg.transport.identity_key)
+    return PeerIdentity.generate() if generate else None
 
 
 def _worker_auth(cfg: LaunchConfig):
@@ -200,14 +221,29 @@ def run_coordinator(cfg: LaunchConfig, *, on_start=None):
     return server, completed
 
 
-def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None):
-    """Sharded scheduler (no weights): drive the run against the parameter servers."""
+def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None, identity=None,
+                  tracker_addr=None, extra_admitted=None):
+    """Sharded scheduler (no weights): drive the run against the parameter servers.
+
+    With ``ownership.mode: rendezvous`` there are no fixed parameter servers:
+    the scheduler signs owner-set epochs from tracker liveness
+    (``watch_tracker``) and routing derives from the current epoch.
+    """
     model, diloco = dipaco_config(cfg.model), diloco_config(cfg.diloco)
     docs = build_documents(cfg)
     corpus = build_corpus(cfg, model, docs)
-    addrs = ps_addrs if ps_addrs is not None else [tuple(a) for a in cfg.sharded.parameter_servers]
-    if not addrs:
-        raise ValueError("sharded mode needs sharded.parameter_servers (or ps_addrs)")
+    own = cfg.ownership
+    rendezvous = own.mode == "rendezvous"
+    if own.mode not in ("static", "rendezvous"):
+        raise ValueError(f"ownership.mode must be 'static' or 'rendezvous', got {own.mode!r}")
+    ident = _node_identity(cfg, identity, generate=rendezvous)
+    if rendezvous:
+        addrs = []
+    else:
+        addrs = (ps_addrs if ps_addrs is not None
+                 else [tuple(a) for a in cfg.sharded.parameter_servers])
+        if not addrs:
+            raise ValueError("sharded mode needs sharded.parameter_servers (or ps_addrs)")
     scheduler = Scheduler(
         model, corpus, addrs, diloco, batch_size=cfg.run.batch_size,
         host=cfg.transport.host, port=cfg.transport.port, seed=cfg.run.seed,
@@ -215,10 +251,21 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None):
         staleness_weight=cfg.transport.staleness_weight,
         heartbeat_timeout=cfg.transport.heartbeat_timeout,
         ps_tls=build_tls_client(cfg), grant_key=cfg.transport.grant_key,
-        compress=cfg.transport.compress,
-        idle_backoff=cfg.transport.idle_backoff, **_server_kw(cfg))
+        identity=ident, compress=cfg.transport.compress,
+        idle_backoff=cfg.transport.idle_backoff, **_server_kw(cfg, extra_admitted))
     scheduler.start()
     _attach_metrics(scheduler, cfg)
+    if rendezvous:
+        if cfg.run.resume and cfg.run.checkpoint_dir:
+            # Load the clock + epoch floor + manifest *before* the first epoch
+            # is published: a resumed run must never re-flag bootstrap nor
+            # restart epoch numbering below what live owners hold.
+            scheduler._load_state(cfg.run.checkpoint_dir)
+        scheduler.watch_tracker(
+            tracker_addr or cfg.tracker_connect_addr(), k=own.k, salt=own.salt,
+            owner_grace=own.owner_grace, min_epoch_interval=own.min_epoch_interval,
+            poll_interval=own.epoch_poll_interval, tracker_auth=cfg.transport.auth_key,
+            tracker_tls=build_tls_client(cfg))
     if on_start:
         on_start(scheduler)
     completed = scheduler.fit(
@@ -238,19 +285,48 @@ def _ps_port(cfg: LaunchConfig, shard_id: int, port) -> int:
     return 0
 
 
-def run_parameter_server(cfg: LaunchConfig, shard_id: int, *, port=None,
-                         on_start=None, stop_event=None):
-    """One parameter-server shard: own a disjoint slice of keys; serve until stopped."""
+def run_parameter_server(cfg: LaunchConfig, shard_id: int = 0, *, port=None,
+                         on_start=None, stop_event=None, identity=None,
+                         scheduler_addr=None, tracker_addr=None, scheduler_pub=None,
+                         extra_admitted=None):
+    """One parameter server: own module keys; serve until stopped.
+
+    Static mode owns a fixed ``assign_shards`` slice (``shard_id``). With
+    ``ownership.mode: rendezvous`` the node is a dynamic **owner**: it
+    heartbeats the tracker, polls the scheduler for owner-set epochs, and its
+    keys (with replication, promotion, and per-key checkpoints) follow from
+    them -- ``shard_id`` is ignored.
+    """
     model, diloco = dipaco_config(cfg.model), diloco_config(cfg.diloco)
-    keys = sorted(model.build_topology().module_keys())
-    assignment = assign_shards(keys, cfg.sharded.num_shards)
-    owned = [k for k, s in assignment.items() if s == shard_id]
-    ps = ParameterServer(
-        model, owned, diloco, host=cfg.transport.host, port=_ps_port(cfg, shard_id, port),
-        device=cfg.run.device, grant_key=cfg.transport.grant_key,
+    own = cfg.ownership
+    resume_dir = cfg.run.checkpoint_dir if cfg.run.resume else None
+    common = dict(
+        host=cfg.transport.host, device=cfg.run.device,
+        grant_key=cfg.transport.grant_key,
         max_update_norm=cfg.transport.max_update_norm, compress=cfg.transport.compress,
-        resume_dir=cfg.run.checkpoint_dir if cfg.run.resume else None, **_server_kw(cfg))
-    ps.start()
+        resume_dir=resume_dir)
+    if own.mode == "rendezvous":
+        ident = _node_identity(cfg, identity, generate=True)
+        ps = ParameterServer(
+            model, [], diloco, port=port if port is not None else 0,
+            identity=ident,
+            scheduler_pub=scheduler_pub or cfg.transport.scheduler_pub,
+            scheduler_addr=scheduler_addr or cfg.connect_addr(),
+            replicate_interval=own.replicate_interval, bank_seed=own.bank_seed,
+            peer_tls=build_tls_client(cfg),
+            **common, **_server_kw(cfg, extra_admitted))
+        ps.start()
+        ps.start_tracker_heartbeat(
+            tracker_addr or cfg.tracker_connect_addr(), _advertise_host(cfg),
+            interval=own.heartbeat_interval, auth_key=cfg.transport.auth_key,
+            tls=build_tls_client(cfg))
+    else:
+        keys = sorted(model.build_topology().module_keys())
+        assignment = assign_shards(keys, cfg.sharded.num_shards)
+        owned = [k for k, s in assignment.items() if s == shard_id]
+        ps = ParameterServer(model, owned, diloco, port=_ps_port(cfg, shard_id, port),
+                             **common, **_server_kw(cfg, extra_admitted))
+        ps.start()
     _attach_metrics(ps, cfg)
     if on_start:
         on_start(ps)
@@ -319,6 +395,8 @@ def _run_local_coordinator(cfg: LaunchConfig):
 
 
 def _run_local_sharded(cfg: LaunchConfig):
+    if cfg.ownership.mode == "rendezvous":
+        return _run_local_rendezvous(cfg)
     n = cfg.sharded.num_shards
     stops = [threading.Event() for _ in range(n)]
     readies = [threading.Event() for _ in range(n)]
@@ -362,6 +440,65 @@ def _run_local_sharded(cfg: LaunchConfig):
         s.set()                     # tell the parameter servers to stop
     for t in ps_threads:
         t.join(timeout=10)
+    for w in workers:
+        w.join(timeout=5)
+    return sresult["r"]
+
+
+def _run_local_rendezvous(cfg: LaunchConfig):
+    """Whole rendezvous cluster in one process: tracker + scheduler (epoch
+    authority) + ``sharded.num_shards`` dynamic owners + workers, with
+    ephemeral ports and freshly generated identities."""
+    import os as _os
+
+    n = cfg.sharded.num_shards
+    if cfg.transport.auth_key is None:
+        # The owners' identity auth makes servers challenge everyone; give the
+        # workers/scheduler a shared secret so they can answer too.
+        cfg.transport.auth_key = _os.urandom(16).hex()
+    sched_id = PeerIdentity.generate()
+    owner_ids = [PeerIdentity.generate() for _ in range(n)]
+    owner_pubs = [i.public_key_hex for i in owner_ids]
+
+    tracker = Tracker(host="127.0.0.1", port=0, open_enrollment=True,
+                      ttl=cfg.tracker.ttl, auth_key=cfg.transport.auth_key)
+    tracker.start()
+    taddr = ("127.0.0.1", tracker.port)
+
+    sbox, sready, sresult = {}, threading.Event(), {}
+
+    def on_sched_start(s):
+        sbox["s"] = s
+        sready.set()
+
+    st = threading.Thread(
+        target=lambda: sresult.__setitem__("r", run_scheduler(
+            cfg, on_start=on_sched_start, identity=sched_id, tracker_addr=taddr,
+            extra_admitted=owner_pubs)), daemon=True)
+    st.start()
+    if not sready.wait(timeout=60):
+        raise RuntimeError("scheduler did not start")
+    saddr = ("127.0.0.1", sbox["s"].port)
+
+    stops = [threading.Event() for _ in range(n)]
+    ps_threads = [threading.Thread(target=run_parameter_server, kwargs=dict(
+        cfg=cfg, port=0, identity=owner_ids[i], scheduler_addr=saddr,
+        tracker_addr=taddr, scheduler_pub=sched_id.public_key_hex,
+        extra_admitted=[p for j, p in enumerate(owner_pubs) if j != i],
+        stop_event=stops[i]), daemon=True) for i in range(n)]
+    for t in ps_threads:
+        t.start()
+    workers = [threading.Thread(target=run_worker_role,
+                                kwargs=dict(cfg=cfg, scheduler_addr=saddr), daemon=True)
+               for _ in range(cfg.run.local_workers)]
+    for w in workers:
+        w.start()
+    st.join()                       # scheduler trains to budget, then shuts down
+    for s in stops:
+        s.set()
+    for t in ps_threads:
+        t.join(timeout=10)
+    tracker.shutdown()
     for w in workers:
         w.join(timeout=5)
     return sresult["r"]

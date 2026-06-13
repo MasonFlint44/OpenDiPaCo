@@ -146,7 +146,7 @@ class CoordinatorServer(_ReactorServer):
         self._lease: dict = {}              # path -> current lease token (fences submits)
         self._outer_opts: dict = {}         # shared key -> per-module SGD+Nesterov
 
-    def _handle(self, msg: dict, nbytes: int):
+    def _handle(self, msg: dict, nbytes: int, peer_id: str | None = None):
         kind = msg.get("type")
         if kind == "request":
             return self._next_task(msg)
