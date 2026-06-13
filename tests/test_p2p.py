@@ -73,3 +73,54 @@ def test_addrs_are_dialable_p2p_multiaddrs():
         assert str(info.peer_id) == server.libp2p_id
     finally:
         server.close()
+
+
+# -- an owner (ParameterServer) served over libp2p -----------------------------
+
+
+def _cfg():
+    from opendipaco import BackboneConfig, DiPaCoConfig
+    bb = BackboneConfig(vocab_size=48, hidden_size=32, num_attention_heads=4,
+                        intermediate_size=64, layers_per_level=[1, 1],
+                        max_position_embeddings=64)
+    return DiPaCoConfig(backbone=bb, level_sizes=[2, 2], sequence_length=16)
+
+
+def test_parameter_server_fetch_and_push_over_libp2p():
+    """The W1 payoff seam: an owner serves its real fetch/push RPC surface over a
+    libp2p Noise stream, with the same effect as a direct call (TCP parity)."""
+    from opendipaco import DiLoCoConfig
+    from opendipaco.schedule import ParameterServer, make_grant
+    from opendipaco.schedule.p2p import serve_over_libp2p
+
+    cfg = _cfg()
+    keys = sorted(cfg.build_topology().module_keys())
+    ps = ParameterServer(cfg, keys, DiLoCoConfig(inner_steps=4), host="127.0.0.1", port=0,
+                         identity=PeerIdentity.generate())
+    owner = serve_over_libp2p(ps)
+    client = Libp2pTransport(PeerIdentity.generate()).start()
+    try:
+        target = dial_info(owner.addrs[0])
+        # fetch over libp2p == direct fetch (versions + weights match).
+        shared = next(k for k in keys if not _is_private(k))
+        reply = client.rpc(target, {"type": "fetch", "keys": [shared], "have": {}}, timeout=20)
+        assert tuple(reply["versions"][shared]) == (0, 0)
+        assert shared in reply["weights"]
+
+        # push a grant over libp2p -> the owner applies it (version bumps).
+        path = cfg.build_topology().path_from_index(0)
+        grad = [torch.ones_like(p) for p in ps.bank[shared].parameters()]
+        grant = make_grant(path, [shared], 1.0, "tok-libp2p")
+        ack = client.rpc(target, {"grant": grant, "updates": {shared: {"grad": grad}},
+                                  "type": "push"}, timeout=20)
+        assert ack["applied"]
+        assert ps._versions[shared] == (0, 1)          # the push landed, via libp2p
+    finally:
+        client.close()
+        owner.close()
+        ps.shutdown()
+
+
+def _is_private(key):
+    from opendipaco.topology import is_private_key
+    return is_private_key(key)

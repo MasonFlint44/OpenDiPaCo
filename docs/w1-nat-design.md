@@ -26,6 +26,26 @@ and **k≥2 relays** per NAT'd peer.
 > stack is threads + a custom event-loop, so a trio↔threads bridge is required
 > (D3) — confined to the transport seam.
 
+**W1a amendments (discovered while building):**
+- *The trio↔threads bridge (the risk) is landed and proven* — `schedule/p2p.py`
+  `Libp2pTransport` runs the host in a trio thread with a synchronous
+  `rpc()`/`serve` facade; our wire codec (incl. tensors) round-trips over a Noise
+  stream; the libp2p id derives from `PeerIdentity` (D4). The async surface is
+  exactly this one module.
+- *Owner-serving is additive, not a reactor rewrite* — `serve_over_libp2p(server)`
+  starts a **parallel** libp2p host that bridges inbound streams to the same
+  `_handle`, so the TCP reactor stays byte-for-byte the anchor (D10) and no
+  shared base class changed. A real `ParameterServer` serves `fetch`/`push` over
+  libp2p with TCP parity (tested) — **owners-over-libp2p, the W1 payoff seam, is
+  proven now**.
+- *Full cluster **orchestration** over libp2p folds into W1b, not W1a.* W1a's
+  table listed "the sharded cluster runs end-to-end over libp2p." Doing that means
+  re-addressing the scheduler routing / epoch records / worker loop from
+  `(host, port)` to multiaddrs — and **W1b changes addressing to circuit-relay
+  multiaddrs anyway**. Reworking addressing once, in W1b (where relays force it),
+  is cleaner than twice. So W1a lands the *seam + owner-serving*; the
+  scheduler/worker orchestration over libp2p rides the W1b addressing change.
+
 ## 1. Goal and trust model
 
 **Goal.** A peer with no public address participates fully — including as a

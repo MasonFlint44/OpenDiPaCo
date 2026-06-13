@@ -51,6 +51,30 @@ def _derive_keypair(identity: PeerIdentity) -> KeyPair:
     return KeyPair(priv, priv.get_public_key())
 
 
+def serve_over_libp2p(server, *, identity: PeerIdentity | None = None,
+                      listen_addrs=("/ip4/127.0.0.1/tcp/0",)) -> "Libp2pTransport":
+    """Serve a server's ``_handle`` over libp2p (W1a owner-serving bridge).
+
+    Additive and non-invasive: the existing TCP reactor is untouched (the byte-
+    for-byte anchor): this starts a *parallel* libp2p host that bridges inbound
+    streams to the same ``_handle(msg, nbytes, peer_id)``. libp2p's Noise
+    handshake authenticates the peer cryptographically, so this path doesn't need
+    the reactor's HMAC challenge. Returns the started transport; ``.addrs`` are
+    the dialable ``/…/p2p/<id>`` multiaddrs to advertise (a public peer's direct
+    addrs today; a NAT'd peer's circuit-relay addrs in W1b).
+    """
+    from .reactor import _nbytes
+
+    ident = identity or getattr(server, "identity", None)
+    if ident is None:
+        raise ValueError("serve_over_libp2p needs an identity (server.identity or identity=)")
+
+    def handler(msg):
+        return server._handle(msg, _nbytes(msg), peer_id=None)
+
+    return Libp2pTransport(ident, handler=handler, listen_addrs=listen_addrs).start()
+
+
 class Libp2pTransport:
     """A synchronous RPC transport backed by a libp2p host (W1a).
 
