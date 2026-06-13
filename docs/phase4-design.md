@@ -14,6 +14,29 @@ operator decisions.
 > **Strategic note (recorded up front, honestly).** Phase 4 is the *optional
 > endgame* in the plan — *"only worth it if tracker availability actually
 > becomes the limiting factor; Phases 0–3 deliver the goal without it."* Two
+**4b amendments (discovered while building):**
+- *The owner-coordinator is added to* ``ParameterServer`` *as a focused
+  ``commit``/``generation`` RPC pair, not a Scheduler refactor.* Sharing the
+  central scheduler's commit code risked the bit-identical ``central`` path, so
+  the owner reuses the **pure** helpers (``assignment.py`` HRW/version-lag,
+  ``make_grant``, ``Reputation``/``RateLimiter``, ``guard.loss_ok``) and the
+  central scheduler is left entirely untouched. Some logic shape repeats; the
+  semantics live in the shared pure functions.
+- *Staleness is version-lag over the keys the coordinator actually holds* (in
+  practice the private coordinator key, whose counter advances once per accepted
+  commit for that path — so it **is** the path's generation clock). The
+  coordinator can't see versions of the path's other modules (they live on other
+  owners), and it doesn't need to: a single-contributor private counter is a
+  faithful per-path staleness, and the ``staleness_bound`` gate still applies.
+- *Audit **resolution** relocates in 4c, not 4b.* The design table put redundant-
+  execution audits in 4b, but they are tightly coupled to the owner-cross-check
+  machinery 4c builds (pinned bases, digest agreement) — moving them with the
+  cross-checks keeps the two coherent. 4b lands the load-bearing trust pieces:
+  owner-minted/owner-verified grants, the version-fence, owner-local reputation,
+  and per-owner rate-limit buckets. ``worker_set`` (the live directory the HRW
+  assignee check reads) is injectable now and gossip-fed in 4d; absent it, the
+  version-fence alone gates (graceful degradation).
+
 > facts are true while building it: (1) the **0f WAN run still hasn't happened**,
 > so we have not measured the central scheduler as a bottleneck — Phase 4
 > optimizes a SPOF whose cost is so far theoretical; and (2) it **reopens the

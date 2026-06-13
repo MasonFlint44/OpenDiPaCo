@@ -64,7 +64,8 @@ from .aggregate import check_aggregate, robust_delta
 from .guard import all_finite, clip_norm_, loss_ok
 from .ratelimit import RateLimiter
 from .reputation import Reputation
-from .identity import sign_record, verify_record
+from .assignment import coordinator_key, is_assignee, path_primary, version_lag
+from .identity import peer_id_of, sign_record, verify_record
 from .ownership import (
     EpochManager,
     epoch_newer,
@@ -148,6 +149,22 @@ def verify_grant(grant, grant_key, *, scheduler_pub: str | None = None) -> bool:
     return hmac.compare_digest(grant.get("mac", ""), expected)
 
 
+def grant_signed_by(grant, expected_peer_id: str | None) -> bool:
+    """Decentralized grant check (Phase 4 D3): an Ed25519 grant signed by exactly
+    ``expected_peer_id`` — the path's primary owner, who mints the grant in place
+    of the (absent) scheduler. Co-owners derive ``expected_peer_id`` from the
+    epoch record, so no shared secret and no central signer are involved; an
+    HMAC/unsigned grant or a grant from any other identity is refused."""
+    if not isinstance(grant, dict) or not grant.get("token") or expected_peer_id is None:
+        return False
+    if not (verify_record(grant) and grant.get("kind") == "grant"):
+        return False
+    try:
+        return peer_id_of(grant.get("pub", "")) == expected_peer_id
+    except (ValueError, TypeError):
+        return False
+
+
 def _opt_to_wire(sd: dict) -> dict:
     """Optimizer state_dicts key their ``state`` by parameter *index* (int) --
     the wire codec only takes str dict keys, so stringify for transport."""
@@ -205,7 +222,11 @@ class ParameterServer(_ReactorServer):
                  peer_auth=None, peer_tls=None, bootstrap=True, bank_seed=0,
                  scheduler_addr=None, robustness="off", quorum_target=3,
                  quorum_timeout=30.0, aggregate="trimmed_mean", version_history=1,
-                 private_policy="overwrite", private_quorum=2, **reactor_kw):
+                 private_policy="overwrite", private_quorum=2,
+                 schedule_mode="central", salt="", lease_ttl=30.0, worker_set=None,
+                 corpus_weights=None, reputation=None, rate_limiter=None,
+                 min_owner_reputation=0.25, staleness_bound=None,
+                 staleness_weight="inverse", **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.config = config
         self.diloco = diloco
@@ -320,6 +341,34 @@ class ParameterServer(_ReactorServer):
             elif os.path.exists(os.path.join(resume_dir, self._shard_name())):
                 self.load_shard(resume_dir)  # restart this shard from a checkpoint
 
+        # Decentralized coordination (Phase 4, design D2/D3/D5): with no
+        # scheduler, each path's *primary owner of its coordinator key* becomes
+        # that path's coordinator -- it tracks the path's generation counter
+        # (the version-fence), mints the Ed25519 commit grant (signed with its
+        # own identity, verified by co-owners against the epoch record), and
+        # hosts the reputation / rate-limit gates for commits it serves. All off
+        # in ``central`` mode, which leaves the scheduler the trust root.
+        if schedule_mode not in ("central", "decentralized"):
+            raise ValueError(f"schedule_mode must be 'central' or 'decentralized', "
+                             f"got {schedule_mode!r}")
+        self.schedule_mode = schedule_mode
+        self.salt = salt
+        self.lease_ttl = float(lease_ttl)
+        # () -> iterable of live worker peer-ids (the gossiped directory in 4d);
+        # None -> skip the HRW-assignee check and rely on the version-fence alone.
+        self.worker_set = worker_set
+        # path_index -> alpha shard weight (from the data spec's token counts);
+        # absent entries default to 1.0 (uniform).
+        self.corpus_weights = dict(corpus_weights or {})
+        self.reputation = reputation if reputation is not None else Reputation()
+        self.rate_limiter = rate_limiter if rate_limiter is not None else RateLimiter()
+        self.min_owner_reputation = min_owner_reputation
+        self.staleness_weight = staleness_weight
+        self.staleness_bound = (staleness_bound if staleness_bound is not None
+                                else 2 * len(self._topology.paths()))
+        # path tuple -> [generation, opened_at] (the per-path clock + fence).
+        self._gen: dict = {}
+
     @staticmethod
     def _owner_ids(key, record) -> set:
         return {o["peer_id"] for o in owners_for(key, record)}
@@ -330,6 +379,10 @@ class ParameterServer(_ReactorServer):
             return self._fetch(msg, peer_id)
         if kind == "push":
             return self._push(msg, peer_id)
+        if kind == "commit":  # decentralized: this owner coordinates the path
+            return self._commit(msg, peer_id)
+        if kind == "generation":  # decentralized: report a path's current (g, opened_at)
+            return self._generation(msg)
         if kind == "private_proposal":
             return self._private_proposal(msg, peer_id)
         if kind == "checkpoint":
@@ -816,9 +869,119 @@ class ParameterServer(_ReactorServer):
         self._peer_conns.clear()
         super().shutdown()
 
+    # -- decentralized coordination (Phase 4 D2/D3/D5) -------------------------
+
+    def _coordinates_locked(self, path) -> bool:
+        """Is this owner the coordinator for ``path`` -- the active primary of
+        the path's :func:`coordinator_key`? Only the coordinator advances the
+        path's generation and mints its grants."""
+        if self.schedule_mode != "decentralized" or self._epoch is None:
+            return False
+        ck = coordinator_key(self._topology.path_module_keys(path))
+        return self._primary_locked(ck)
+
+    def _generation(self, msg: dict) -> dict:
+        """Report a coordinated path's current generation, so a self-assigning
+        worker knows which generation to commit (the version-fence value)."""
+        try:
+            path = tuple(msg["path"])
+        except (KeyError, TypeError):
+            return {"type": "generation", "ok": False}
+        with self._lock:
+            if not self._coordinates_locked(path):
+                return {"type": "generation", "ok": False, "epoch": self._epoch_num}
+            g, _ = self._gen.setdefault(path, [0, time.monotonic()])
+            return {"type": "generation", "ok": True, "generation": g,
+                    "epoch": self._epoch_num, "lease_ttl": self.lease_ttl,
+                    "staleness_bound": self.staleness_bound}
+
+    def _commit(self, msg: dict, peer_id: str | None = None) -> dict:
+        """A self-assigned worker commits ``(path, generation)`` to its
+        coordinator (this owner), which version-fences the slot, verifies the
+        worker is the HRW assignee, gates on reputation/rate-limit/loss/staleness
+        exactly as the central scheduler did, then **mints an Ed25519 grant
+        signed with its own identity** (the path's co-owners verify it against
+        the epoch record). Replaces ``Scheduler._commit`` in decentralized mode;
+        the central path is untouched."""
+        if self.schedule_mode != "decentralized":
+            return {"type": "commit_ack", "accepted": False, "reason": "not_decentralized"}
+        try:
+            path = tuple(msg["path"])
+        except (KeyError, TypeError):
+            return {"type": "commit_ack", "accepted": False}
+        rep_outcome = None  # True credit (accepted) / False debit (bad loss) / None neutral
+        try:
+            with self._lock:
+                if not self._coordinates_locked(path):
+                    return {"type": "commit_ack", "accepted": False,
+                            "reason": "not_coordinator", "epoch": self._epoch_num}
+                entry = self._gen.setdefault(path, [0, time.monotonic()])
+                g, opened = entry
+                if msg.get("generation") != g:
+                    # Version-fence: the slot already advanced (someone committed
+                    # this generation) or the worker is stale -> dropped commit.
+                    return {"type": "commit_ack", "accepted": False,
+                            "reason": "stale_generation", "generation": g}
+                # HRW-assignee check: load distribution + anti-grab. Skipped when
+                # no worker directory is available, leaving the fence as the gate.
+                member = peer_id or msg.get("worker_id")
+                workers = list(self.worker_set() or []) if self.worker_set else []
+                if workers and not is_assignee(
+                        member, path, g, workers, salt=self.salt,
+                        elapsed=time.monotonic() - opened, lease_ttl=self.lease_ttl):
+                    return {"type": "commit_ack", "accepted": False, "reason": "not_assignee"}
+                rep = self.reputation.get(peer_id)
+                if not self.rate_limiter.allow(peer_id, reputation=rep):
+                    return {"type": "commit_ack", "accepted": False, "reason": "throttled"}
+                if not loss_ok(msg.get("loss"), empty=bool(msg.get("empty"))):
+                    self.metrics.record_invalid_reject()
+                    rep_outcome = False
+                    return {"type": "commit_ack", "accepted": False, "reason": "bad_loss"}
+                # Staleness = version-vector lag over the path keys this owner
+                # holds (>= the coordinator key, whose counter tracks this path's
+                # generations). Cross-epoch / remapped base -> drop (Phase 2
+                # failover semantics).
+                base = {k: v for k, v in (msg.get("base_versions") or {}).items()
+                        if k in self._versions}
+                lag = version_lag(base, {k: self._versions[k] for k in base})
+                if lag is None or lag > self.staleness_bound:
+                    self.metrics.record_stale_reject()
+                    return {"type": "commit_ack", "accepted": False, "reason": "stale"}
+                entry[0], entry[1] = g + 1, time.monotonic()  # fence closes, slot reopens
+                damp = 1.0 / (1.0 + lag) if self.staleness_weight == "inverse" else 1.0
+                push_weight = self.corpus_weights.get(self._topology.path_index(path), 1.0) * damp
+                grant = make_grant(path, self._topology.path_module_keys(path),
+                                   push_weight, uuid.uuid4().hex, identity=self.identity)
+                self.metrics.record_update(lag)
+                rep_outcome = True
+                return {"type": "commit_ack", "accepted": True, "generation": g + 1,
+                        "push_weight": push_weight, "grant": grant}
+        finally:
+            if rep_outcome is True:
+                self.reputation.credit(peer_id)
+            elif rep_outcome is False:
+                self.reputation.debit(peer_id)
+
+    def _expected_grant_signer(self, grant) -> str | None:
+        """The peer-id that legitimately mints a push grant for this path under
+        the current epoch -- the primary owner of the path's coordinator key
+        (decentralized mode). The grant carries the path; the epoch resolves the
+        primary, so co-owners agree without a shared secret."""
+        try:
+            path_keys = self._topology.path_module_keys(tuple(grant["path"]))
+        except (KeyError, TypeError, ValueError, IndexError):
+            return None
+        prim = path_primary(path_keys, self._epoch) if self._epoch is not None else None
+        return prim["peer_id"] if prim else None
+
     def _push(self, msg: dict, peer_id: str | None = None) -> dict:
         grant = msg.get("grant")
-        if not verify_grant(grant, self.grant_key, scheduler_pub=self.scheduler_pub):
+        if self.schedule_mode == "decentralized":
+            # No scheduler: the grant must be signed by the path's primary owner.
+            ok = grant_signed_by(grant, self._expected_grant_signer(grant))
+        else:
+            ok = verify_grant(grant, self.grant_key, scheduler_pub=self.scheduler_pub)
+        if not ok:
             return {"type": "ack", "applied": False}  # no/forged grant -> refuse
         # Decode (possibly quantized) gradients outside the lock; a malformed
         # encoding refuses the push rather than crashing the server.
