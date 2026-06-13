@@ -14,6 +14,37 @@ operator decisions.
 > **Strategic note (recorded up front, honestly).** Phase 4 is the *optional
 > endgame* in the plan — *"only worth it if tracker availability actually
 > becomes the limiting factor; Phases 0–3 deliver the goal without it."* Two
+**4c amendments (discovered while building):**
+- *The deferred-from-4b audit relocation is **subsumed**, not ported.* In
+  decentralized mode the ``k`` owners independently computing/serving a shared
+  key **are** the redundant execution for that key — the cross-owner digest
+  agreement is the agreement signal the scheduler's audits used to provide — and
+  private modules already cross-check owner-side via Phase 3d proposal-gating
+  (``_private_proposal`` lives on the owner). So no separate scheduler-style
+  ``_audits`` machinery is ported; the redundancy lives in the replication tier
+  where the cross-checking already is.
+- *Where 4c draws the validated/0f line (the Phase 3 discipline).* The
+  **detection** primitives are unit-validated and sound on their own:
+  ``state_digest`` (fp-recompute-tolerant via int8, like ``pseudograd_digest``),
+  ``confirm_version`` (majority at the highest agreed version), ``divergent_peers``
+  (flags only a same-version digest contradiction, so a *lagging* honest owner is
+  never blamed), ``read_quorum_versions`` (a reader trusts only the quorum
+  digest), and the owner-side ``_audit_digests_once`` debit toward eviction. What
+  rides the **0f** run is the *enforcement dynamics* of the full write path: a
+  backup defending against a Byzantine **primary** requires workers to push to
+  all ``k`` owners so each can recompute rather than trust the primary's bytes,
+  and whether ``k`` independent aggregations converge comparably to one-primary
+  replication is exactly the kind of dynamics property unit tests can't settle.
+  4c lands the cross-check *signal* and the read defense; the push-to-all-``k``
+  write path is wired with the worker loop in 4d and its convergence is a 0f
+  acceptance item, called out rather than assumed.
+- *One reputation store, two behaviours.* Owner-behaviour debits (digest
+  divergence) and worker-behaviour debits (bad commits, 4b) share the per-
+  ``peer_id`` ``Reputation`` on the owner, so a peer that is both gets one score
+  and the same eviction gate (``EpochManager.is_eligible``) covers both. The
+  eviction *wiring* (owners running the EpochManager over the gossiped directory)
+  lands in 4d; 4c produces the debit.
+
 **4b amendments (discovered while building):**
 - *The owner-coordinator is added to* ``ParameterServer`` *as a focused
   ``commit``/``generation`` RPC pair, not a Scheduler refactor.* Sharing the

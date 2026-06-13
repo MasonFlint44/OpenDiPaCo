@@ -51,6 +51,7 @@ from .compress import (
     maybe_dequantize,
     pseudograd_digest,
     restore_shard,
+    state_digest,
 )
 from .distributed import (
     _build_worker_engine,
@@ -65,6 +66,7 @@ from .guard import all_finite, clip_norm_, loss_ok
 from .ratelimit import RateLimiter
 from .reputation import Reputation
 from .assignment import coordinator_key, is_assignee, path_primary, version_lag
+from .quorum import confirm_version, divergent_peers
 from .identity import peer_id_of, sign_record, verify_record
 from .ownership import (
     EpochManager,
@@ -226,7 +228,7 @@ class ParameterServer(_ReactorServer):
                  schedule_mode="central", salt="", lease_ttl=30.0, worker_set=None,
                  corpus_weights=None, reputation=None, rate_limiter=None,
                  min_owner_reputation=0.25, staleness_bound=None,
-                 staleness_weight="inverse", **reactor_kw):
+                 staleness_weight="inverse", read_quorum=2, **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.config = config
         self.diloco = diloco
@@ -366,6 +368,9 @@ class ParameterServer(_ReactorServer):
         self.staleness_weight = staleness_weight
         self.staleness_bound = (staleness_bound if staleness_bound is not None
                                 else 2 * len(self._topology.paths()))
+        # Replicas a read cross-checks before trusting bytes, and the agreement
+        # threshold for confirming a version / flagging a divergent owner (4c).
+        self.read_quorum = max(1, int(read_quorum))
         # path tuple -> [generation, opened_at] (the per-path clock + fence).
         self._gen: dict = {}
 
@@ -383,6 +388,8 @@ class ParameterServer(_ReactorServer):
             return self._commit(msg, peer_id)
         if kind == "generation":  # decentralized: report a path's current (g, opened_at)
             return self._generation(msg)
+        if kind == "digest":  # decentralized: cheap (version, content-digest) for quorum reads
+            return self._digests(msg)
         if kind == "private_proposal":
             return self._private_proposal(msg, peer_id)
         if kind == "checkpoint":
@@ -700,6 +707,8 @@ class ParameterServer(_ReactorServer):
                 self._sweep_buffers()  # flush quorum buffers past their timeout
                 self._poll_epoch()
                 self._replicate_once()
+                if self.schedule_mode == "decentralized":
+                    self._audit_digests_once()  # cross-check co-owners' digests (4c)
             except Exception:  # noqa: BLE001 -- a peer mid-restart must not kill the puller
                 pass
 
@@ -961,6 +970,66 @@ class ParameterServer(_ReactorServer):
                 self.reputation.credit(peer_id)
             elif rep_outcome is False:
                 self.reputation.debit(peer_id)
+
+    def _digests(self, msg: dict) -> dict:
+        """Cheap ``{key: [version, content-digest]}`` for this owner's active
+        keys, so a reader cross-checks across replicas (quorum reads) without
+        pulling weights. States are snapshotted under the lock and hashed
+        outside it."""
+        requested = msg.get("keys")
+        with self._lock:
+            sel = set(requested) & self._active if requested else set(self._active)
+            snap = {k: (self._versions[k], _state_to_cpu(self.bank[k].state_dict()))
+                    for k in sel if k in self.bank}
+            epoch = self._epoch_num
+        digests = {k: [list(v), state_digest(sd)] for k, (v, sd) in snap.items()}
+        return {"type": "digest", "digests": digests, "epoch": epoch}
+
+    def _apply_digest_audit(self, reports_by_key: dict) -> dict:
+        """Confirm each key's value by quorum and debit the owner-behaviour
+        reputation of any replica whose digest at the confirmed version
+        contradicts the majority (design D4). ``reports_by_key`` is
+        ``{key: {peer_id: (version, digest)}}``; returns the flagged peers per
+        key. Pure given the reports, so the network gather (below) and tests
+        share one rule."""
+        flagged: dict = {}
+        for k, reports in reports_by_key.items():
+            confirmed = confirm_version(list(reports.values()), self.read_quorum)
+            bad = divergent_peers(reports, confirmed)
+            for pid in bad:
+                self.reputation.debit(pid)  # owner-behaviour debit -> eviction (4d)
+            if bad:
+                flagged[k] = bad
+        return flagged
+
+    def _audit_digests_once(self) -> dict:
+        """Gather co-owners' digests for the keys this owner holds and audit
+        them (decentralized replication-loop step). A co-owner mid-restart that
+        doesn't answer simply isn't in the tally — no false blame."""
+        if self.schedule_mode != "decentralized" or self._epoch is None or self.peer_id is None:
+            return {}
+        with self._lock:
+            epoch = self._epoch
+            keys = sorted(self.owned_keys & self._active)
+            snap = {k: (self._versions[k], _state_to_cpu(self.bank[k].state_dict()))
+                    for k in keys if k in self.bank}
+        reports: dict = {k: {self.peer_id: (tuple(v), state_digest(sd))}
+                         for k, (v, sd) in snap.items()}
+        by_peer: dict = {}  # peer_id -> (addr, [keys it co-owns with us])
+        for k in reports:
+            for o in owners_for(k, epoch):
+                if o["peer_id"] == self.peer_id:
+                    continue
+                by_peer.setdefault(o["peer_id"], (tuple(o["addr"]), []))[1].append(k)
+        for pid, (addr, ks) in by_peer.items():
+            try:
+                reply = self._peer_rpc(addr, {"type": "digest", "keys": ks})
+            except (OSError, ConnectionError):
+                reply = None
+            for k, vd in ((reply or {}).get("digests") or {}).items():
+                if k in reports and vd:
+                    reports[k][pid] = (tuple(vd[0]), vd[1])
+        return self._apply_digest_audit(reports)
 
     def _expected_grant_signer(self, grant) -> str | None:
         """The peer-id that legitimately mints a push grant for this path under

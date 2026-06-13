@@ -13,6 +13,7 @@ from .assignment import (
 from .observability import MetricsExporter, MetricsLogger
 from .ratelimit import RateLimiter
 from .reputation import Reputation
+from .quorum import confirm_version, divergent_peers, read_quorum_versions
 from .ownership import (
     EpochManager,
     make_epoch_record,
@@ -93,4 +94,7 @@ __all__ = [
     "version_lag",
     "coordinator_key",
     "path_primary",
+    "confirm_version",
+    "divergent_peers",
+    "read_quorum_versions",
 ]

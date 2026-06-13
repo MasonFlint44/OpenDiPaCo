@@ -114,6 +114,32 @@ def pseudograd_digest(shared_delta: dict) -> str:
     return h.hexdigest()
 
 
+def state_digest(state: dict) -> str:
+    """A stable hash of a module's weights (Phase 4c: owner cross-checking).
+
+    The decentralized swarm has no trusted owner, so a reader cross-checks a
+    key's ``(version, digest)`` across its ``k`` replicas and trusts only the
+    bytes a majority agrees on (quorum reads), and co-owners flag a replica
+    whose digest at a confirmed version diverges. Like
+    :func:`pseudograd_digest`, each tensor is symmetric-int8-quantized before
+    hashing so honest replicas that *recomputed* an aggregate (rather than
+    copied exact bytes) agree despite low-order fp noise, while materially
+    different weights land on a different digest. Keys hash in sorted order.
+    """
+    h = hashlib.sha256()
+    for name in sorted(state):
+        h.update(name.encode("utf-8"))
+        t = state[name]
+        if not torch.is_floating_point(t):
+            h.update(t.cpu().numpy().tobytes())  # int buffers hash exactly
+            continue
+        payload, _ = _quantize_int8(t)
+        q, s = payload["q"], payload["s"]
+        h.update(struct.pack(">q", round(math.log(s) * 1e3) if s > 0 else 0))
+        h.update(q.numpy().tobytes())
+    return h.hexdigest()
+
+
 def compress_delta(delta, mode: str, carry=None):
     """Compress one module's pseudo-gradient (a list of tensors).
 
