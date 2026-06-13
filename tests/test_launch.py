@@ -157,3 +157,20 @@ def test_run_local_sharded_trains():
     scheduler, completed = run_local(cfg)
     assert sum(completed.values()) >= _target(cfg)
     assert not hasattr(scheduler, "bank")  # the scheduler holds no weights
+
+
+def test_advertise_host_defaults_to_bind_host():
+    """A rendezvous owner's tracker record must advertise a dialable address:
+    explicit ownership.advertise_host, else transport.connect_host, else the
+    bind host -- only a wildcard bind falls back to loopback (Codex P2)."""
+    from opendipaco.launch.roles import _advertise_host
+
+    assert _advertise_host(LaunchConfig.from_dict(
+        {"transport": {"host": "203.0.113.7"}})) == "203.0.113.7"
+    assert _advertise_host(LaunchConfig.from_dict(
+        {"transport": {"host": "0.0.0.0"}})) == "127.0.0.1"
+    assert _advertise_host(LaunchConfig.from_dict(
+        {"transport": {"host": "0.0.0.0", "connect_host": "owner.example"}})) == "owner.example"
+    assert _advertise_host(LaunchConfig.from_dict(
+        {"transport": {"host": "203.0.113.7", "connect_host": "owner.example"},
+         "ownership": {"advertise_host": "advertise.example"}})) == "advertise.example"

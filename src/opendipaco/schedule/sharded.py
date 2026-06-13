@@ -837,6 +837,8 @@ class Scheduler(_ReactorServer):
             return self._next_task(msg)
         if kind == "commit":
             return self._commit(msg)
+        if kind == "routing":
+            return self._fresh_routing(msg)
         if kind == "heartbeat":
             self._heartbeat(msg)
             return None
@@ -936,6 +938,30 @@ class Scheduler(_ReactorServer):
             msg["retry_in"] = self.idle_backoff
         return msg
 
+    def _routing_locked(self, keys) -> dict:
+        """Replica addr lists per key, rank order (primary first), per the
+        current epoch (rendezvous) or the static shard map."""
+        if self._epoch_record is not None:
+            return {k: [list(o["addr"]) for o in owners_for(k, self._epoch_record)]
+                    for k in keys}
+        return {k: self._routing[k] for k in keys}
+
+    def _fresh_routing(self, msg: dict) -> dict:
+        """Re-resolve a path's routing on demand: a worker whose push was
+        refused as ``not_primary`` (epoch changed mid-task) retries its grant
+        once against the *current* primaries (grants are single-use per
+        server, so re-presenting one to a new primary is sound)."""
+        try:
+            keys = self.topology.path_module_keys(tuple(msg.get("path") or ()))
+            with self._lock:
+                if not self._routing and self._epoch_record is None:
+                    return {"type": "routing", "routing": None}
+                epoch = None if self._epoch_record is None else self._epoch_record["epoch"]
+                return {"type": "routing", "routing": self._routing_locked(keys),
+                        "epoch": epoch}
+        except (KeyError, IndexError, TypeError, ValueError):
+            return {"type": "routing", "routing": None}  # malformed path
+
     def _next_task(self, req: dict) -> dict:
         wid = req.get("worker_id")
         warm = {tuple(p) for p in req.get("warm_paths", [])}
@@ -960,11 +986,7 @@ class Scheduler(_ReactorServer):
             self._lease[path] = lease
             generation = self._completed[path]
             keys = self.topology.path_module_keys(path)
-            if self._epoch_record is not None:  # rendezvous: replicas in rank order
-                routing = {k: [list(o["addr"]) for o in owners_for(k, self._epoch_record)]
-                           for k in keys}
-            else:
-                routing = {k: self._routing[k] for k in keys}
+            routing = self._routing_locked(keys)
         # Data plane: shard bytes, or just the recipe for a spec corpus.
         shard, shard_spec = None, None
         if path not in cached:
@@ -1364,19 +1386,34 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
                 contrib, task.get("compress") or "none", residuals, path
             )
             _commit_residuals(residuals, path, pending_res)
-            by_primary: dict = {}  # writes go to rank 0 only (design D3)
-            for k, addrs in routing.items():
-                by_primary.setdefault(addrs[0], []).append(k)
-            for addr, keys in by_primary.items():
-                updates = {k: {"grad": shared_payload[k]}
-                           for k in keys if not is_private_key(k) and k in shared_payload}
-                private = {k: private_payload[k]
-                           for k in keys if is_private_key(k) and k in private_payload}
-                if not updates and not private:
-                    continue
-                _rpc(ps_sock(addr),
-                     {"type": "push", "grant": grant, "updates": updates, "private": private},
-                     max_msg_bytes)
+
+            def drop_conn(addr):
+                s = ps_conns.pop(addr, None)
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+
+            failed = _push_group(routing, grant, shared_payload, private_payload,
+                                 ps_sock, drop_conn, max_msg_bytes)
+            if failed:
+                # The epoch moved under this task: the old primary refused (or
+                # died). The scheduler already accepted the commit, so re-route
+                # the failed keys to the *current* primaries and re-present the
+                # grant once (it is single-use per server, so a new primary
+                # accepts it). A second failure drops the update -- the
+                # documented bounded-loss window.
+                fresh = _rpc_send(sch, send_lock, max_msg_bytes,
+                                  {"type": "routing", "path": path})
+                if fresh is None:
+                    raise OSError("scheduler disconnected during push retry")
+                fresh_routing = fresh.get("routing") or {}
+                retry = {k: [tuple(a) for a in fresh_routing[k]]
+                         for k in failed if k in fresh_routing}
+                if retry:
+                    _push_group(retry, grant, shared_payload, private_payload,
+                                ps_sock, drop_conn, max_msg_bytes)
             engine._opt_state[path] = contrib.opt_state          # warm-back
             _load_private(engine, contrib.private_state)
             warm.add(path)
@@ -1384,6 +1421,40 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
             if max_tasks is not None and state["done"] >= max_tasks:
                 return True
         # rejected -> discard the contribution; warm caches stay
+
+
+def _push_group(routing, grant, shared_payload, private_payload, ps_sock, drop_conn,
+                max_msg_bytes) -> set:
+    """Push each key's update to its primary (``routing[k][0]``).
+
+    Returns the keys whose update did **not** land for a retryable reason:
+    the server refused them as ``not_primary`` (the worker's routing is from
+    an older epoch) or the primary was unreachable. Non-retryable refusals
+    (bad grant, replay) return nothing -- a retry could never succeed.
+    """
+    by_primary: dict = {}  # writes go to rank 0 only (design D3)
+    for k, addrs in routing.items():
+        by_primary.setdefault(tuple(addrs[0]), []).append(k)
+    failed: set = set()
+    for addr, keys in by_primary.items():
+        updates = {k: {"grad": shared_payload[k]}
+                   for k in keys if not is_private_key(k) and k in shared_payload}
+        private = {k: private_payload[k]
+                   for k in keys if is_private_key(k) and k in private_payload}
+        if not updates and not private:
+            continue
+        try:
+            reply = _rpc(ps_sock(addr),
+                         {"type": "push", "grant": grant, "updates": updates,
+                          "private": private},
+                         max_msg_bytes)
+        except (OSError, ConnectionError):
+            drop_conn(addr)
+            failed |= set(updates) | set(private)
+            continue
+        if reply and reply.get("reason") == "not_primary":
+            failed |= set(reply.get("skipped") or [])
+    return failed
 
 
 def _ps_connect(addr, auth_key, max_msg_bytes, timeout, *, tls=None, server_hostname=None):

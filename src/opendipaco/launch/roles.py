@@ -77,6 +77,16 @@ def _server_kw(cfg: LaunchConfig, extra_admitted=None) -> dict:
     return kw
 
 
+def _advertise_host(cfg: LaunchConfig) -> str:
+    """The address other peers dial for this owner: the explicit
+    ``ownership.advertise_host``, else ``transport.connect_host``, else the
+    bind host when it is a real address (same defaulting as ``connect_addr``
+    -- only a wildcard bind falls back to loopback)."""
+    t = cfg.transport
+    return (cfg.ownership.advertise_host or t.connect_host
+            or (t.host if t.host not in ("0.0.0.0", "::") else "127.0.0.1"))
+
+
 def _node_identity(cfg: LaunchConfig, identity=None, *, generate=False):
     """This node's Ed25519 identity: an explicit object, the configured key
     file, or (rendezvous in-process smoke) a freshly generated one."""
@@ -306,9 +316,8 @@ def run_parameter_server(cfg: LaunchConfig, shard_id: int = 0, *, port=None,
             peer_tls=build_tls_client(cfg),
             **common, **_server_kw(cfg, extra_admitted))
         ps.start()
-        advertise = own.advertise_host or cfg.transport.connect_host or "127.0.0.1"
         ps.start_tracker_heartbeat(
-            tracker_addr or cfg.tracker_connect_addr(), advertise,
+            tracker_addr or cfg.tracker_connect_addr(), _advertise_host(cfg),
             interval=own.heartbeat_interval, auth_key=cfg.transport.auth_key,
             tls=build_tls_client(cfg))
     else:

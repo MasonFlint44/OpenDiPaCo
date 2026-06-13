@@ -177,6 +177,88 @@ def test_zombie_fenced_and_lame_duck_lifecycle():
             ps.shutdown()
 
 
+def test_stale_routing_push_retried_to_new_primary():
+    """An epoch change mid-task must not silently drop an accepted update: the
+    old primary refuses (``not_primary``) or is dead, the worker re-resolves
+    routing from the scheduler, and re-presents the same grant to the new
+    primary (grants are single-use *per server*, so this is sound)."""
+    from opendipaco.schedule.sharded import DEFAULT_MAX_MSG_BYTES, _ps_connect, _push_group
+
+    cfg = _cfg()
+    sched_id = PeerIdentity.generate()
+    ida, idb = PeerIdentity.generate(), PeerIdentity.generate()
+    pss = [ParameterServer(cfg, [], _diloco(), host="127.0.0.1", port=0, identity=i,
+                           replicate_interval=60.0, auth_key="t",
+                           admitted_peers=[p for p in (ida, idb) if p is not i])
+           for i in (ida, idb)]
+    a, b = pss
+    recs = [make_peer_record(i, reachability="public",
+                             addr=("127.0.0.1", ps.port), roles=("owner",))
+            for i, ps in zip((ida, idb), pss)]
+    sched = Scheduler(cfg, _corpus(cfg), [], _diloco(), batch_size=BATCH,
+                      host="127.0.0.1", port=0, identity=sched_id, auth_key="t")
+    socks: dict = {}
+
+    def ps_sock(addr):
+        if addr not in socks:
+            socks[addr] = _ps_connect(addr, "t", DEFAULT_MAX_MSG_BYTES, 5.0)
+        return socks[addr]
+
+    def drop_conn(addr):
+        s = socks.pop(addr, None)
+        if s is not None:
+            s.close()
+
+    try:
+        epoch0 = sched.publish_epoch(recs, k=1)
+        for ps in pss:
+            ps.apply_epoch(epoch0)
+            ps.start()
+        path = cfg.build_topology().path_from_index(0)
+        key = next(k for k in cfg.build_topology().path_module_keys(path)
+                   if not is_private_key(k) and k in a.owned_keys)  # primary: A
+        stale = {key: [("127.0.0.1", a.port)]}
+        grads = [torch.ones_like(p) for p in a.bank[key].parameters()]
+
+        # The epoch moves the key to B; B syncs it from the lame duck A.
+        epoch1 = sched.publish_epoch(recs[1:], k=1)
+        for ps in pss:
+            ps.apply_epoch(epoch1)
+        assert b._replicate_once()[key] == "active"
+
+        # Stale push -> A refuses as not_primary -> retry against fresh routing.
+        grant = make_grant(path, [key], 1.0, "tok-retry-1")
+        failed = _push_group(stale, grant, {key: grads}, {}, ps_sock, drop_conn,
+                             DEFAULT_MAX_MSG_BYTES)
+        assert failed == {key}
+        assert b._versions[key][1] == 0          # nothing landed yet
+        fresh = sched._handle({"type": "routing", "path": list(path)}, 0)
+        assert fresh["epoch"] == 1
+        retry = {k: [tuple(x) for x in v] for k, v in fresh["routing"].items() if k in failed}
+        assert retry[key][0] == ("127.0.0.1", b.port)
+        assert _push_group(retry, grant, {key: grads}, {}, ps_sock, drop_conn,
+                           DEFAULT_MAX_MSG_BYTES) == set()
+        assert b._versions[key] == (1, 1)        # landed on the promoted primary
+
+        # Dead-primary flavor: the old primary is gone entirely; the push
+        # fails on connect, and the same retry path lands the update.
+        a.shutdown()
+        drop_conn(("127.0.0.1", a.port))
+        grant2 = make_grant(path, [key], 1.0, "tok-retry-2")
+        failed = _push_group(stale, grant2, {key: grads}, {}, ps_sock, drop_conn,
+                             DEFAULT_MAX_MSG_BYTES)
+        assert failed == {key}
+        assert _push_group(retry, grant2, {key: grads}, {}, ps_sock, drop_conn,
+                           DEFAULT_MAX_MSG_BYTES) == set()
+        assert b._versions[key] == (1, 2)
+    finally:
+        sched.shutdown()
+        for ps in pss:
+            ps.shutdown()
+        for s in socks.values():
+            s.close()
+
+
 def test_scheduler_restart_resumes_epoch_numbering(tmp_path):
     """A restarted scheduler must publish epochs that *supersede* what live
     owners already hold -- owners refuse anything not strictly newer, so
