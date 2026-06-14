@@ -1327,6 +1327,10 @@ class ParameterServer(_ReactorServer):
         # math.prod(shape), which max_msg_bytes (a bound on the encoded frame)
         # does NOT cover -- so a tiny push could claim a huge shape and OOM us.
         raw_updates = msg.get("updates") or {}
+        private = msg.get("private") or {}
+        if not (isinstance(raw_updates, dict) and isinstance(private, dict)):
+            self.metrics.record_invalid_reject()  # a non-dict would crash .items()
+            return {"type": "ack", "applied": False}
         with self._lock:
             expected = {k: [tuple(p.shape) for p in self.bank[k].parameters()]
                         for k in raw_updates if k in self.bank}
@@ -1344,7 +1348,6 @@ class ParameterServer(_ReactorServer):
         except (TypeError, KeyError, ValueError):
             self.metrics.record_invalid_reject()
             return {"type": "ack", "applied": False}
-        private = msg.get("private") or {}
         weight = float(grant["weight"])
         allowed = set(grant["keys"])
         skipped, n_applied = [], 0

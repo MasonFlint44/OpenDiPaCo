@@ -129,6 +129,11 @@ def test_owner_rejects_wrong_shaped_grad_push():
         assert r["applied"] is False
         after = ps.bank[shared].state_dict()
         assert all(torch.equal(before[n], after[n]) for n in before)  # untouched
+        # A non-dict updates/private would crash .items(); refuse instead.
+        assert ps._push({"grant": make_grant(path, [shared], 1.0, "tu", grant_key="s"),
+                         "updates": "garbage"})["applied"] is False
+        assert ps._push({"grant": make_grant(path, [shared], 1.0, "tp", grant_key="s"),
+                         "updates": {}, "private": [1, 2, 3]})["applied"] is False
         # A correctly-shaped push still applies.
         good = [torch.ones_like(p) * 0.01 for p in ps.bank[shared].parameters()]
         r = ps._push({"grant": make_grant(path, [shared], 1.0, "t3", grant_key="s"),
