@@ -158,8 +158,31 @@ def _serve_libp2p(server, cfg: LaunchConfig, identity=None):
         server, identity=ident, listen_addrs=tuple(cfg.transport.libp2p_listen),
         require_identity=True, dcutr=cfg.transport.dcutr,
         max_msg_bytes=cfg.transport.max_msg_bytes)
-    for relay in cfg.transport.relays:        # k>=2 for failover (D6)
-        t.reserve_on(relay)
+    # Reserve each configured relay independently (k>=2 for failover, D6). A relay
+    # is an unreliable external peer: a down/refusing one must not crash the node
+    # (reserve_on raises on connect failure, returns None on refusal), so isolate
+    # each and proceed on the survivors. If relays were configured but NONE took,
+    # a NAT'd owner has no reachable address -- fail loud rather than serve a
+    # silent zombie.
+    relays = cfg.transport.relays
+    if relays:
+        ok = 0
+        for relay in relays:
+            try:
+                if t.reserve_on(relay) is not None:
+                    ok += 1
+                else:
+                    print(f"WARNING: relay refused reservation: {relay}", flush=True)
+            except Exception as e:  # noqa: BLE001 -- a down/bad relay is not fatal on its own
+                print(f"WARNING: could not reserve on relay {relay}: {e}", flush=True)
+        if ok == 0:
+            t.close()
+            raise RuntimeError(
+                f"no relay reservation succeeded ({len(relays)} configured); a NAT'd "
+                "owner would be unreachable. Check transport.relays / relay liveness.")
+        if ok < len(relays):
+            print(f"NOTE: reserved on {ok}/{len(relays)} relays (k>=2 recommended "
+                  "for failover).", flush=True)
     return t
 
 

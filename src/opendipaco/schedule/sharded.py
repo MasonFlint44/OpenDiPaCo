@@ -2063,7 +2063,10 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
 
         if identity is None:
             raise ValueError("transport='libp2p' needs identity=")
-        link = _Libp2pLink(Libp2pTransport(identity).start(), scheduler_addr)
+        # Honor the worker's frame cap on its libp2p transport too, so a malicious
+        # owner/scheduler can't push an oversized reply against the 4 GiB default.
+        link = _Libp2pLink(
+            Libp2pTransport(identity, max_msg_bytes=max_msg_bytes).start(), scheduler_addr)
         backoff, fails, last_done = 0.05, 0, state["done"]
         try:
             while fails < 8:   # give up only after sustained no-progress failures

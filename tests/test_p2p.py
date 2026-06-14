@@ -420,6 +420,49 @@ def test_owner_to_owner_rpc_over_libp2p():
         b.shutdown()
 
 
+def test_serve_libp2p_isolates_relay_reservation_failures():
+    """W1d review: a down/refusing relay (unreliable external peer) must not crash
+    a NAT'd owner -- _serve_libp2p reserves each independently and proceeds on the
+    survivors, but raises if NONE took (an unreachable owner is a zombie)."""
+    from opendipaco import DiLoCoConfig
+    from opendipaco.launch.config import LaunchConfig
+    from opendipaco.launch.roles import _serve_libp2p
+    from opendipaco.schedule import ParameterServer
+    from opendipaco.schedule.p2p import Libp2pTransport
+
+    cfg_dict = {"transport": {"kind": "libp2p"}}
+    spec = _cfg()
+    keys = sorted(spec.build_topology().module_keys())
+
+    live = Libp2pTransport(PeerIdentity.generate(), relay=True).start()
+    dead_t = Libp2pTransport(PeerIdentity.generate(), relay=True).start()
+    dead = dead_t.addrs[0]
+    dead_t.close()                      # well-formed addr, now unreachable
+
+    def _ps():
+        return ParameterServer(spec, keys, DiLoCoConfig(inner_steps=4), host="127.0.0.1",
+                               port=0, identity=PeerIdentity.generate())
+
+    ps1, ps2 = _ps(), _ps()
+    try:
+        # one dead + one live -> survives, reserves on the live one.
+        cfg = LaunchConfig.from_dict({**cfg_dict, "transport":
+                                      {"kind": "libp2p", "relays": [dead, live.addrs[0]]}})
+        t1 = _serve_libp2p(ps1, cfg, ps1.identity)
+        assert len(t1.circuit_addrs) == 1            # the live relay only
+        t1.close()
+
+        # all relays dead -> raise (the owner would be unreachable).
+        cfg_bad = LaunchConfig.from_dict({**cfg_dict, "transport":
+                                          {"kind": "libp2p", "relays": [dead]}})
+        with pytest.raises(RuntimeError):
+            _serve_libp2p(ps2, cfg_bad, ps2.identity)
+    finally:
+        live.close()
+        ps1.shutdown()
+        ps2.shutdown()
+
+
 def test_run_relay_role_stands_up_a_forwarding_relay():
     """W1d launch wiring: the ``relay`` role builds a Circuit Relay v2 host a
     NAT'd peer can reserve on. A listener reserves through it and is reached via
