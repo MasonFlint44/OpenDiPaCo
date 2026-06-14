@@ -141,6 +141,37 @@ def test_owner_rejects_malformed_sparse_push_without_crashing():
         ps.shutdown()
 
 
+def test_owner_rejects_huge_declared_sparse_shape_no_oom():
+    """A tiny sparse push that *claims* a huge dense shape must be refused before
+    maybe_dequantize allocates math.prod(shape) -- max_msg_bytes bounds the
+    encoded frame, not the densified tensor, so this would OOM the owner. The
+    declared shape is validated against the target param pre-decode."""
+    from opendipaco import BackboneConfig, DiLoCoConfig, DiPaCoConfig
+    from opendipaco.schedule import ParameterServer, make_grant
+    from opendipaco.topology import is_private_key
+
+    bb = BackboneConfig(vocab_size=48, hidden_size=32, num_attention_heads=4,
+                        intermediate_size=64, layers_per_level=[1, 1],
+                        max_position_embeddings=64)
+    cfg = DiPaCoConfig(backbone=bb, level_sizes=[2, 2], sequence_length=16)
+    keys = sorted(cfg.build_topology().module_keys())
+    shared = next(k for k in keys if not is_private_key(k))
+    path = cfg.build_topology().path_from_index(0)
+    ps = ParameterServer(cfg, keys, DiLoCoConfig(inner_steps=2), host="127.0.0.1",
+                         port=0, grant_key="s")
+    try:
+        nparams = len(list(ps.bank[shared].parameters()))
+        # 1 index/value but a declared dense shape of a billion -> ~4 GB if densified.
+        huge = [{"sp": [10 ** 9], "i": torch.tensor([0], dtype=torch.int32),
+                 "v": torch.tensor([1.0])} for _ in range(nparams)]
+        grant = make_grant(path, [shared], 1.0, "tok", grant_key="s")
+        r = ps._push({"grant": grant, "updates": {shared: {"grad": huge}}})
+        assert r["applied"] is False                       # rejected pre-decode, no alloc
+        assert ps._fetch({"keys": [shared], "have": {}})["versions"][shared] == (0, 0)
+    finally:
+        ps.shutdown()
+
+
 def test_run_local_sharded_trains_with_sparse_up():
     """A full sharded cluster with transport.up_density < 1 trains to budget."""
     from opendipaco.launch import run_local

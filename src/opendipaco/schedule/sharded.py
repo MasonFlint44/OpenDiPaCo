@@ -198,6 +198,25 @@ def _addr_key(addr):
     return tuple(addr) if isinstance(addr, (list, tuple)) else addr
 
 
+def _declared_shape(payload):
+    """The dense shape a pseudo-gradient payload *claims*, without decoding it
+    (so the receiver can bound the allocation a sparse/int4 decode would make
+    before densifying). ``None`` if the payload is malformed/unrecognized."""
+    try:
+        if torch.is_tensor(payload):
+            return tuple(payload.shape)                      # fp32 / bf16
+        if isinstance(payload, dict):
+            if torch.is_tensor(payload.get("q")):
+                return tuple(payload["q"].shape)             # int8 {"q","s"}
+            if "q4" in payload:
+                return tuple(int(s) for s in payload["shape"])   # int4 per-group
+            if "sp" in payload:
+                return tuple(int(s) for s in payload["sp"])      # sparse top-k
+    except (TypeError, ValueError, KeyError):
+        return None
+    return None
+
+
 def _route_target(owner):
     """The dial target a scheduler advertises for one **epoch owner entry**. A
     multi-relay NAT owner returns its **full circuit-addr candidate list**
@@ -503,22 +522,6 @@ class ParameterServer(_ReactorServer):
         if hist is not None and version in hist:
             return _state_to_cpu(hist[version])
         return None
-
-    def _grads_well_shaped_locked(self, updates) -> bool:
-        """Every shared grad must match its module's parameters in count and
-        shape, so a malformed push (wrong-shaped/count decoded tensors) is
-        refused rather than silently broadcast-corrupting or crashing
-        ``apply_outer_grads``. Keys we don't own are skipped in the apply loop, so
-        they need no shape check here."""
-        for k, grad in updates.items():
-            mod = self.bank.get(k)
-            if mod is None:
-                continue
-            params = list(mod.parameters())
-            if len(grad) != len(params) or any(
-                    g.shape != p.shape for g, p in zip(grad, params)):
-                return False
-        return True
 
     def _private_well_shaped_locked(self, private) -> bool:
         """Every private state-dict must match its module's keys and tensor
@@ -1317,11 +1320,27 @@ class ParameterServer(_ReactorServer):
         if not ok:
             return {"type": "ack", "applied": False}  # no/forged grant -> refuse
         # Decode (possibly quantized) gradients outside the lock; a malformed
-        # encoding refuses the push rather than crashing the server.
+        # encoding refuses the push rather than crashing the server. Snapshot the
+        # target modules' parameter shapes under the lock first, then validate the
+        # *declared* shape of each payload BEFORE maybe_dequantize densifies it: a
+        # sparse/int4 payload declares its dense shape and the decode allocates
+        # math.prod(shape), which max_msg_bytes (a bound on the encoded frame)
+        # does NOT cover -- so a tiny push could claim a huge shape and OOM us.
+        raw_updates = msg.get("updates") or {}
+        with self._lock:
+            expected = {k: [tuple(p.shape) for p in self.bank[k].parameters()]
+                        for k in raw_updates if k in self.bank}
         try:
-            updates = {k: maybe_dequantize(u["grad"])
-                       for k, u in (msg.get("updates") or {}).items()
-                       if isinstance(u, dict)}
+            updates = {}
+            for k, u in raw_updates.items():
+                shapes = expected.get(k)         # foreign key (not ours) -> not decoded
+                if shapes is None or not isinstance(u, dict):
+                    continue
+                grad = u.get("grad")
+                if (not isinstance(grad, list) or len(grad) != len(shapes)
+                        or any(_declared_shape(p) != s for p, s in zip(grad, shapes))):
+                    raise ValueError("grad payload shape mismatch")
+                updates[k] = maybe_dequantize(grad)
         except (TypeError, KeyError, ValueError):
             self.metrics.record_invalid_reject()
             return {"type": "ack", "applied": False}
@@ -1335,15 +1354,17 @@ class ParameterServer(_ReactorServer):
             self._seen_grants[grant["token"]] = True  # consumed even if invalid below
             while len(self._seen_grants) > self._SEEN_GRANTS_MAX:
                 self._seen_grants.popitem(last=False)
-            # Validate before touching the shard: one applied NaN poisons it,
-            # and a wrong-shaped/count grad (a buggy/Byzantine worker) would
-            # broadcast-corrupt or crash apply_outer_grads (which blindly assigns
-            # p.grad = d). Reject the whole push on either.
+            # Validate before touching the shard: one applied NaN poisons it.
+            # (Grad shapes/count were already checked against the target params
+            # pre-decode; private state is validated here.)
             if not (all_finite(updates) and all_finite(private)
-                    and self._grads_well_shaped_locked(updates)
                     and self._private_well_shaped_locked(private)):
                 self.metrics.record_invalid_reject()
                 return {"type": "ack", "applied": False}
+            # Foreign update keys (pushed to a PS that doesn't hold them -- stale
+            # routing) were not decoded; still report them so the worker re-routes.
+            if self._epoch is not None:
+                skipped.extend(k for k in raw_updates if k not in self.bank)
             for k, grad in updates.items():
                 if is_private_key(k) or k not in allowed:
                     continue
@@ -2288,10 +2309,16 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions, keyfr
                 # hold exactly) or None -- never the trained-against version,
                 # which is a *lossy* reconstruction we can't delta-decode against.
                 # No keyframe -> None -> the owner ships a full (a new keyframe).
+                # An audited primary must train from the owner's EXACT current
+                # bytes: its checkers pin that version and fetch it full, so a
+                # lossy delta reconstruction would make honest replicas disagree.
+                # Sending no `have` forces a full fetch (a fresh exact keyframe).
                 def _have(k):
-                    if down_delta:
-                        return keyframes[k][0] if k in keyframes else None
-                    return versions.get(k)
+                    if not down_delta:
+                        return versions.get(k)
+                    if audit:
+                        return None
+                    return keyframes[k][0] if k in keyframes else None
                 req = {"type": "fetch", "keys": batch, "cold": cold,
                        "have": {} if pin else
                                {k: _have(k) for k in batch if not is_private_key(k)}}

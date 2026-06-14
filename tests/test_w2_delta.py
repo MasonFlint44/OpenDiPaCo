@@ -127,6 +127,31 @@ def test_run_local_sharded_trains_with_delta_down():
     assert server.metrics.accepted_updates > 0
 
 
+def test_delta_down_with_redundant_audits():
+    """Audits + delta-down together (Codex P2): an audited primary must train
+    from the owner's EXACT bytes -- its checkers pin that version and fetch it
+    full -- so it now fetches full instead of a lossy keyframe+delta. With
+    redundancy on and worker oversupply (so tasks are audited and checked), the
+    run trains to budget rather than stalling on spurious digest disagreement."""
+    from opendipaco.launch import run_local
+    from opendipaco.launch.config import LaunchConfig
+
+    cfg = LaunchConfig.from_dict({
+        "mode": "sharded",
+        "model": {"vocab_size": 64, "hidden_size": 32, "num_attention_heads": 4,
+                  "intermediate_size": 64, "max_position_embeddings": 64,
+                  "layers_per_level": [1, 1], "level_sizes": [2, 2], "sequence_length": 16},
+        "diloco": {"inner_steps": 4, "inner_lr": 1e-3},
+        "data": {"source": "synthetic", "num_documents": 64},
+        "transport": {"compress": "int8", "down": "delta"},
+        "robustness": {"redundancy_rate": 1.0, "redundancy": 2},   # every task audited
+        "sharded": {"num_shards": 2, "parameter_servers": [["127.0.0.1", 0], ["127.0.0.1", 0]]},
+        "run": {"generations": 2, "batch_size": 8, "local_workers": 6},  # oversupply -> checkers
+    })
+    server, completed = run_local(cfg)
+    assert sum(completed.values()) >= 2 * cfg.model.level_sizes[0] * cfg.model.level_sizes[1]
+
+
 def test_delta_down_survives_path_switching_keyframe_eviction():
     """A single worker rotating through all paths repeatedly evicts a path's
     keyframe (D3 bound) and must re-fetch a full + re-establish it -- never delta
