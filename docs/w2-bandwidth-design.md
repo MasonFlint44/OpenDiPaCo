@@ -1,6 +1,24 @@
 # W2 design — bandwidth: delta encoding + sparsification + sub-int8
 
-Status: **W2a + W2b landed; W2c/docs pending.** W2 (from [viability-roadmap.md](viability-roadmap.md))
+Status: **W2a + W2b + W2c landed; inner_steps docs pending.** W2 (from [viability-roadmap.md](viability-roadmap.md))
+
+**W2c status (sub-int8: int4 + per-group scale):**
+- *int4 is a value encoding that stacks on every W2 path.* `compress: int4`
+  adds a fourth mode: symmetric int4 (`[-7, 7]`) with a **per-group scale** (one
+  per 128 elements -- a single per-tensor scale is far too lossy at 4 bits), two
+  nibbles packed per byte (`_quantize_int4`/`_dequant_int4`, ~0.5 B/elem +
+  scales). It encodes the **up pseudo-gradient** (dense and sparse-kept values)
+  and the **down delta** (an int4 owner ships int4 deltas); weights still ship
+  bf16 (raw weights at 4 bits are hopeless). Self-describing `{"q4","s","g","n",
+  "shape"}` payloads, error feedback throughout, device-safe (no CPU/GPU mix).
+- *Byzantine-hardened decode.* `_dequant_int4` validates the packed/scale lengths
+  and group size, raising a caught `ValueError` (rejected push) instead of an
+  uncaught reshape crash -- same boundary as the int8/sparse paths.
+- *Off by default; validated.* `validate_dynamics.py` gained `int4` and a fully
+  `W2 stacked` (int4 + delta-down + sparse-up) arm; both converge (~0.7× the
+  anchor at toy scale). WAN §0f stays the final verdict.
+
+
 
 **W2b status (structured sparsification, up path):**
 - *Top-k sparsification works end to end.* `up_density` (∈ (0, 1], 1.0 = dense =

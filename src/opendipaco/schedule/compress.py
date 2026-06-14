@@ -35,7 +35,8 @@ import struct
 
 import torch
 
-MODES = ("none", "bf16", "int8")
+MODES = ("none", "bf16", "int8", "int4")
+_INT4_GROUP = 128   # elements per int4 scale (per-tensor would be too lossy at 4 bits)
 
 
 def check_mode(mode: str) -> str:
@@ -86,6 +87,45 @@ def _quantize_int8(t: torch.Tensor) -> tuple[dict, torch.Tensor]:
         return {"q": q, "s": 0.0}, t.clone()
     q = torch.round(t / scale).clamp_(-127, 127).to(torch.int8)
     return {"q": q, "s": scale}, t - q.float() * scale
+
+
+def _quantize_int4(t: torch.Tensor, group_size: int = _INT4_GROUP):
+    """Symmetric int4 with a **per-group scale** (W2c/D7): values in [-7, 7], one
+    scale per ``group_size`` elements (a single per-tensor scale is far too lossy
+    at 4 bits), two nibbles packed per byte. Returns
+    (``{"q4","s","g","n","shape"}`` payload, residual). Stays on ``t``'s device."""
+    flat = t.detach().reshape(-1).float()
+    n = flat.numel()
+    pad = (-n) % group_size
+    if pad:
+        flat = torch.cat([flat, flat.new_zeros(pad)])
+    grp = flat.reshape(-1, group_size)
+    scale = grp.abs().amax(dim=1, keepdim=True) / 7.0
+    safe = torch.where(scale > 0, scale, torch.ones_like(scale))
+    q = torch.round(grp / safe).clamp_(-7, 7)
+    recon = (q * scale).reshape(-1)[:n].reshape(t.shape)
+    qu = (q + 8).to(torch.uint8).reshape(-1)            # [-7,7] -> [1,15], fits a nibble
+    packed = ((qu[0::2] << 4) | qu[1::2]).contiguous()  # two values per byte (g even)
+    payload = {"q4": packed, "s": scale.reshape(-1).to(torch.float32),
+               "g": group_size, "n": n, "shape": list(t.shape)}
+    return payload, t.detach().float() - recon
+
+
+def _dequant_int4(p: dict) -> torch.Tensor:
+    """Inverse of :func:`_quantize_int4`; returns a flat fp32 tensor of length
+    ``n``. Validates lengths so a malformed payload raises ``ValueError`` (a
+    caught, rejected push) instead of an uncaught reshape/index crash."""
+    packed, scale = p.get("q4"), p.get("s")
+    g, n = int(p.get("g", 0)), int(p.get("n", -1))
+    if not (torch.is_tensor(packed) and torch.is_tensor(scale)) or g <= 0 or n < 0:
+        raise ValueError("malformed int4 payload")
+    ngroups = (n + g - 1) // g
+    if scale.numel() != ngroups or packed.numel() != ngroups * g // 2:
+        raise ValueError("malformed int4 payload: length mismatch")
+    pk = packed.to(torch.int16)
+    qu = torch.stack([(pk >> 4) & 0xF, pk & 0xF], dim=1).reshape(-1)
+    q = (qu.to(torch.float32) - 8.0).reshape(-1, g)
+    return (q * scale.reshape(-1, 1).to(torch.float32)).reshape(-1)[:n]
 
 
 def pseudograd_digest(shared_delta: dict) -> str:
@@ -169,6 +209,9 @@ def _sparsify(d: torch.Tensor, density: float, mode: str):
     if mode == "int8":
         enc, _ = _quantize_int8(kept)
         recon_vals = enc["q"].float() * enc["s"]
+    elif mode == "int4":
+        enc, _ = _quantize_int4(kept)
+        recon_vals = _dequant_int4(enc)
     elif mode == "bf16":
         enc = kept.to(torch.bfloat16)
         recon_vals = enc.float()
@@ -206,6 +249,10 @@ def compress_delta(delta, mode: str, carry=None, density: float = 1.0):
             c = d.detach().to(torch.bfloat16)
             payload.append(c)
             residual.append(d.detach().float() - c.float())
+        elif mode == "int4":
+            p, r = _quantize_int4(d)
+            payload.append(p)
+            residual.append(r)
         else:  # int8
             q, r = _quantize_int8(d)
             payload.append(q)
@@ -216,21 +263,21 @@ def compress_delta(delta, mode: str, carry=None, density: float = 1.0):
 # -- weight deltas (W2a delta-down; docs/w2-bandwidth-design.md) -----------------
 
 
-def encode_state_delta(cur: dict, base: dict) -> dict:
-    """Encode a state_dict as an **int8 delta against ``base``** (a prior version
-    the receiver holds exactly -- a keyframe). Floating tensors become a small-
-    magnitude ``cur - base`` quantized symmetric int8 (``{"q","s"}``) -- deltas
-    have far smaller range than raw weights, so int8 captures them at pseudo-
-    gradient quality (raw weights would need bf16). Non-floating (or shape-
-    changed) tensors ship verbatim; their delta would be meaningless. ``base`` is
-    the *same bytes the receiver holds* (the caller passes ``compress_state``-d
-    history), so the only reconstruction error is one bounded int8 step."""
+def encode_state_delta(cur: dict, base: dict, mode: str = "int8") -> dict:
+    """Encode a state_dict as a **delta against ``base``** (a prior version the
+    receiver holds exactly -- a keyframe). Floating tensors become a small-
+    magnitude ``cur - base`` quantized to ``mode`` (int8, or int4 per-group for
+    W2c) -- deltas have far smaller range than raw weights, so low-bit captures
+    them at pseudo-gradient quality (raw weights would need bf16). Non-floating
+    (or shape-changed) tensors ship verbatim. ``base`` is the *same bytes the
+    receiver holds* (the caller passes ``compress_state``-d history), so the only
+    reconstruction error is one bounded quant step."""
     out = {}
     for n, c in cur.items():
         b = base.get(n)
         if c.is_floating_point() and b is not None and b.shape == c.shape:
-            q, _ = _quantize_int8(c.float() - b.float())
-            out[n] = q                      # {"q": int8, "s": scale}
+            d = c.float() - b.float()
+            out[n] = _quantize_int4(d)[0] if mode == "int4" else _quantize_int8(d)[0]
         else:
             out[n] = c                      # non-float / shape change -> verbatim
     return out
@@ -238,14 +285,16 @@ def encode_state_delta(cur: dict, base: dict) -> dict:
 
 def apply_state_delta(base: dict, tensors: dict) -> dict:
     """Reconstruct a state_dict from a keyframe ``base`` + an
-    :func:`encode_state_delta` payload: ``base + dequant(delta)`` for the int8
-    entries, verbatim for the rest. Raises ``TypeError`` on a malformed entry so
-    a receiver refuses a bad delta instead of crashing."""
+    :func:`encode_state_delta` payload: ``base + dequant(delta)`` for the int8 /
+    int4 entries, verbatim for the rest. Raises ``TypeError``/``ValueError`` on a
+    malformed entry so a receiver refuses a bad delta instead of crashing."""
     out = {}
     for n, t in tensors.items():
         if isinstance(t, dict) and "q" in t and torch.is_tensor(t["q"]):
+            out[n] = base[n].float() + t["q"].to(torch.float32) * float(t["s"])
+        elif isinstance(t, dict) and "q4" in t:
             b = base[n]
-            out[n] = b.float() + t["q"].to(torch.float32) * float(t["s"])
+            out[n] = b.float() + _dequant_int4(t).reshape(b.shape)
         elif torch.is_tensor(t):
             out[n] = t                      # verbatim (non-float / shape change)
         else:
@@ -256,9 +305,10 @@ def apply_state_delta(base: dict, tensors: dict) -> dict:
 def maybe_dequantize(items) -> list[torch.Tensor]:
     """Restore a pseudo-gradient list to fp32 whatever encoding it arrived in.
 
-    Accepts fp32 (passthrough), bf16 (cast), ``{"q", "s"}`` int8 payloads, or a
-    ``{"sp", "i", "v"}`` sparse top-k payload (W2b, scattered back to a dense
-    tensor); raises ``TypeError`` on anything else so the server can refuse a
+    Accepts fp32 (passthrough), bf16 (cast), ``{"q", "s"}`` int8 payloads,
+    ``{"q4", ...}`` int4 per-group payloads (W2c), or a ``{"sp", "i", "v"}``
+    sparse top-k payload (W2b, scattered back to a dense tensor); raises
+    ``TypeError``/``ValueError`` on anything else so the server can refuse a
     malformed push instead of crashing.
     """
     out = []
@@ -267,11 +317,15 @@ def maybe_dequantize(items) -> list[torch.Tensor]:
             out.append(it if it.dtype == torch.float32 else it.to(torch.float32))
         elif isinstance(it, dict) and "q" in it and torch.is_tensor(it["q"]):
             out.append(it["q"].to(torch.float32) * float(it["s"]))
+        elif isinstance(it, dict) and "q4" in it:       # int4 per-group (dense)
+            out.append(_dequant_int4(it).reshape([int(s) for s in it["shape"]]))
         elif isinstance(it, dict) and "sp" in it and torch.is_tensor(it.get("i")):
             shape = [int(s) for s in it["sp"]]
             v = it["v"]
             if isinstance(v, dict) and "q" in v:        # int8-encoded kept values
                 vals = v["q"].to(torch.float32) * float(v["s"])
+            elif isinstance(v, dict) and "q4" in v:     # int4-encoded kept values
+                vals = _dequant_int4(v)
             elif torch.is_tensor(v):                    # fp32 / bf16 kept values
                 vals = v.to(torch.float32)
             else:

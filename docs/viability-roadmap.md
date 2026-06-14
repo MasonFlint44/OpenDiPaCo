@@ -104,17 +104,19 @@ in-process — the data/control plane over libp2p is proven, only the rendezvous
 *of* addresses is still manual), plus real NAT/CGNAT + DCUtR-success measurement
 and throughput at scale, which need the multi-node §0f run.
 
-### W2 · Bandwidth: delta encoding + sparsification + lower-bit quant · B0 · [eng + research] · **W2a + W2b landed**
+### W2 · Bandwidth: delta encoding + sparsification + lower-bit quant · B0 · [eng + research] · **W2a–W2c landed**
 
 Design + per-slice status in [w2-bandwidth-design.md](w2-bandwidth-design.md).
-**W2a (delta-down) landed**: `transport.down: delta` ships int8 `current −
-keyframe` weights (keyframe + non-chained deltas bound the quant error; owner
-version ring + full fallback). **W2b (structured sparsification) landed**:
-`transport.up_density < 1` sends only the top fraction of each pseudo-gradient
-(per-row for 2-D weights), error-feeding the dropped mass. Both off by default,
-byte-identical when at full/dense, with converging `delta-down` / `sparse-up`
-arms in `validate_dynamics.py`. Remaining: **W2c** sub-int8 (int4 + per-group)
-and the `inner_steps` docs lever. WAN §0f stays the final verdict.
+**W2a (delta-down)**: `transport.down: delta` ships int8 `current − keyframe`
+weights (keyframe + non-chained deltas bound the quant error; owner version ring
++ full fallback). **W2b (structured sparsification)**: `transport.up_density < 1`
+sends only the top fraction of each pseudo-gradient (per-row for 2-D weights),
+error-feeding the dropped mass. **W2c (sub-int8)**: `transport.compress: int4`
+adds int4 per-group quantization for the up pseudo-gradient and the down delta
+(~8× up). All off by default, byte-identical at full/dense/none, error-fed, and
+Byzantine-hardened at the decode boundary; `validate_dynamics.py` has converging
+`delta-down` / `sparse-up` / `int4` / `W2 stacked` arms. Remaining: the free
+`inner_steps` docs lever. The WAN §0f run stays the final convergence verdict.
 
 Phase 0c got ~2× down / 4× up, but the "ship only changed weights" cache is
 **structurally defeated in async mode** (every accepted contribution bumps the

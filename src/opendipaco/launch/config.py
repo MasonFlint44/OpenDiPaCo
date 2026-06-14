@@ -125,8 +125,10 @@ class TransportCfg:
     # Servers always reject non-finite contributions; this additionally clips a
     # pseudo-gradient whose L2 norm exceeds the cap (None = no cap).
     max_update_norm: float | None = None
-    # Wire compression: "none" (fp32, default), "bf16" (2x), or "int8"
-    # (bf16 weights + int8 pseudo-gradients with error feedback, ~4x up).
+    # Wire compression: "none" (fp32, default), "bf16" (2x), "int8" (bf16 weights
+    # + int8 pseudo-gradients with error feedback, ~4x up), or "int4" (int4
+    # per-group pseudo-gradients/deltas, ~8x up; bf16 weights). int8/int4 also set
+    # the down-delta precision (W2a/W2c). Off (none) is byte-identical.
     compress: str = "none"
     # Downlink (weights) policy (W2; docs/w2-bandwidth-design.md): "full"
     # (default, byte-identical) re-ships full weights; "delta" ships int8

@@ -518,8 +518,11 @@ class ParameterServer(_ReactorServer):
             held = self._pinned_state_locked(key, have_version)
             if held is not None:
                 base = compress_state(held, self.compress)  # == the bytes the worker holds
+                # The delta is always quantized (its small range is the point);
+                # int4 when the owner runs int4, else int8 (W2a/W2c).
+                dmode = "int4" if self.compress == "int4" else "int8"
                 return {"__delta__": list(self._versions[key]), "base": list(have_version),
-                        "tensors": encode_state_delta(cur, base)}
+                        "tensors": encode_state_delta(cur, base, dmode)}
         return compress_state(cur, self.compress)
 
     # -- private proposals (Phase 3d, policy D5/3a) ----------------------------

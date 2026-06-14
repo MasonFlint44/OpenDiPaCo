@@ -23,6 +23,8 @@ genuinely race and go stale), with two further deltas layered on:
 * ``sparse-up`` (W2b, ``up_density < 1``) — the worker sends only the top fraction
   of each pseudo-gradient (error-feeding the rest); does sparsified communication
   still train?
+* ``int4`` (W2c, ``compress: int4``) — int4 per-group pseudo-gradients/deltas; does
+  4-bit communication still train? (plus a ``W2 stacked`` arm with all three on.)
 
 All configs train the **same** corpus/sharding/seed and are evaluated by the same
 router-free metric (best-path perplexity on a held-out split), so the numbers are
@@ -204,6 +206,8 @@ def main() -> None:
         ("async + robust agg", dict(compress="none", robustness="on")),
         ("async + delta-down", dict(compress="int8", down="delta")),   # W2a
         ("async + sparse-up", dict(compress="int8", up_density=0.25)),  # W2b
+        ("async + int4", dict(compress="int4")),                        # W2c
+        ("async + W2 stacked", dict(compress="int4", down="delta", up_density=0.25)),
     ]
     worst, all_learned = 1.0, True
     for name, kw in variants:
