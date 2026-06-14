@@ -19,7 +19,9 @@ from .roles import (
     run_ingest,
     run_local,
     run_parameter_server,
+    run_relay,
     run_scheduler,
+    run_tracker,
     run_worker_role,
 )
 
@@ -34,6 +36,8 @@ __all__ = [
     "run_coordinator",
     "run_scheduler",
     "run_parameter_server",
+    "run_relay",
+    "run_tracker",
     "run_worker_role",
     "run_ingest",
     "run_local",

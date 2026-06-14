@@ -42,12 +42,14 @@ REACHABILITY = ("public", "nat")
 
 
 def make_peer_record(identity: PeerIdentity, *, reachability: str = "nat",
-                     addr=None, roles=(), capabilities=None) -> dict:
+                     addr=None, roles=(), capabilities=None, circuit_addrs=None) -> dict:
     """Build + sign this peer's directory record (``issued_at`` = now).
 
     ``"public"`` reachability requires ``addr=(host, port)`` — that is the
-    address other peers will dial; ``"nat"`` peers carry no address (they only
-    dial out).
+    address other peers will dial; ``"nat"`` peers carry no direct address (they
+    only dial out), but may advertise ``circuit_addrs`` — ``/p2p-circuit``
+    multiaddrs through relays they've reserved on — so a NAT'd peer can be
+    reached (and serve as an owner) through a relay (W1c).
     """
     if reachability not in REACHABILITY:
         raise ValueError(f"reachability must be one of {REACHABILITY}, got {reachability!r}")
@@ -63,6 +65,8 @@ def make_peer_record(identity: PeerIdentity, *, reachability: str = "nat",
         "capabilities": dict(capabilities or {}),
         "issued_at": time.time(),
     }
+    if circuit_addrs:  # omitted when absent, so non-relay records are unchanged
+        record["circuit_addrs"] = list(circuit_addrs)
     return sign_record(identity, record)
 
 

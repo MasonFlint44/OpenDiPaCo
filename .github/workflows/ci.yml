@@ -22,3 +22,22 @@ jobs:
       # large CUDA build). --frozen requires uv.lock to be in sync with pyproject.
       - name: Run tests
         run: uv run --frozen --extra cpu --extra data --extra launch pytest
+
+  # The libp2p (NAT-traversal, W1) path lives behind the optional [nat] extra and
+  # its tests importorskip libp2p, so the baseline job above skips them. This job
+  # installs the extra and exercises the libp2p transport seam end-to-end.
+  nat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Run libp2p (NAT) tests
+        run: >-
+          uv run --frozen --extra cpu --extra data --extra launch --extra nat
+          pytest tests/test_p2p.py

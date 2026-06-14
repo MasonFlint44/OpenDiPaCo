@@ -30,7 +30,6 @@ import collections
 import hashlib
 import hmac
 import json
-import math
 import os
 import random
 import ssl
@@ -186,6 +185,28 @@ def _version_pair(v) -> tuple:
     return tuple(v) if isinstance(v, (tuple, list)) else (0, int(v))
 
 
+def _addr_key(addr):
+    """A hashable, transport-opaque handle for a peer address (W1b orchestration).
+
+    TCP addresses cross the wire as JSON and arrive as ``[host, port]`` lists ->
+    normalize to a ``(host, port)`` tuple (hashable, what connection caches and
+    routing have always keyed on). A libp2p multiaddr is a string and is already
+    hashable, so it passes through unchanged. Replaces the ``tuple(addr)``
+    coercions that turned a multiaddr into a tuple of characters."""
+    return tuple(addr) if isinstance(addr, (list, tuple)) else addr
+
+
+def _route_target(owner):
+    """The dial target a scheduler advertises for one **epoch owner entry**. A
+    multi-relay NAT owner returns its **full circuit-addr candidate list**
+    (``owner["addrs"]``, populated by ``make_epoch_record``) so a worker can fail
+    over across relays (``Libp2pTransport.rpc`` tries them in order); a single-
+    address owner returns that one address verbatim -- so a public/TCP owner
+    stays ``[host, port]`` exactly as before (byte-identical routing)."""
+    addrs = owner.get("addrs") or [owner["addr"]]
+    return addrs if len(addrs) > 1 else owner["addr"]
+
+
 def _safe_version(v):
     """A *wire* version coerced to an (epoch, counter) pair, or None if
     malformed. Decentralized sources may be Byzantine (Phase 4), so a bad
@@ -295,6 +316,10 @@ class ParameterServer(_ReactorServer):
 
         self.identity = identity
         self.peer_id = getattr(identity, "peer_id", None)
+        # The libp2p transport that serves this owner (set by serve_over_libp2p);
+        # owner↔owner RPCs (_peer_rpc) reuse it to dial co-owners over libp2p /
+        # through relays when their addr is a multiaddr (W1c).
+        self.libp2p = None
         self._all_keys = set(self._topology.module_keys())
         self._epoch = None
         self._epoch_num = 0
@@ -786,10 +811,13 @@ class ParameterServer(_ReactorServer):
                              if o["peer_id"] != self.peer_id]
                 addrs, seen = [], set()
                 for o in srcs:
-                    a = tuple(o["addr"])
-                    if a not in seen:
-                        seen.add(a)
-                        addrs.append(a)
+                    # _owner_targets gives a NAT co-owner's full relay candidate
+                    # list (libp2p, tried in order for failover) or its single TCP
+                    # addr; dedup by peer_id since a candidate list isn't hashable.
+                    if o["peer_id"] in seen:
+                        continue
+                    seen.add(o["peer_id"])
+                    addrs.append(self._owner_targets(o))
                 if addrs:
                     candidates[k] = addrs
                     results[k] = "pending"
@@ -807,7 +835,7 @@ class ParameterServer(_ReactorServer):
         # replicas -- an unconfirmed higher version is left for a later pass.
         confirmed: dict = {}
         if self.schedule_mode == "decentralized" and epoch is not None and candidates:
-            addrs = sorted({tuple(o["addr"]) for k in candidates
+            addrs = sorted({_addr_key(o["addr"]) for k in candidates
                             for o in owners_for(k, epoch)})
             confirmed = read_quorum_versions(
                 addrs, list(candidates), self.read_quorum,
@@ -910,7 +938,21 @@ class ParameterServer(_ReactorServer):
         self._beat_thread = threading.Thread(target=beat, daemon=True)
         self._beat_thread.start()
 
+    def _owner_targets(self, owner):
+        """Dial target(s) for an owner epoch entry: a candidate list of its relay
+        circuit addrs (libp2p — tried in order for multi-relay failover, W1c) or
+        a single ``(host, port)`` (TCP)."""
+        if self.libp2p is not None:
+            return owner.get("addrs") or [owner["addr"]]
+        return _addr_key(owner["addr"])
+
     def _peer_rpc(self, addr, msg):
+        # libp2p owners (W1c): a co-owner's addr is a multiaddr (direct or a
+        # /p2p-circuit through a relay), or a *list* of its k relay circuit addrs
+        # tried in order for failover -> dial over the owner's libp2p transport,
+        # which handles connection reuse + relay routing.
+        if self.libp2p is not None and isinstance(addr, (str, list)):
+            return self.libp2p.rpc(addr, msg, timeout=60.0)
         sock = self._peer_conns.get(addr)
         if sock is None:
             sock = _ps_connect(addr, self._peer_auth, self.max_msg_bytes, 5.0,
@@ -1075,12 +1117,14 @@ class ParameterServer(_ReactorServer):
                     for k in keys if k in self.bank}
         reports: dict = {k: {self.peer_id: (tuple(v), state_digest(sd))}
                          for k, (v, sd) in snap.items()}
-        by_peer: dict = {}  # peer_id -> (addr, [keys it co-owns with us])
+        by_peer: dict = {}  # peer_id -> (dial target(s), [keys it co-owns with us])
         for k in reports:
             for o in owners_for(k, epoch):
                 if o["peer_id"] == self.peer_id:
                     continue
-                by_peer.setdefault(o["peer_id"], (tuple(o["addr"]), []))[1].append(k)
+                # _owner_targets gives a co-owner's relay candidates (libp2p) so
+                # the digest fetch fails over across its k relays (W1c).
+                by_peer.setdefault(o["peer_id"], (self._owner_targets(o), []))[1].append(k)
         for pid, (addr, ks) in by_peer.items():
             try:
                 reply = self._peer_rpc(addr, {"type": "digest", "keys": ks})
@@ -1171,7 +1215,7 @@ class ParameterServer(_ReactorServer):
             self_addr = None if self._self_record is None else tuple(self._self_record["addr"])
             if self._epoch is not None:
                 for o in self._epoch["owners"]:
-                    a = tuple(o["addr"])
+                    a = _addr_key(o["addr"])
                     if a != self_addr:
                         addrs.add(a)
         for addr in addrs:
@@ -1435,13 +1479,13 @@ class Scheduler(_ReactorServer):
         self.total_rounds = None
 
         # key -> (host, port) of the owning parameter server.
-        self.ps_addrs = [tuple(a) for a in ps_addrs]
+        self.ps_addrs = [_addr_key(a) for a in ps_addrs]
         # Routing values are *replica lists* in rank order (primary first); the
         # static map has one entry per key. With no ps_addrs the scheduler is in
         # rendezvous mode: routing derives from the published epoch instead.
         if self.ps_addrs:
             key_shard = assign_shards(self.topology.module_keys(), len(self.ps_addrs))
-            self._routing = {k: [list(self.ps_addrs[s])] for k, s in key_shard.items()}
+            self._routing = {k: [self.ps_addrs[s]] for k, s in key_shard.items()}
         else:
             self._routing = {}
 
@@ -1568,7 +1612,7 @@ class Scheduler(_ReactorServer):
         """Replica addr lists per key, rank order (primary first), per the
         current epoch (rendezvous) or the static shard map."""
         if self._epoch_record is not None:
-            return {k: [list(o["addr"]) for o in owners_for(k, self._epoch_record)]
+            return {k: [_route_target(o) for o in owners_for(k, self._epoch_record)]
                     for k in keys}
         return {k: self._routing[k] for k in keys}
 
@@ -1899,7 +1943,7 @@ class Scheduler(_ReactorServer):
         os.makedirs(dirpath, exist_ok=True)
         with self._lock:
             record = self._epoch_record
-            addrs = (sorted({tuple(o["addr"]) for o in record["owners"]})
+            addrs = (sorted({_addr_key(o["addr"]) for o in record["owners"]})
                      if record is not None else self.ps_addrs)
         held: dict = {}
         for addr in addrs:
@@ -1967,7 +2011,7 @@ class Scheduler(_ReactorServer):
         if record is None:
             return False  # no owner set yet (watch_tracker hasn't published)
         held: dict = {}
-        for addr in sorted({tuple(o["addr"]) for o in record["owners"]}):
+        for addr in sorted({_addr_key(o["addr"]) for o in record["owners"]}):
             try:
                 s = _ps_connect(addr, self.auth_key, DEFAULT_MAX_MSG_BYTES, 5.0,
                                 tls=self.ps_tls, server_hostname=addr[0])
@@ -1999,7 +2043,7 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
                        connect_timeout=10.0, reconnect=False, reconnect_timeout=30.0,
                        fault_hook=None, tls=None, tls_hostname=None,
                        data_dir=None, data_source=None, data_tokenizer=None,
-                       max_batch_size=None):
+                       max_batch_size=None, transport="tcp", identity=None):
     """Train path-tasks for a sharded scheduler + parameter servers.
 
     Per task: lease from the scheduler, fetch the path's modules from the owning
@@ -2018,13 +2062,45 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
     warm: set = set()
     shard_cache: dict = {}
     versions: dict = {}          # shared key -> held version
-    ps_conns: dict = {}          # (host, port) -> connected socket
     residuals: dict = {}         # path -> {key: [tensors]}: compression error feedback
     data_ctx = {"dir": data_dir, "source": data_source, "tokenizer": data_tokenizer}
     caps = {"device": str(device)}
     if max_batch_size is not None:
         caps["max_batch"] = int(max_batch_size)
     state = {"done": 0}
+
+    if transport == "libp2p":
+        # libp2p path: scheduler_addr + routing addrs are multiaddrs; the worker
+        # dials owners (direct or through a relay) over Noise streams. Lazy import
+        # so the default install never imports libp2p (W1, optional [nat] extra).
+        from .p2p import Libp2pTransport, _Libp2pLink
+
+        if identity is None:
+            raise ValueError("transport='libp2p' needs identity=")
+        # Honor the worker's frame cap on its libp2p transport too, so a malicious
+        # owner/scheduler can't push an oversized reply against the 4 GiB default.
+        link = _Libp2pLink(
+            Libp2pTransport(identity, max_msg_bytes=max_msg_bytes).start(), scheduler_addr)
+        backoff, fails, last_done = 0.05, 0, state["done"]
+        try:
+            while fails < 8:   # give up only after sustained no-progress failures
+                try:
+                    if _serve_sharded(link, engine, worker, wid, warm, shard_cache,
+                                      versions, residuals, data_ctx, caps, state,
+                                      heartbeat_interval, poll_interval, max_tasks,
+                                      fault_hook):
+                        return  # clean finish (stop / budget)
+                except (OSError, ConnectionError):
+                    pass  # transient libp2p fault (e.g. a raced dial) -> retry
+                if state["done"] > last_done:    # progress -> the fault was transient
+                    fails, backoff, last_done = 0, 0.05, state["done"]
+                else:                             # no progress -> scheduler likely gone
+                    fails += 1
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 1.0)
+        finally:
+            link.close()
+        return
 
     first = True
     backoff = 0.05
@@ -2036,60 +2112,40 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
         except ConnectionError:
             return  # scheduler unreachable
         first = False
+        # One link per scheduler connection: it owns the PS connection cache, so
+        # a reconnect naturally drops stale PS sockets (fresh link next loop).
+        link = _WorkerLink(sch, auth_key=auth_key, max_msg_bytes=max_msg_bytes,
+                           connect_timeout=connect_timeout, tls=tls)
         clean = False
         try:
-            clean = _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions,
-                                   ps_conns, residuals, data_ctx, caps, state, auth_key,
-                                   max_msg_bytes, connect_timeout, heartbeat_interval,
-                                   poll_interval, max_tasks, fault_hook, tls=tls)
+            clean = _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions,
+                                   residuals, data_ctx, caps, state, heartbeat_interval,
+                                   poll_interval, max_tasks, fault_hook)
         except (OSError, ConnectionError):
             clean = False  # disconnected -> reconnect (if enabled)
         finally:
+            link.close()
             try:
                 sch.close()
             except OSError:
                 pass
         if clean or not reconnect:
-            for s in ps_conns.values():
-                try:
-                    s.close()
-                except OSError:
-                    pass
             return
-        # Reconnect: drop stale PS sockets; they reconnect lazily next task.
-        for s in ps_conns.values():
-            try:
-                s.close()
-            except OSError:
-                pass
-        ps_conns.clear()
         time.sleep(backoff)
         backoff = min(backoff * 2, 1.0)
 
 
-def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_conns,
-                   residuals, data_ctx, caps, state, auth_key, max_msg_bytes,
-                   connect_timeout, heartbeat_interval, poll_interval, max_tasks,
-                   fault_hook, *, tls=None) -> bool:
+def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions,
+                   residuals, data_ctx, caps, state, heartbeat_interval, poll_interval,
+                   max_tasks, fault_hook) -> bool:
     """One scheduler connection: serve tasks. Returns True on a clean finish (stop /
-    budget), raises ``OSError`` on a disconnect (so the caller can reconnect)."""
-    send_lock = threading.Lock()
-
-    def sch_send(m):
-        with send_lock:
-            send_msg(sch, m)
-
-    def ps_sock(addr):
-        if addr not in ps_conns:
-            ps_conns[addr] = _ps_connect(addr, auth_key, max_msg_bytes, connect_timeout,
-                                         tls=tls, server_hostname=addr[0])
-        return ps_conns[addr]
-
+    budget), raises ``OSError`` on a disconnect (so the caller can reconnect). All
+    peer comms go through ``link`` (the transport seam), so TCP and libp2p share
+    this loop verbatim."""
     while True:
-        sch_send({"type": "request", "worker_id": wid,
-                  "warm_paths": list(warm), "cached_shards": list(shard_cache),
-                  "capabilities": caps})
-        task = recv_msg(sch, max_msg_bytes)
+        task = link.sch_rpc({"type": "request", "worker_id": wid,
+                             "warm_paths": list(warm), "cached_shards": list(shard_cache),
+                             "capabilities": caps})
         if task is None:
             raise OSError("scheduler disconnected")  # not a clean stop -> reconnect
         if task["type"] == "stop":
@@ -2103,7 +2159,11 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
         worker.seed = task["seed"]
         engine.total_rounds = task["total_rounds"]
         # Routing values are replica addr lists in rank order (primary first).
-        routing = {k: [tuple(a) for a in addrs] for k, addrs in task["routing"].items()}
+        # link.addr_key picks the per-transport dial target: a hashable (host,
+        # port) for TCP, the raw multiaddr / k-relay candidate *list* for libp2p
+        # (a NAT owner's relays, which rpc fails over across).
+        routing = {k: [link.addr_key(a) for a in addrs]
+                   for k, addrs in task["routing"].items()}
         check_only = bool(task.get("check_only"))
         audit = bool(task.get("audit"))
         # A check pins the audited primary's exact base; an audited primary (and
@@ -2121,7 +2181,8 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
             must serve those exact versions; an aged-out pin can't be reproduced,
             so it raises ``_CheckAborted`` and the caller abstains."""
             pending = {
-                k: [a for a in addrs if a in ps_conns] + [a for a in addrs if a not in ps_conns]
+                k: [a for a in addrs if link.connected(a)]
+                + [a for a in addrs if not link.connected(a)]
                 for k, addrs in routing.items()
             }
             while pending:
@@ -2133,11 +2194,10 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
                 if pin:
                     req["pin"] = {k: list(pin[k]) for k in batch if k in pin}
                 try:
-                    reply = _rpc(ps_sock(addr), req, max_msg_bytes)
+                    reply = link.ps_rpc(addr, req)
                     if reply is None:
                         raise OSError(f"replica {addr} closed")
                 except (OSError, ConnectionError):
-                    ps_conns.pop(addr, None)
                     for k in batch:
                         pending[k] = pending[k][1:]
                         if not pending[k]:
@@ -2182,29 +2242,31 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
             # distinct peers agree on the exact bytes (D5/3a).
             if (task.get("private_proposal") and contrib is not None
                     and contrib.private_state):
+                # Group by a hashable key but dial the raw target (a libp2p
+                # candidate *list* isn't hashable yet must stay a list to fail over).
                 by_owner: dict = {}
                 for k, sd in contrib.private_state.items():
                     if k in routing:
-                        by_owner.setdefault(routing[k][0], {})[k] = sd
-                for addr, states in by_owner.items():
+                        target = routing[k][0]
+                        by_owner.setdefault(_addr_key(target), (target, {}))[1][k] = sd
+                for addr, states in by_owner.values():
                     try:
-                        _rpc(ps_sock(addr),
-                             {"type": "private_proposal", "private": states,
-                              "grant": task.get("grant")}, max_msg_bytes)
+                        link.ps_rpc(addr, {"type": "private_proposal", "private": states,
+                                           "grant": task.get("grant")})
                     except (OSError, ConnectionError):
-                        ps_conns.pop(addr, None)  # owner away; corroboration just waits
+                        pass  # owner away; corroboration just waits (link drops the conn)
             engine._opt_state.pop(path, None)  # leave no warm trace of the check
-            ack = _rpc_send(sch, send_lock, max_msg_bytes,
-                            {"type": "commit", "check_only": True, "path": path,
-                             "worker_id": wid, "lease": lease, "digest": digest,
-                             "gen_id": task["gen_id"]})
+            ack = link.sch_rpc({"type": "commit", "check_only": True, "path": path,
+                                "worker_id": wid, "lease": lease, "digest": digest,
+                                "gen_id": task["gen_id"]})
             if ack is None:
                 raise OSError("scheduler disconnected during check commit")
             continue
 
         stop_beat = threading.Event()
         beat = threading.Thread(target=_sch_heartbeat,
-                                args=(sch_send, stop_beat, heartbeat_interval, wid, lease, path),
+                                args=(link.sch_send, stop_beat, heartbeat_interval, wid,
+                                      lease, path),
                                 daemon=True)
         beat.start()
         base, digest = None, None
@@ -2229,7 +2291,7 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
                   "loss": contrib.loss, "empty": contrib.empty}
         if audit:
             commit["digest"], commit["base"] = digest, base
-        ack = _rpc_send(sch, send_lock, max_msg_bytes, commit)
+        ack = link.sch_rpc(commit)
         if ack is None:
             raise OSError("scheduler disconnected during commit")
         if ack.get("accepted"):
@@ -2241,16 +2303,7 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
             )
             _commit_residuals(residuals, path, pending_res)
 
-            def drop_conn(addr):
-                s = ps_conns.pop(addr, None)
-                if s is not None:
-                    try:
-                        s.close()
-                    except OSError:
-                        pass
-
-            failed = _push_group(routing, grant, shared_payload, private_payload,
-                                 ps_sock, drop_conn, max_msg_bytes)
+            failed = _push_group(routing, grant, shared_payload, private_payload, link)
             if failed:
                 # The epoch moved under this task: the old primary refused (or
                 # died). The scheduler already accepted the commit, so re-route
@@ -2258,16 +2311,14 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
                 # grant once (it is single-use per server, so a new primary
                 # accepts it). A second failure drops the update -- the
                 # documented bounded-loss window.
-                fresh = _rpc_send(sch, send_lock, max_msg_bytes,
-                                  {"type": "routing", "path": path})
+                fresh = link.sch_rpc({"type": "routing", "path": path})
                 if fresh is None:
                     raise OSError("scheduler disconnected during push retry")
                 fresh_routing = fresh.get("routing") or {}
-                retry = {k: [tuple(a) for a in fresh_routing[k]]
+                retry = {k: [link.addr_key(a) for a in fresh_routing[k]]
                          for k in failed if k in fresh_routing}
                 if retry:
-                    _push_group(retry, grant, shared_payload, private_payload,
-                                ps_sock, drop_conn, max_msg_bytes)
+                    _push_group(retry, grant, shared_payload, private_payload, link)
             engine._opt_state[path] = contrib.opt_state          # warm-back
             _load_private(engine, contrib.private_state)
             warm.add(path)
@@ -2277,20 +2328,21 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
         # rejected -> discard the contribution; warm caches stay
 
 
-def _push_group(routing, grant, shared_payload, private_payload, ps_sock, drop_conn,
-                max_msg_bytes) -> set:
-    """Push each key's update to its primary (``routing[k][0]``).
+def _push_group(routing, grant, shared_payload, private_payload, link) -> set:
+    """Push each key's update to its primary (``routing[k][0]``) via the link.
 
     Returns the keys whose update did **not** land for a retryable reason:
     the server refused them as ``not_primary`` (the worker's routing is from
     an older epoch) or the primary was unreachable. Non-retryable refusals
     (bad grant, replay) return nothing -- a retry could never succeed.
     """
-    by_primary: dict = {}  # writes go to rank 0 only (design D3)
+    by_primary: dict = {}  # group_key -> (dial_target, [keys]); writes to rank 0 only (D3)
     for k, addrs in routing.items():
-        by_primary.setdefault(tuple(addrs[0]), []).append(k)
+        # Hashable group key, but dial the raw target -- a libp2p relay candidate
+        # list must stay a list so rpc fails over across the owner's k relays.
+        by_primary.setdefault(_addr_key(addrs[0]), (addrs[0], []))[1].append(k)
     failed: set = set()
-    for addr, keys in by_primary.items():
+    for addr, keys in by_primary.values():
         updates = {k: {"grad": shared_payload[k]}
                    for k in keys if not is_private_key(k) and k in shared_payload}
         private = {k: private_payload[k]
@@ -2298,13 +2350,10 @@ def _push_group(routing, grant, shared_payload, private_payload, ps_sock, drop_c
         if not updates and not private:
             continue
         try:
-            reply = _rpc(ps_sock(addr),
-                         {"type": "push", "grant": grant, "updates": updates,
-                          "private": private},
-                         max_msg_bytes)
+            reply = link.ps_rpc(addr, {"type": "push", "grant": grant,
+                                       "updates": updates, "private": private})
         except (OSError, ConnectionError):
-            drop_conn(addr)
-            failed |= set(updates) | set(private)
+            failed |= set(updates) | set(private)   # link drops the stale conn itself
             continue
         if reply and reply.get("reason") == "not_primary":
             failed |= set(reply.get("skipped") or [])
@@ -2345,6 +2394,72 @@ def _rpc_send(sock, lock, max_msg_bytes, msg):
     with lock:
         send_msg(sock, msg)
         return recv_msg(sock, max_msg_bytes)
+
+
+class _WorkerLink:
+    """The worker's comm seam to the scheduler + parameter servers (W1b step 2).
+
+    A persistent request/reply channel to the scheduler (``sch_rpc``) with a
+    fire-and-forget path for heartbeats (``sch_send``), plus a connection-cached
+    request/reply to each parameter server (``ps_rpc``). This TCP implementation
+    preserves today's behavior exactly (same sockets, same ``send_lock``-serialized
+    writes, same ``_ps_connect`` cache, same drop-on-error); the libp2p
+    implementation (W1b step 3) swaps the byte pipe without touching the worker
+    loop, which now speaks only to this seam."""
+
+    def __init__(self, sch_sock, *, auth_key, max_msg_bytes, connect_timeout, tls=None):
+        self._sch = sch_sock
+        self._lock = threading.Lock()
+        self._auth = auth_key
+        self._max = max_msg_bytes
+        self._timeout = connect_timeout
+        self._tls = tls
+        self._ps: dict = {}   # addr_key -> connected socket
+
+    def sch_send(self, msg) -> None:
+        with self._lock:
+            send_msg(self._sch, msg)
+
+    def sch_rpc(self, msg):
+        with self._lock:                      # serialize writes; heartbeat waits its turn
+            send_msg(self._sch, msg)
+            return recv_msg(self._sch, self._max)
+
+    def addr_key(self, a):
+        """Normalize a routing entry to this transport's dial target. TCP keys its
+        socket cache by address, so an entry must be a hashable ``(host, port)``."""
+        return _addr_key(a)
+
+    def connected(self, addr) -> bool:
+        return addr in self._ps
+
+    def ps_rpc(self, addr, msg):
+        sock = self._ps.get(addr)
+        if sock is None:
+            sock = _ps_connect(addr, self._auth, self._max, self._timeout,
+                               tls=self._tls, server_hostname=addr[0])
+            self._ps[addr] = sock
+        try:
+            return _rpc(sock, msg, self._max)
+        except (OSError, ConnectionError):
+            self._drop(addr)               # stale socket -> reconnect lazily next call
+            raise
+
+    def _drop(self, addr) -> None:
+        s = self._ps.pop(addr, None)
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        for s in self._ps.values():
+            try:
+                s.close()
+            except OSError:
+                pass
+        self._ps.clear()
 
 
 def _sch_heartbeat(sch_send, stop_beat, interval, wid, lease, path):

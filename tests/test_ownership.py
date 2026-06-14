@@ -345,3 +345,96 @@ def test_tracker_epoch_cache_pins_signer_and_orders_epochs():
         assert put_epoch(addr2, r0)["type"] == "epoch_cached"
     finally:
         t2.shutdown()
+
+
+# -- NAT'd owners reachable through relays (W1c) --------------------------------
+
+
+def test_owner_eligible_accepts_nat_with_relay_circuit_addrs():
+    """A NAT'd consumer machine becomes owner-eligible by advertising relay
+    circuit addrs (the W1 goal); a bare NAT peer (no relays) does not."""
+    from opendipaco.schedule import make_peer_record, owner_addr, owner_eligible
+
+    pub = make_peer_record(PeerIdentity.generate(), reachability="public",
+                           addr=("203.0.113.5", 9000), roles=("owner",))
+    circuit = "/ip4/198.51.100.2/tcp/4001/p2p/RELAY/p2p-circuit/p2p/SELF"
+    nat = make_peer_record(PeerIdentity.generate(), reachability="nat",
+                           roles=("owner",), circuit_addrs=[circuit])
+    nat_bare = make_peer_record(PeerIdentity.generate(), reachability="nat",
+                                roles=("owner",))
+    non_owner = make_peer_record(PeerIdentity.generate(), reachability="nat",
+                                 roles=("relay",), circuit_addrs=[circuit])
+
+    assert owner_eligible(pub) and owner_eligible(nat)
+    assert not owner_eligible(nat_bare)     # NAT with no relay reservation
+    assert not owner_eligible(non_owner)    # has relays but not the owner role
+    assert owner_addr(pub) == ["203.0.113.5", 9000]
+    assert owner_addr(nat) == circuit       # dialed through its relay
+    assert owner_addr(nat_bare) is None
+
+
+def test_epoch_record_carries_a_nat_owners_circuit_addr():
+    """make_epoch_record places a NAT'd owner with its circuit addr, so HRW
+    routing hands dialers a relay-reachable address."""
+    from opendipaco.schedule import make_epoch_record, owners_for
+
+    sched = PeerIdentity.generate()
+    nat_id = PeerIdentity.generate()
+    circuit = "/ip4/198.51.100.2/tcp/4001/p2p/RELAY/p2p-circuit/p2p/SELF"
+    rec = make_peer_record(nat_id, reachability="nat", roles=("owner",),
+                           circuit_addrs=[circuit])
+    epoch = make_epoch_record(sched, epoch=0, owner_records=[rec], k=1)
+    cfg = _cfg()
+    key = sorted(cfg.build_topology().module_keys())[0]
+    assert owners_for(key, epoch)[0]["addr"] == circuit
+
+
+def test_epoch_manager_observes_a_nat_owner_without_crashing():
+    """Codex review: EpochManager.observe keyed its change signature on
+    rec["addr"], which is None for a NAT record (TypeError) -- so a relay-
+    reachable owner admitted by owner_eligible could never join through the
+    manager. The signature now keys on the dialable addresses, and a relay-set
+    change bumps the epoch."""
+    from opendipaco.schedule import EpochManager
+
+    nat = make_peer_record(PeerIdentity.generate(), reachability="nat",
+                           roles=("owner",), circuit_addrs=["/ip4/1.1.1.1/tcp/1/p2p/R/"
+                                                            "p2p-circuit/p2p/SELF"])
+    mgr = EpochManager(owner_grace=100.0, min_epoch_interval=0.0)
+    published = mgr.observe([nat], now=0.0)            # no TypeError
+    assert published is not None and published[0]["peer_id"] == nat["peer_id"]
+    assert mgr.observe([nat], now=1.0) is None         # unchanged -> no new epoch
+    # A changed relay set is a real change -> the manager bumps again.
+    nat2 = dict(nat, circuit_addrs=nat["circuit_addrs"]
+                + ["/ip4/2.2.2.2/tcp/2/p2p/R2/p2p-circuit/p2p/SELF"])
+    assert mgr.observe([nat2], now=2.0) is not None
+
+
+def test_routing_target_preserves_tcp_and_lists_relays_for_nat():
+    """Codex review: scheduler routing dropped a NAT owner's relay candidates
+    (sent only addr[0]), so a worker got no failover. A multi-relay NAT owner now
+    routes as its full candidate list; a public/TCP owner stays [host, port]."""
+    from opendipaco.schedule.sharded import _route_target
+
+    pub = {"peer_id": "p", "addr": ["10.0.0.1", 29501], "addrs": [["10.0.0.1", 29501]]}
+    assert _route_target(pub) == ["10.0.0.1", 29501]          # TCP unchanged
+    c = ["/ip4/1/tcp/1/p2p/R1/p2p-circuit/p2p/S", "/ip4/2/tcp/2/p2p/R2/p2p-circuit/p2p/S"]
+    nat = {"peer_id": "n", "addr": c[0], "addrs": c}
+    assert _route_target(nat) == c                            # all relays, for failover
+    one = {"peer_id": "n1", "addr": c[0], "addrs": [c[0]]}
+    assert _route_target(one) == c[0]                         # single addr verbatim
+
+
+def test_owner_addrs_lists_all_relays_for_failover():
+    """A NAT'd owner's k relay circuit addrs are all carried through the epoch,
+    so a dialer can fail over across them (W1c)."""
+    from opendipaco.schedule import make_epoch_record, owner_addrs, owners_for
+
+    c1 = "/ip4/198.51.100.2/tcp/1/p2p/R1/p2p-circuit/p2p/SELF"
+    c2 = "/ip4/198.51.100.3/tcp/2/p2p/R2/p2p-circuit/p2p/SELF"
+    nat = make_peer_record(PeerIdentity.generate(), reachability="nat",
+                           roles=("owner",), circuit_addrs=[c1, c2])
+    assert owner_addrs(nat) == [c1, c2]
+    epoch = make_epoch_record(PeerIdentity.generate(), epoch=0, owner_records=[nat], k=1)
+    key = sorted(_cfg().build_topology().module_keys())[0]
+    assert owners_for(key, epoch)[0]["addrs"] == [c1, c2]   # both relays carried

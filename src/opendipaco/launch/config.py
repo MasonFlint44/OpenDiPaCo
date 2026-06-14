@@ -84,6 +84,22 @@ class TLSCfg:
 
 @dataclass
 class TransportCfg:
+    # Connection substrate (W1; docs/w1-nat-design.md). "tcp" (default) is the
+    # raw-socket reactor -- the deterministic anchor, bit-identical to pre-W1.
+    # "libp2p" runs our wire frames over libp2p Noise streams (NAT traversal via
+    # Circuit Relay v2 + DCUtR); needs the optional ``[nat]`` extra and a
+    # ``transport.identity_key`` (the libp2p host key derives from it).
+    kind: str = "tcp"                   # "tcp" | "libp2p"
+    # libp2p listen multiaddrs (kind == "libp2p"); 0 picks an ephemeral port.
+    libp2p_listen: list[str] = field(default_factory=lambda: ["/ip4/0.0.0.0/tcp/0"])
+    # Relay multiaddrs a NAT'd peer reserves a forwarding slot on (k>=2 for
+    # failover, D6); empty for a public peer that needs no relay.
+    relays: list[str] = field(default_factory=list)
+    dcutr: bool = True                  # attempt relayed->direct hole-punch upgrade (D9)
+    # The coordinator/scheduler multiaddr a libp2p worker dials (kind ==
+    # "libp2p"): a direct ``/ip4/.../p2p/<id>`` or a ``/p2p-circuit`` addr for a
+    # NAT'd scheduler. (TCP uses ``connect_host``/``port``.)
+    connect_libp2p: str | None = None
     host: str = "0.0.0.0"               # bind address (servers)
     connect_host: str | None = None     # address workers dial (defaults from host)
     port: int = 29500
@@ -302,6 +318,9 @@ class LaunchConfig:
             raise ValueError(f"unknown top-level config keys: {sorted(d)}")
         if kw["mode"] not in ("coordinator", "sharded"):
             raise ValueError(f"mode must be 'coordinator' or 'sharded', got {kw['mode']!r}")
+        if kw["transport"].kind not in ("tcp", "libp2p"):
+            raise ValueError(
+                f"transport.kind must be 'tcp' or 'libp2p', got {kw['transport'].kind!r}")
         # Decentralized scheduling is built on the replicated owner tier, so it
         # requires rendezvous ownership (Phase 4 D9). Catch the mismatch at load
         # rather than half-wiring a run with no owners to mint grants.

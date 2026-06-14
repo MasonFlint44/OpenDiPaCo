@@ -20,6 +20,11 @@ dependencies = [
 [project.optional-dependencies]
 data = ["datasets>=2.19", "tokenizers>=0.19"]
 launch = ["pyyaml>=6.0", "cryptography>=41"]
+# NAT traversal / relay tier (W1; docs/w1-nat-design.md): libp2p as the
+# transport+NAT substrate. Optional so the default cpu/cu130 installs are
+# untouched; the libp2p transport is opt-in (transport: libp2p) and its tests
+# importorskip libp2p.
+nat = ["libp2p>=0.6"]
 # torch build selectors (uv routes these to the right index, see [tool.uv]):
 # `uv sync --extra cpu` for CI / CPU boxes, `--extra cu130` for this GPU.
 cpu = ["torch>=2.4"]

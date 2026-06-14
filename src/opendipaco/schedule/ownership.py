@@ -38,16 +38,49 @@ OWNER_ROLE = "owner"
 DEFAULT_REPLICATION = 3
 
 
+def owner_addr(record: dict):
+    """The address other peers dial to reach this owner: its direct ``addr``
+    (a ``public`` peer) or its first relay ``/p2p-circuit`` addr (a ``nat`` peer
+    reachable through relays, W1c). ``None`` if neither is present."""
+    if record.get("addr"):
+        return record["addr"]
+    circuits = record.get("circuit_addrs") or []
+    return circuits[0] if circuits else None
+
+
+def owner_addrs(record: dict) -> list:
+    """All addresses a dialer may try to reach this owner, in preference order:
+    its direct addr (public) or *all* its relay circuit addrs (nat) — so a
+    dialer can fail over across the owner's k relays (W1c)."""
+    if record.get("addr"):
+        return [record["addr"]]
+    return list(record.get("circuit_addrs") or [])
+
+
+def owner_addr_sig(record: dict) -> tuple:
+    """A **hashable** signature of an owner's dialable addresses (its direct addr
+    or *all* its relay circuits), for change detection. A raw NAT record has
+    ``addr=None`` and only ``circuit_addrs``, so keying on ``addr`` directly
+    would crash or miss relay-set changes; this keys on :func:`owner_addrs` and
+    normalizes each entry (a ``[host, port]`` list -> tuple) so the result is set-
+    safe and an owner's epoch bumps when any of its addresses change."""
+    return tuple(tuple(a) if isinstance(a, list) else a for a in owner_addrs(record))
+
+
 def owner_eligible(record: dict) -> bool:
-    """May this (already-verified) peer record host modules?"""
+    """May this (already-verified) peer record host modules?
+
+    A ``public`` peer qualifies with a direct addr; a ``nat`` peer qualifies if
+    it advertises at least one relay circuit addr (so a NAT'd consumer machine
+    can serve as an owner, reached through a relay — the W1 goal)."""
     if not isinstance(record, dict) or record.get("kind") != "peer":
         return False
-    return (
-        record.get("reachability") == "public"
-        and OWNER_ROLE in (record.get("roles") or [])
-        and bool(record.get("addr"))
-        and isinstance(record.get("peer_id"), str)
-    )
+    if OWNER_ROLE not in (record.get("roles") or []) or not isinstance(
+            record.get("peer_id"), str):
+        return False
+    if record.get("reachability") == "public" and record.get("addr"):
+        return True
+    return record.get("reachability") == "nat" and bool(record.get("circuit_addrs"))
 
 
 def _score(salt: str, key: str, peer_id: str) -> bytes:
@@ -96,7 +129,8 @@ def make_epoch_record(identity: PeerIdentity, *, epoch: int, owner_records,
     for r in owner_records:
         if not owner_eligible(r):
             raise ValueError(f"record not owner-eligible: {r.get('peer_id')!r}")
-        owners.append({"peer_id": r["peer_id"], "addr": list(r["addr"])})
+        owners.append({"peer_id": r["peer_id"], "addr": owner_addr(r),
+                       "addrs": owner_addrs(r)})
     owners.sort(key=lambda o: o["peer_id"])
     return sign_record(identity, {
         "kind": "epoch",
@@ -112,7 +146,7 @@ def make_epoch_record(identity: PeerIdentity, *, epoch: int, owner_records,
 def _members_sig(owners) -> str:
     """A stable hash of an owner set (peer_id + addr), so identical membership
     maps to the same epoch on every node (Phase 4 D6)."""
-    payload = [[o["peer_id"], list(o["addr"])] for o in owners]
+    payload = [[o["peer_id"], o["addr"]] for o in owners]  # addr is a list (public) or str (nat)
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -144,7 +178,8 @@ def derive_epoch(owner_records, *, k: int = DEFAULT_REPLICATION, salt: str = "",
     owners = []
     for r in owner_records:
         if owner_eligible(r) and (is_eligible is None or is_eligible(r["peer_id"])):
-            owners.append({"peer_id": r["peer_id"], "addr": list(r["addr"])})
+            owners.append({"peer_id": r["peer_id"], "addr": owner_addr(r),
+                           "addrs": owner_addrs(r)})
     owners.sort(key=lambda o: o["peer_id"])
     sig = _members_sig(owners)
     if prev is not None and prev.get("members_sig") == sig and int(prev.get("k", k)) == int(k):
@@ -270,7 +305,7 @@ class EpochManager:
         if not self._seen:
             return None  # never publish an ownerless epoch; wait for the swarm
         live = {p: rec for p, (_, rec) in self._seen.items()}
-        signature = {(p, tuple(rec["addr"])) for p, rec in live.items()}
+        signature = {(p, owner_addr_sig(rec)) for p, rec in live.items()}
         if signature == self._current:
             return None
         if self._last_bump is not None and now - self._last_bump < self.min_epoch_interval:
