@@ -78,9 +78,13 @@ def test_transport_kind_parses_and_validates():
 def test_transport_down_parses_and_validates():
     """W2a: transport.down selects the weights downlink policy (full default)."""
     assert LaunchConfig.from_dict({}).transport.down == "full"
-    assert LaunchConfig.from_dict({"transport": {"down": "delta"}}).transport.down == "delta"
+    assert LaunchConfig.from_dict(
+        {"mode": "sharded", "transport": {"down": "delta"}}).transport.down == "delta"
     with pytest.raises(ValueError):
         LaunchConfig.from_dict({"transport": {"down": "gzip"}})
+    # delta-down is sharded-only -> fail fast instead of silently no-op'ing.
+    with pytest.raises(ValueError):
+        LaunchConfig.from_dict({"mode": "coordinator", "transport": {"down": "delta"}})
 
 
 def test_libp2p_routes_gate():

@@ -330,6 +330,12 @@ class LaunchConfig:
         if kw["transport"].down not in ("full", "delta"):
             raise ValueError(
                 f"transport.down must be 'full' or 'delta', got {kw['transport'].down!r}")
+        # Delta-down lives on the sharded owner tier (the version ring + owner
+        # fetch). The single-node coordinator has no such path, so down="delta"
+        # there would silently do nothing -- fail fast instead.
+        if kw["transport"].down == "delta" and kw["mode"] != "sharded":
+            raise ValueError("transport.down: delta requires mode: sharded "
+                             "(delta-down is served by the owner tier)")
         # Decentralized scheduling is built on the replicated owner tier, so it
         # requires rendezvous ownership (Phase 4 D9). Catch the mismatch at load
         # rather than half-wiring a run with no owners to mint grants.
