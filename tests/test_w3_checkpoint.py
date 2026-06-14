@@ -20,11 +20,12 @@ def _cfg():
     return DiPaCoConfig(backbone=bb, level_sizes=[2, 2], sequence_length=32)
 
 
-def _train(cfg, checkpoint):
+def _train(cfg, checkpoint, autocast=False):
     path = cfg.build_topology().path_from_index(0)
     bank = build_module_bank(cfg, seed=0)
     pm = build_path_model(cfg, path, bank, deepcopy=True)
-    dl = DiLoCoConfig(inner_steps=3, inner_lr=1e-3, activation_checkpoint=checkpoint)
+    dl = DiLoCoConfig(inner_steps=3, inner_lr=1e-3, inner_autocast=autocast,
+                      activation_checkpoint=checkpoint)
     opt = make_inner_optimizer(pm, dl)
     shard = torch.arange(16 * 32).remainder(200).reshape(16, 32)
     g = torch.Generator().manual_seed(0)
@@ -41,6 +42,15 @@ def test_checkpointing_is_bit_exact():
     on, pm = _train(cfg, checkpoint=True)
     assert all(torch.equal(a, b) for a, b in zip(off, on))
     assert pm.checkpoint is True                        # flag set from diloco during training
+
+
+def test_checkpointing_composes_with_autocast():
+    """The recompute runs under the same bf16 autocast context (use_reentrant=
+    False), so checkpointing + inner_autocast is still bit-exact."""
+    cfg = _cfg()
+    off, _ = _train(cfg, checkpoint=False, autocast=True)
+    on, _ = _train(cfg, checkpoint=True, autocast=True)
+    assert all(torch.equal(a, b) for a, b in zip(off, on))
 
 
 def test_checkpoint_inert_outside_training():
