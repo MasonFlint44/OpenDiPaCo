@@ -196,6 +196,17 @@ def _addr_key(addr):
     return tuple(addr) if isinstance(addr, (list, tuple)) else addr
 
 
+def _route_target(owner):
+    """The dial target a scheduler advertises for one **epoch owner entry**. A
+    multi-relay NAT owner returns its **full circuit-addr candidate list**
+    (``owner["addrs"]``, populated by ``make_epoch_record``) so a worker can fail
+    over across relays (``Libp2pTransport.rpc`` tries them in order); a single-
+    address owner returns that one address verbatim -- so a public/TCP owner
+    stays ``[host, port]`` exactly as before (byte-identical routing)."""
+    addrs = owner.get("addrs") or [owner["addr"]]
+    return addrs if len(addrs) > 1 else owner["addr"]
+
+
 def _safe_version(v):
     """A *wire* version coerced to an (epoch, counter) pair, or None if
     malformed. Decentralized sources may be Byzantine (Phase 4), so a bad
@@ -800,10 +811,13 @@ class ParameterServer(_ReactorServer):
                              if o["peer_id"] != self.peer_id]
                 addrs, seen = [], set()
                 for o in srcs:
-                    a = _addr_key(o["addr"])
-                    if a not in seen:
-                        seen.add(a)
-                        addrs.append(a)
+                    # _owner_targets gives a NAT co-owner's full relay candidate
+                    # list (libp2p, tried in order for failover) or its single TCP
+                    # addr; dedup by peer_id since a candidate list isn't hashable.
+                    if o["peer_id"] in seen:
+                        continue
+                    seen.add(o["peer_id"])
+                    addrs.append(self._owner_targets(o))
                 if addrs:
                     candidates[k] = addrs
                     results[k] = "pending"
@@ -1598,7 +1612,7 @@ class Scheduler(_ReactorServer):
         """Replica addr lists per key, rank order (primary first), per the
         current epoch (rendezvous) or the static shard map."""
         if self._epoch_record is not None:
-            return {k: [o["addr"] for o in owners_for(k, self._epoch_record)]
+            return {k: [_route_target(o) for o in owners_for(k, self._epoch_record)]
                     for k in keys}
         return {k: self._routing[k] for k in keys}
 

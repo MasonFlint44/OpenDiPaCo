@@ -57,6 +57,16 @@ def owner_addrs(record: dict) -> list:
     return list(record.get("circuit_addrs") or [])
 
 
+def owner_addr_sig(record: dict) -> tuple:
+    """A **hashable** signature of an owner's dialable addresses (its direct addr
+    or *all* its relay circuits), for change detection. A raw NAT record has
+    ``addr=None`` and only ``circuit_addrs``, so keying on ``addr`` directly
+    would crash or miss relay-set changes; this keys on :func:`owner_addrs` and
+    normalizes each entry (a ``[host, port]`` list -> tuple) so the result is set-
+    safe and an owner's epoch bumps when any of its addresses change."""
+    return tuple(tuple(a) if isinstance(a, list) else a for a in owner_addrs(record))
+
+
 def owner_eligible(record: dict) -> bool:
     """May this (already-verified) peer record host modules?
 
@@ -295,7 +305,7 @@ class EpochManager:
         if not self._seen:
             return None  # never publish an ownerless epoch; wait for the swarm
         live = {p: rec for p, (_, rec) in self._seen.items()}
-        signature = {(p, tuple(rec["addr"])) for p, rec in live.items()}
+        signature = {(p, owner_addr_sig(rec)) for p, rec in live.items()}
         if signature == self._current:
             return None
         if self._last_bump is not None and now - self._last_bump < self.min_epoch_interval:

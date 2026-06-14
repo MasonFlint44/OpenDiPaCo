@@ -389,6 +389,42 @@ def test_epoch_record_carries_a_nat_owners_circuit_addr():
     assert owners_for(key, epoch)[0]["addr"] == circuit
 
 
+def test_epoch_manager_observes_a_nat_owner_without_crashing():
+    """Codex review: EpochManager.observe keyed its change signature on
+    rec["addr"], which is None for a NAT record (TypeError) -- so a relay-
+    reachable owner admitted by owner_eligible could never join through the
+    manager. The signature now keys on the dialable addresses, and a relay-set
+    change bumps the epoch."""
+    from opendipaco.schedule import EpochManager
+
+    nat = make_peer_record(PeerIdentity.generate(), reachability="nat",
+                           roles=("owner",), circuit_addrs=["/ip4/1.1.1.1/tcp/1/p2p/R/"
+                                                            "p2p-circuit/p2p/SELF"])
+    mgr = EpochManager(owner_grace=100.0, min_epoch_interval=0.0)
+    published = mgr.observe([nat], now=0.0)            # no TypeError
+    assert published is not None and published[0]["peer_id"] == nat["peer_id"]
+    assert mgr.observe([nat], now=1.0) is None         # unchanged -> no new epoch
+    # A changed relay set is a real change -> the manager bumps again.
+    nat2 = dict(nat, circuit_addrs=nat["circuit_addrs"]
+                + ["/ip4/2.2.2.2/tcp/2/p2p/R2/p2p-circuit/p2p/SELF"])
+    assert mgr.observe([nat2], now=2.0) is not None
+
+
+def test_routing_target_preserves_tcp_and_lists_relays_for_nat():
+    """Codex review: scheduler routing dropped a NAT owner's relay candidates
+    (sent only addr[0]), so a worker got no failover. A multi-relay NAT owner now
+    routes as its full candidate list; a public/TCP owner stays [host, port]."""
+    from opendipaco.schedule.sharded import _route_target
+
+    pub = {"peer_id": "p", "addr": ["10.0.0.1", 29501], "addrs": [["10.0.0.1", 29501]]}
+    assert _route_target(pub) == ["10.0.0.1", 29501]          # TCP unchanged
+    c = ["/ip4/1/tcp/1/p2p/R1/p2p-circuit/p2p/S", "/ip4/2/tcp/2/p2p/R2/p2p-circuit/p2p/S"]
+    nat = {"peer_id": "n", "addr": c[0], "addrs": c}
+    assert _route_target(nat) == c                            # all relays, for failover
+    one = {"peer_id": "n1", "addr": c[0], "addrs": [c[0]]}
+    assert _route_target(one) == c[0]                         # single addr verbatim
+
+
 def test_owner_addrs_lists_all_relays_for_failover():
     """A NAT'd owner's k relay circuit addrs are all carried through the epoch,
     so a dialer can fail over across them (W1c)."""
