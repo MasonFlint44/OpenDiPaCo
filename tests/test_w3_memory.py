@@ -4,6 +4,7 @@ The parameter/optimizer terms are exact (counted on the meta device); the
 activation term is a coarse estimate that the levers should visibly reduce.
 """
 
+import torch
 from opendipaco import BackboneConfig, DiLoCoConfig, DiPaCoConfig
 from opendipaco.train.memory import _count_params, fits, measure_peak, vram_breakdown
 
@@ -67,3 +68,22 @@ def test_fits_and_measure_peak_cpu():
     # measure_peak is CUDA-only; on CPU it returns None (use the estimate).
     assert measure_peak(cfg, DiLoCoConfig(inner_steps=2), device="cpu",
                         batch_size=8, seq_len=128) is None
+
+
+def test_measure_peak_round_construction_runs_on_cpu():
+    """measure_peak's real round is CUDA-gated, so CI never exercises its shard
+    shape. Run the identical construction on CPU to prove the seq_len-row shard
+    trains a path without error (a wrong shape would only fail on a GPU)."""
+    from opendipaco.backend import LocalBackend
+    from opendipaco.schedule import AsyncScheduler
+    from opendipaco.train.loop import DiPaCoEngine
+
+    cfg = _cfg()
+    seq_len = cfg.sequence_length
+    engine = DiPaCoEngine(cfg, DiLoCoConfig(inner_steps=2), LocalBackend(cfg.build_topology()),
+                          device="cpu", seed=0, materialize="serial")
+    worker = AsyncScheduler(engine, num_workers=1)
+    path = cfg.build_topology().path_from_index(0)
+    shard = torch.randint(0, cfg.backbone.vocab_size, (8, seq_len))   # seq_len rows
+    contrib = worker._train_path(path, shard, 4, 0)
+    assert contrib is not None and not contrib.empty

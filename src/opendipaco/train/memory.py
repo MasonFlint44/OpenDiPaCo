@@ -99,7 +99,7 @@ def measure_peak(config, diloco, *, device: str, batch_size: int, seq_len: int,
     if not (str(device).startswith("cuda") and torch.cuda.is_available()):
         return None
     from ..backend import LocalBackend
-    from ..scheduler import AsyncScheduler
+    from ..schedule import AsyncScheduler
     from .loop import DiPaCoEngine
 
     torch.cuda.empty_cache()
@@ -109,7 +109,10 @@ def measure_peak(config, diloco, *, device: str, batch_size: int, seq_len: int,
     worker = AsyncScheduler(engine, num_workers=1)
     path = config.build_topology().path_from_index(0)
     g = torch.Generator().manual_seed(seed)
+    # Rows are `seq_len` long: the model is called pm(batch, labels=batch) and
+    # shifts internally, so a seq_len row matches real training (and never
+    # exceeds max_position_embeddings, unlike seq_len + 1).
     shard = torch.randint(0, config.backbone.vocab_size,
-                          (max(2 * batch_size, 4), seq_len + 1), generator=g)
+                          (max(2 * batch_size, 4), seq_len), generator=g)
     worker._train_path(path, shard, batch_size, 0)
     return int(torch.cuda.max_memory_allocated())
