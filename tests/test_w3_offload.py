@@ -81,6 +81,45 @@ def test_chunked_skips_full_logits():
     assert logits is not None and logits.shape == (4, 32, 200)
 
 
+def _grads(cfg, chunks, autocast=False):
+    bank = build_module_bank(cfg, seed=0)
+    pm = build_path_model(cfg, cfg.build_topology().path_from_index(0), bank, deepcopy=True)
+    pm.loss_chunks = chunks
+    pm.train()
+    x = torch.arange(4 * 32).remainder(200).reshape(4, 32)
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+        _, loss = pm(x, labels=x)
+    loss.float().backward()
+    return [p.grad.detach().clone() for p in pm.parameters() if p.grad is not None]
+
+
+def test_chunked_ce_gradients_match_dense():
+    """Training uses gradients, not just the loss value: chunked CE must produce
+    the same grads as the dense path to fp tolerance (sum order aside)."""
+    cfg = _cfg()
+    dense, chunked = _grads(cfg, 1), _grads(cfg, 4)
+    assert len(dense) == len(chunked)
+    assert all(torch.allclose(a, b, rtol=1e-4, atol=1e-6) for a, b in zip(dense, chunked))
+
+
+def test_chunked_ce_composes_with_autocast_and_checkpoint():
+    """Chunked CE runs under bf16 autocast and with the body checkpointed (the
+    real worker config), and the loss stays close to the dense path."""
+    cfg = _cfg()
+    bank = build_module_bank(cfg, seed=0)
+    pm = build_path_model(cfg, cfg.build_topology().path_from_index(0), bank, deepcopy=True)
+    pm.train()
+    pm.checkpoint, pm.loss_chunks = True, 4
+    x = torch.arange(4 * 32).remainder(200).reshape(4, 32)
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=True):
+        _, loss = pm(x, labels=x)
+    loss.float().backward()                              # grads flow through chunks + recompute
+    pm.checkpoint, pm.loss_chunks = False, 1
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=True):
+        _, dense = pm(x, labels=x)
+    assert torch.allclose(loss.float(), dense.float(), rtol=1e-2, atol=1e-3)
+
+
 def test_chunked_ce_trains():
     """A short training run with chunked CE on converges like the dense path
     (loss decreases), end to end through run_inner_steps."""

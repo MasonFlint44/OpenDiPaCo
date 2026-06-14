@@ -163,11 +163,13 @@ class PathModel(nn.Module):
         normed = norm(hidden) if norm is not None else hidden
         h = normed[:, :-1, :].reshape(-1, normed.size(-1))   # shifted, flattened tokens
         y = labels[:, 1:].reshape(-1)
-        total = h.new_zeros(())
+        # Accumulate the loss sum in fp32 even under bf16 autocast (the dense path
+        # reduces in fp32 too) so chunking doesn't lose precision per chunk.
+        total = torch.zeros((), dtype=torch.float32, device=h.device)
         count = 0
         for hc, yc in zip(h.chunk(self.loss_chunks), y.chunk(self.loss_chunks)):
             total = total + F.cross_entropy(self.head.lm_head(hc), yc,
-                                            ignore_index=-100, reduction="sum")
+                                            ignore_index=-100, reduction="sum").float()
             count += int((yc != -100).sum())
         return total / max(count, 1)
 
