@@ -52,7 +52,17 @@ and **k≥2 relays** per NAT'd peer.
   can't crash a dialer); `_peer_rpc`/`_owner_targets` feed a co-owner's relay
   candidates into the digest-audit path. A NAT'd owner stays reachable while ≥1
   of its k relays is alive.
-- *Remaining (runtime, lands with W1d launch wiring):* a NAT'd owner
+- *Checkpoint-review fix — non-Ed25519 keys can't slip past the gates.* A peer
+  using a non-Ed25519 libp2p key has a plain-hash peer id (no embedded pubkey),
+  so `_remote_peer_id` returns None and it would be treated as "trusted
+  anonymous" (ungated by reputation/rate-limit/Sybil). `serve_over_libp2p` now
+  defaults `require_identity=True` and **refuses any peer it can't authenticate**
+  — every legitimate peer is Ed25519, so this closes the bypass for free.
+  Tested: an RSA-keyed client is denied, an Ed25519 client is served.
+- *Remaining (runtime, lands with W1d launch wiring):* full enrollment
+  (`admitted_peers` allowlist) over libp2p — `require_identity` ensures an
+  *authenticated* peer, not yet an *enrolled* one; an unbounded per-peer lock
+  dict in a long-churning swarm; and a NAT'd owner
   **re-reserving** on a fresh relay when one of its k dies (to *maintain*
   redundancy over time — immediate availability already holds via the other
   relays), and `_replicate_once`/`_gossip_once` using candidate lists (they

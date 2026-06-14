@@ -71,8 +71,15 @@ def _derive_keypair(identity: PeerIdentity) -> KeyPair:
 
 
 def serve_over_libp2p(server, *, identity: PeerIdentity | None = None,
-                      listen_addrs=("/ip4/127.0.0.1/tcp/0",)) -> "Libp2pTransport":
+                      listen_addrs=("/ip4/127.0.0.1/tcp/0",),
+                      require_identity: bool = True) -> "Libp2pTransport":
     """Serve a server's ``_handle`` over libp2p (W1a owner-serving bridge).
+
+    ``require_identity`` (default True) **refuses any peer whose app identity we
+    can't establish** — a non-Ed25519 key whose libp2p id doesn't embed the
+    pubkey would map to ``peer_id=None`` and slip past the reputation / rate-limit
+    / Sybil gates as "trusted anonymous". Every legitimate peer is Ed25519, so
+    this closes that bypass for free; set it False only for a trusted/test run.
 
     Additive and non-invasive: the existing TCP reactor is untouched (the byte-
     for-byte anchor): this starts a *parallel* libp2p host that bridges inbound
@@ -89,6 +96,8 @@ def serve_over_libp2p(server, *, identity: PeerIdentity | None = None,
         raise ValueError("serve_over_libp2p needs an identity (server.identity or identity=)")
 
     def handler(msg, peer_id):
+        if require_identity and peer_id is None:
+            return None  # unauthenticatable peer (non-Ed25519) -> deny service (W1c)
         # peer_id is the Noise-authenticated remote mapped to our app id (W1c), so
         # reputation / rate-limit / audit / owner-eligibility + enrollment gates
         # apply on the libp2p path exactly as on TCP.

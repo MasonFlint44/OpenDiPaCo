@@ -86,6 +86,37 @@ def test_authenticated_peer_id_is_threaded_to_the_handler():
         server.close()
 
 
+def test_unauthenticatable_peer_is_refused_over_libp2p():
+    """A non-Ed25519 peer (whose libp2p id can't yield our app peer id) is denied
+    service, so it can't slip past the reputation/rate-limit/Sybil gates as
+    'trusted anonymous' (W1c). An Ed25519 peer is served."""
+    from libp2p.crypto.rsa import create_new_key_pair as rsa_kp
+
+    from opendipaco import DiLoCoConfig
+    from opendipaco.schedule import ParameterServer
+    from opendipaco.schedule.p2p import serve_over_libp2p
+
+    cfg = _cfg()
+    keys = sorted(cfg.build_topology().module_keys())
+    ps = ParameterServer(cfg, keys, DiLoCoConfig(inner_steps=4), host="127.0.0.1", port=0,
+                         identity=PeerIdentity.generate())
+    owner = serve_over_libp2p(ps)                  # require_identity=True (default)
+    rsa_client = Libp2pTransport(PeerIdentity.generate())
+    rsa_client._kp = rsa_kp(2048)                  # non-Ed25519 host key
+    rsa_client.start()
+    ed_client = Libp2pTransport(PeerIdentity.generate()).start()
+    try:
+        shared = next(k for k in keys if not _is_private(k))
+        req = {"type": "fetch", "keys": [shared], "have": {}}
+        assert rsa_client.rpc(dial_info(owner.addrs[0]), req, timeout=20) is None   # refused
+        assert ed_client.rpc(dial_info(owner.addrs[0]), req, timeout=20)["versions"]  # served
+    finally:
+        rsa_client.close()
+        ed_client.close()
+        owner.close()
+        ps.shutdown()
+
+
 def test_addrs_are_dialable_p2p_multiaddrs():
     server = Libp2pTransport(PeerIdentity.generate(), handler=lambda m, pid: {"ok": True}).start()
     try:
