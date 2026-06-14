@@ -2206,6 +2206,12 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions, keyfr
         check_only = bool(task.get("check_only"))
         audit = bool(task.get("audit"))
         down_delta = task.get("down") == "delta"   # keep keyframes, send keyframe `have` (W2a)
+        # Evict keyframes for keys outside this task's path (D3): bounds the
+        # baseline cache to the current path's shared keys instead of every key
+        # ever fetched. A dropped keyframe just costs one full re-fetch -- never
+        # worse than full mode.
+        for stale in [k for k in keyframes if k not in routing]:
+            del keyframes[stale]
         # A check pins the audited primary's exact base; an audited primary (and
         # any check) runs *cold* so the computation is reproducible by replicas
         # -- a warm inner-optimizer state can't cross the wire (a core invariant).
@@ -2228,12 +2234,13 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions, keyfr
             while pending:
                 addr = next(iter(pending.values()))[0]
                 batch = [k for k, cands in pending.items() if cands[0] == addr]
-                # In delta mode `have` is the *keyframe* version (the bytes we
-                # hold exactly), not the trained-against version, so the owner
-                # deltas against what we can reconstruct from (W2a).
+                # In delta mode `have` is ONLY the keyframe version (the bytes we
+                # hold exactly) or None -- never the trained-against version,
+                # which is a *lossy* reconstruction we can't delta-decode against.
+                # No keyframe -> None -> the owner ships a full (a new keyframe).
                 def _have(k):
-                    if down_delta and k in keyframes:
-                        return keyframes[k][0]
+                    if down_delta:
+                        return keyframes[k][0] if k in keyframes else None
                     return versions.get(k)
                 req = {"type": "fetch", "keys": batch, "cold": cold,
                        "have": {} if pin else
