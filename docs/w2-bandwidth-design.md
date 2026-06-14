@@ -1,6 +1,16 @@
 # W2 design — bandwidth: delta encoding + sparsification + sub-int8
 
-Status: **W2a + W2b + W2c landed; inner_steps docs pending.** W2 (from [viability-roadmap.md](viability-roadmap.md))
+Status: **W2 complete (W2a–W2c + the inner_steps lever).** W2 (from [viability-roadmap.md](viability-roadmap.md))
+
+**inner_steps lever (D8) — landed as docs + a calculator.** The free lever:
+`examples/bandwidth_budget.py` is a first-order calculator showing total sync
+traffic scales as **1/inner_steps** (no precision cost) while the W2 levers cut
+the per-sync bytes, and the two compound — e.g. for a 150M path it puts the
+none→int4+sparse per-round size at 1.12→0.10 GB and the 1→500 inner_steps total
+at ~85 PB→170 GB for a 10B-token budget. Recommendation: raise `inner_steps`
+*before* paying any compression-precision cost.
+
+
 
 **W2c status (sub-int8: int4 + per-group scale):**
 - *int4 is a value encoding that stacks on every W2 path.* `compress: int4`
