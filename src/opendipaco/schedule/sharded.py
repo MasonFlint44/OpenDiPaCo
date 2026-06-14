@@ -30,7 +30,6 @@ import collections
 import hashlib
 import hmac
 import json
-import math
 import os
 import random
 import ssl
@@ -184,6 +183,17 @@ def _version_pair(v) -> tuple:
     """Coerce a stored version to the (epoch, counter) pair form (Phase 2b);
     pre-pair checkpoints stored bare ints, which were all epoch-0."""
     return tuple(v) if isinstance(v, (tuple, list)) else (0, int(v))
+
+
+def _addr_key(addr):
+    """A hashable, transport-opaque handle for a peer address (W1b orchestration).
+
+    TCP addresses cross the wire as JSON and arrive as ``[host, port]`` lists ->
+    normalize to a ``(host, port)`` tuple (hashable, what connection caches and
+    routing have always keyed on). A libp2p multiaddr is a string and is already
+    hashable, so it passes through unchanged. Replaces the ``tuple(addr)``
+    coercions that turned a multiaddr into a tuple of characters."""
+    return tuple(addr) if isinstance(addr, (list, tuple)) else addr
 
 
 def _safe_version(v):
@@ -786,7 +796,7 @@ class ParameterServer(_ReactorServer):
                              if o["peer_id"] != self.peer_id]
                 addrs, seen = [], set()
                 for o in srcs:
-                    a = tuple(o["addr"])
+                    a = _addr_key(o["addr"])
                     if a not in seen:
                         seen.add(a)
                         addrs.append(a)
@@ -807,7 +817,7 @@ class ParameterServer(_ReactorServer):
         # replicas -- an unconfirmed higher version is left for a later pass.
         confirmed: dict = {}
         if self.schedule_mode == "decentralized" and epoch is not None and candidates:
-            addrs = sorted({tuple(o["addr"]) for k in candidates
+            addrs = sorted({_addr_key(o["addr"]) for k in candidates
                             for o in owners_for(k, epoch)})
             confirmed = read_quorum_versions(
                 addrs, list(candidates), self.read_quorum,
@@ -1080,7 +1090,7 @@ class ParameterServer(_ReactorServer):
             for o in owners_for(k, epoch):
                 if o["peer_id"] == self.peer_id:
                     continue
-                by_peer.setdefault(o["peer_id"], (tuple(o["addr"]), []))[1].append(k)
+                by_peer.setdefault(o["peer_id"], (_addr_key(o["addr"]), []))[1].append(k)
         for pid, (addr, ks) in by_peer.items():
             try:
                 reply = self._peer_rpc(addr, {"type": "digest", "keys": ks})
@@ -1171,7 +1181,7 @@ class ParameterServer(_ReactorServer):
             self_addr = None if self._self_record is None else tuple(self._self_record["addr"])
             if self._epoch is not None:
                 for o in self._epoch["owners"]:
-                    a = tuple(o["addr"])
+                    a = _addr_key(o["addr"])
                     if a != self_addr:
                         addrs.add(a)
         for addr in addrs:
@@ -1435,13 +1445,13 @@ class Scheduler(_ReactorServer):
         self.total_rounds = None
 
         # key -> (host, port) of the owning parameter server.
-        self.ps_addrs = [tuple(a) for a in ps_addrs]
+        self.ps_addrs = [_addr_key(a) for a in ps_addrs]
         # Routing values are *replica lists* in rank order (primary first); the
         # static map has one entry per key. With no ps_addrs the scheduler is in
         # rendezvous mode: routing derives from the published epoch instead.
         if self.ps_addrs:
             key_shard = assign_shards(self.topology.module_keys(), len(self.ps_addrs))
-            self._routing = {k: [list(self.ps_addrs[s])] for k, s in key_shard.items()}
+            self._routing = {k: [self.ps_addrs[s]] for k, s in key_shard.items()}
         else:
             self._routing = {}
 
@@ -1568,7 +1578,7 @@ class Scheduler(_ReactorServer):
         """Replica addr lists per key, rank order (primary first), per the
         current epoch (rendezvous) or the static shard map."""
         if self._epoch_record is not None:
-            return {k: [list(o["addr"]) for o in owners_for(k, self._epoch_record)]
+            return {k: [o["addr"] for o in owners_for(k, self._epoch_record)]
                     for k in keys}
         return {k: self._routing[k] for k in keys}
 
@@ -1899,7 +1909,7 @@ class Scheduler(_ReactorServer):
         os.makedirs(dirpath, exist_ok=True)
         with self._lock:
             record = self._epoch_record
-            addrs = (sorted({tuple(o["addr"]) for o in record["owners"]})
+            addrs = (sorted({_addr_key(o["addr"]) for o in record["owners"]})
                      if record is not None else self.ps_addrs)
         held: dict = {}
         for addr in addrs:
@@ -1967,7 +1977,7 @@ class Scheduler(_ReactorServer):
         if record is None:
             return False  # no owner set yet (watch_tracker hasn't published)
         held: dict = {}
-        for addr in sorted({tuple(o["addr"]) for o in record["owners"]}):
+        for addr in sorted({_addr_key(o["addr"]) for o in record["owners"]}):
             try:
                 s = _ps_connect(addr, self.auth_key, DEFAULT_MAX_MSG_BYTES, 5.0,
                                 tls=self.ps_tls, server_hostname=addr[0])
@@ -2103,7 +2113,7 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
         worker.seed = task["seed"]
         engine.total_rounds = task["total_rounds"]
         # Routing values are replica addr lists in rank order (primary first).
-        routing = {k: [tuple(a) for a in addrs] for k, addrs in task["routing"].items()}
+        routing = {k: [_addr_key(a) for a in addrs] for k, addrs in task["routing"].items()}
         check_only = bool(task.get("check_only"))
         audit = bool(task.get("audit"))
         # A check pins the audited primary's exact base; an audited primary (and
@@ -2263,7 +2273,7 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
                 if fresh is None:
                     raise OSError("scheduler disconnected during push retry")
                 fresh_routing = fresh.get("routing") or {}
-                retry = {k: [tuple(a) for a in fresh_routing[k]]
+                retry = {k: [_addr_key(a) for a in fresh_routing[k]]
                          for k in failed if k in fresh_routing}
                 if retry:
                     _push_group(retry, grant, shared_payload, private_payload,
@@ -2288,7 +2298,7 @@ def _push_group(routing, grant, shared_payload, private_payload, ps_sock, drop_c
     """
     by_primary: dict = {}  # writes go to rank 0 only (design D3)
     for k, addrs in routing.items():
-        by_primary.setdefault(tuple(addrs[0]), []).append(k)
+        by_primary.setdefault(_addr_key(addrs[0]), []).append(k)
     failed: set = set()
     for addr, keys in by_primary.items():
         updates = {k: {"grad": shared_payload[k]}
