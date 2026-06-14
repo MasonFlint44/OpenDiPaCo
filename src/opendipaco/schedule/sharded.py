@@ -504,6 +504,22 @@ class ParameterServer(_ReactorServer):
             return _state_to_cpu(hist[version])
         return None
 
+    def _grads_well_shaped_locked(self, updates) -> bool:
+        """Every shared grad must match its module's parameters in count and
+        shape, so a malformed push (wrong-shaped/count decoded tensors) is
+        refused rather than silently broadcast-corrupting or crashing
+        ``apply_outer_grads``. Keys we don't own are skipped in the apply loop, so
+        they need no shape check here."""
+        for k, grad in updates.items():
+            mod = self.bank.get(k)
+            if mod is None:
+                continue
+            params = list(mod.parameters())
+            if len(grad) != len(params) or any(
+                    g.shape != p.shape for g, p in zip(grad, params)):
+                return False
+        return True
+
     def _down_payload_locked(self, key, have_version):
         """The downlink weights for a stale shared key (W2a). In ``down="delta"``
         mode, if the worker's keyframe (``have_version``) is still in the version
@@ -1300,8 +1316,12 @@ class ParameterServer(_ReactorServer):
             self._seen_grants[grant["token"]] = True  # consumed even if invalid below
             while len(self._seen_grants) > self._SEEN_GRANTS_MAX:
                 self._seen_grants.popitem(last=False)
-            # Validate before touching the shard: one applied NaN poisons it.
-            if not (all_finite(updates) and all_finite(private)):
+            # Validate before touching the shard: one applied NaN poisons it,
+            # and a wrong-shaped/count grad (a buggy/Byzantine worker) would
+            # broadcast-corrupt or crash apply_outer_grads (which blindly assigns
+            # p.grad = d). Reject the whole push on either.
+            if not (all_finite(updates) and all_finite(private)
+                    and self._grads_well_shaped_locked(updates)):
                 self.metrics.record_invalid_reject()
                 return {"type": "ack", "applied": False}
             for k, grad in updates.items():

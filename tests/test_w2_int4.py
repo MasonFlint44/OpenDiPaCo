@@ -99,6 +99,45 @@ def test_malformed_int4_payload_refused():
                                              {"w": torch.zeros(2, 8)}))
 
 
+def test_owner_rejects_wrong_shaped_grad_push():
+    """A push whose decoded grad doesn't match the target module (wrong shape or
+    count) is rejected -- it would otherwise broadcast-corrupt or crash
+    apply_outer_grads (p.grad = d, no shape check). Weights stay untouched and the
+    owner keeps serving. Mode-agnostic, but the W2 decoders make it pertinent."""
+    from opendipaco import BackboneConfig, DiLoCoConfig, DiPaCoConfig
+    from opendipaco.schedule import ParameterServer, make_grant
+    from opendipaco.topology import is_private_key
+
+    bb = BackboneConfig(vocab_size=48, hidden_size=32, num_attention_heads=4,
+                        intermediate_size=64, layers_per_level=[1, 1],
+                        max_position_embeddings=64)
+    cfg = DiPaCoConfig(backbone=bb, level_sizes=[2, 2], sequence_length=16)
+    keys = sorted(cfg.build_topology().module_keys())
+    shared = next(k for k in keys if not is_private_key(k))
+    path = cfg.build_topology().path_from_index(0)
+    ps = ParameterServer(cfg, keys, DiLoCoConfig(inner_steps=2), host="127.0.0.1",
+                         port=0, grant_key="s")
+    try:
+        before = {n: v.clone() for n, v in ps.bank[shared].state_dict().items()}
+        nparams = len(list(ps.bank[shared].parameters()))
+        wrong_shape = [torch.ones(99) for _ in range(nparams)]      # right count, wrong shape
+        r = ps._push({"grant": make_grant(path, [shared], 1.0, "t1", grant_key="s"),
+                      "updates": {shared: {"grad": wrong_shape}}})
+        assert r["applied"] is False
+        r = ps._push({"grant": make_grant(path, [shared], 1.0, "t2", grant_key="s"),
+                      "updates": {shared: {"grad": []}}})            # wrong count
+        assert r["applied"] is False
+        after = ps.bank[shared].state_dict()
+        assert all(torch.equal(before[n], after[n]) for n in before)  # untouched
+        # A correctly-shaped push still applies.
+        good = [torch.ones_like(p) * 0.01 for p in ps.bank[shared].parameters()]
+        r = ps._push({"grant": make_grant(path, [shared], 1.0, "t3", grant_key="s"),
+                      "updates": {shared: {"grad": good}}})
+        assert r["applied"] is True
+    finally:
+        ps.shutdown()
+
+
 def test_run_local_sharded_trains_with_int4():
     """A full sharded cluster with compress="int4" trains to budget -- int4
     pseudo-gradients/deltas still carry the signal."""
