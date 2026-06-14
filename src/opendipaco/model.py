@@ -13,6 +13,7 @@ import copy
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 from transformers.masking_utils import create_causal_mask
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 
@@ -96,6 +97,10 @@ class PathModel(nn.Module):
             raise ValueError("a path must contain an embedding and a head segment")
 
         self.rotary = LlamaRotaryEmbedding(to_llama_config(config.backbone))
+        # Activation checkpointing (W3b): when True, body blocks recompute their
+        # activations in backward instead of storing them. Set by the trainer
+        # (off for inference/encode). Bit-exact -- only changes what is stored.
+        self.checkpoint = False
 
     def modules_by_key(self) -> dict[str, nn.Module]:
         """Map topology key -> the live submodule instance in this path."""
@@ -116,13 +121,24 @@ class PathModel(nn.Module):
             past_key_values=None,
             position_ids=position_ids,
         )
+        # Checkpoint only when it can help: training with grad on (under no_grad /
+        # eval it would be a wasteful no-op). use_reentrant=False preserves the
+        # autocast context on recompute, so it composes with inner_autocast.
+        ckpt = self.checkpoint and self.training and torch.is_grad_enabled()
         for block in self.body:
-            hidden = block(
-                hidden,
-                position_embeddings=cos_sin,
-                attention_mask=causal,
-                position_ids=position_ids,
-            )
+            if ckpt:
+                hidden = checkpoint(
+                    block, hidden, position_embeddings=cos_sin,
+                    attention_mask=causal, position_ids=position_ids,
+                    use_reentrant=False,
+                )
+            else:
+                hidden = block(
+                    hidden,
+                    position_embeddings=cos_sin,
+                    attention_mask=causal,
+                    position_ids=position_ids,
+                )
         return hidden
 
     @torch.no_grad()

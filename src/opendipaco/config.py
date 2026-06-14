@@ -158,6 +158,11 @@ class DiLoCoConfig:
     # Parameters, gradients, and the pseudo-gradient stay fp32 (master weights);
     # bf16 needs no loss scaling. ~2x throughput/memory on consumer GPUs.
     inner_autocast: bool = False
+    # Activation checkpointing (W3b): recompute each body block's activations in
+    # backward instead of storing them -- a large activation-memory cut (∝ depth)
+    # for ~one extra forward. Bit-exact (it only changes what's stored), so off
+    # here keeps the in-process anchor fast; real worker runs default it on.
+    activation_checkpoint: bool = False
 
     # Inner LR schedule over the *whole* run (paper: cosine, peak 4e-4). Needs the
     # total number of rounds, which ``DiPaCoEngine.fit`` supplies automatically;

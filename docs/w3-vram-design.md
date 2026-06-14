@@ -1,6 +1,31 @@
 # W3 design — fit one path in consumer VRAM
 
-Status: **W3a landed; W3b/W3c/W3d pending.** W3 (from [viability-roadmap.md](viability-roadmap.md))
+Status: **W3a + W3b(checkpointing) landed; D4 reclassified; W3c/W3d pending.**
+W3 (from [viability-roadmap.md](viability-roadmap.md))
+
+**W3b status (activation checkpointing) + a correction to D4.**
+- *Activation checkpointing landed (exact).* `diloco.activation_checkpoint`
+  wraps each body block in `torch.utils.checkpoint` (`use_reentrant=False`, so it
+  composes with `inner_autocast` and preserves RNG); it's inert outside training
+  (no grad / eval). **Bit-exact** — training is identical with it on or off
+  (tested) — so the launch config defaults it **on** for real runs while the core
+  `DiLoCoConfig` default stays off (fast, byte-identical in-process anchor + unit
+  tests).
+- *Correction — D4 (private-copy de-dup) is NOT exact, reclassified.* The design
+  assumed aliasing the worker's private modules from its bank (instead of
+  deep-copying) was a free, bit-exact win. Implementation revealed it is **not**:
+  the remote worker's `_train_path` **never writes trained private weights back
+  to its bank** (it pushes them to the owner and re-fetches private only on a
+  *cold* task). So deep-copy (re-train private from the cold-fetched base each
+  warm task) and aliasing (accumulate private in-place across warm tasks) yield
+  **different private trajectories** — a behavior/dynamics change, not an exact
+  one. It is plausibly a private-*warming improvement*, but it must be validated
+  like any dynamics change, so it moves to the **§0f-gated, off-by-default**
+  bucket (W3d-adjacent), out of the exact-default-on set. (The *in-process*
+  engine does copy private back via `_copy_into`, so there aliasing would be
+  exact — but the worker is the memory target, and there it is not.)
+
+
 
 **W3a status (VRAM profiler):** `src/opendipaco/train/memory.py` —
 `vram_breakdown(config, batch_size, seq_len, ...)` counts a path's real
@@ -63,11 +88,13 @@ This is the key contrast with W2 (whose levers were all lossy). W3's levers spli
     storing them; the math is unchanged.
   - **offload** — move tensors (optimizer state, embedding rows) between GPU and
     CPU; *where/when* a tensor lives, never its value.
-  - **not duplicating the global copy of private modules** — private modules are
-    never communicated, so a worker needs only one copy (D4).
   These change peak memory, not numerics, so the deterministic anchor stays
   bit-exact and they can ship **on** wherever they help.
-- **Lossy (changes numerics) — §0f-gated, off by default, on-box validated:**
+- **Behavior/dynamics-changing — §0f-gated, off by default, on-box validated:**
+  - **private-copy de-dup / warming** (D4) — aliasing the worker's private
+    modules changes the warm-round private trajectory (the worker doesn't write
+    trained private back to its bank), so it is a dynamics change, not the exact
+    win first assumed; see the status note.
   - **quantized training** — 8-bit AdamW state, optional int8/int4 params. Rides
     the WAN §0f run for its convergence verdict, exactly like W2's compression;
     `examples/validate_dynamics.py` de-risks it on-box.
@@ -115,13 +142,16 @@ A flag (default-on for the worker; off for the tiny in-process anchor where it
 only adds compute) controls it; checkpointing must coexist with `inner_autocast`
 (recompute under the same autocast context) so they compose.
 
-### D4. Keep one copy of private modules — don't duplicate the global (W3b, exact)
-The pseudo-gradient `global − local` is only meaningful for **shared** modules;
-private modules (the dominant embed/head) are never communicated, so the worker
-needs no separate global copy of them. Building the worker's working path so
-private modules are **not** deep-copied from a global (only shared are) saves
-~`R` — the largest single exact win for a real vocab. The owner/anchor paths are
-unaffected (they already treat private modules as locally authoritative).
+### D4. Private-copy de-dup — reclassified as a dynamics change (NOT exact)
+Aliasing the worker's private modules (deep-copying only shared) would save ~`R`
+(the dominant embed/head). It was first assumed bit-exact, but the worker's
+`_train_path` never writes trained private back to its bank, so aliasing
+(accumulate private in-place across warm tasks) differs from deep-copy (re-train
+private from the cold-fetched base each warm task). That is a **behavior/dynamics
+change** — likely a private-*warming improvement*, but it must ride §0f like any
+dynamics change, so it is **off by default** and validated on-box, not shipped as
+a free exact win. (In the *in-process* engine, the round copies private back via
+`_copy_into`, so there aliasing is exact — but the worker is the memory target.)
 
 ### D5. Offload: optimizer state and embedding rows (W3c, exact)
 Two exact offloads, applied by measured priority:
@@ -183,9 +213,9 @@ measured-priority), the exact levers before the lossy one.
 | Slice | Contents | Key tests |
 |---|---|---|
 | **W3a** | VRAM profiler (D1): analytical calculator (params/Adam/activations/embedding breakdown + fit-vs-budget) + real `max_memory_allocated` measurement of a worker round (CPU fallback = the estimate). `examples/vram_budget.py`. | The calculator's breakdown sums to the measured peak within tolerance on a small GPU/CPU run; fit-vs-budget reports correctly; CPU fallback returns the estimate. |
-| **W3b** | Activation checkpointing over the body (D3) + private-copy de-dup (D4), both exact + default-on for the worker. | Peak activations drop with checkpointing on; training is **bit-identical** with/without (exact); the worker holds one copy of private modules; anchor unchanged. |
+| **W3b** | Activation checkpointing over the body (D3), exact + default-on for real runs. *(Private-copy de-dup, D4, moved to W3d — it turned out to be a dynamics change, not exact.)* | Training **bit-identical** with/without checkpointing; the flag flows from `diloco`; inert outside training; anchor unchanged. |
 | **W3c** | Offload (D5) + embedding tie/chunk (D6), exact, by measured priority. | Optimizer/embedding offload cuts the peak; results bit-identical; tied-head halves `R`; chunked logits match unchunked exactly. |
-| **W3d** | Quantized training (D7): custom blockwise 8-bit AdamW, off by default, §0f-gated; on-box `validate_dynamics` arm. | 8-bit Adam round-trips within the blockwise bound; a `quant-optim` dynamics arm converges; peak `2P → ~0.5P`. |
+| **W3d** | Dynamics-gated levers (off by default, §0f, on-box-validated): custom blockwise 8-bit AdamW (D7) **and** the private-copy de-dup / warming (D4). | 8-bit Adam round-trips within the blockwise bound; private-warming + `quant-optim` arms converge in `validate_dynamics`; peak `2P → ~0.5P`. |
 
 Rough sizing: W3a M, W3b M, W3c M–L, W3d M. M–L overall — worker-local, no new
 transport or protocol, mostly memory engineering over the existing train loop.

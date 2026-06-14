@@ -50,6 +50,10 @@ class DiLoCoCfg:
     rescale_by_sqrt_sharing: bool = True
     # bf16 mixed-precision inner loop (params/grads stay fp32; no loss scaling).
     inner_autocast: bool = False
+    # Activation checkpointing (W3b): recompute body-block activations in backward
+    # for a large activation-memory cut at ~one extra forward. Bit-exact, so it's
+    # default-on for real runs (turn off only to trade memory back for speed).
+    activation_checkpoint: bool = True
 
 
 @dataclass
@@ -429,5 +433,5 @@ def diloco_config(d: DiLoCoCfg) -> DiLoCoConfig:
         inner_warmup_steps=d.inner_warmup_steps, outer_lr=d.outer_lr,
         outer_momentum=d.outer_momentum, outer_nesterov=d.outer_nesterov,
         rescale_by_sqrt_sharing=d.rescale_by_sqrt_sharing,
-        inner_autocast=d.inner_autocast,
+        inner_autocast=d.inner_autocast, activation_checkpoint=d.activation_checkpoint,
     )
