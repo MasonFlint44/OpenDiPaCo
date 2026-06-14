@@ -78,18 +78,31 @@ until the dynamics are understood.
 
 ## Tier B0 — blockers to run on the target at all
 
-### W1 · NAT traversal / a relay tier · B0 · [eng-hard]
+### W1 · NAT traversal / a relay tier · B0 · [eng-hard] · **landed (W1a–W1d)**
 
-**The single biggest *unbuilt practical* blocker.** Workers are dial-out-only
-(NAT-friendly — keep that), but the **owner** tier assumes peers are publicly
-reachable, and almost no consumer machine behind home NAT/CGNAT is. Today you
-would need volunteers with public IPs to host the weight shards, which
-contradicts "consumer hardware." Needs UDP hole-punching (STUN-style rendezvous,
-which the tracker is well placed to broker) and/or a **relay** role for the
-peers that can't be punched through. The `relay` role offer is already
-*reserved* in the protocol (Phase 1/Phase 2 D10) but unbuilt; per-frame signed
-envelopes were deferred waiting for exactly this relayed data-plane path. Known
-techniques, real systems effort.
+**Was the single biggest *unbuilt practical* blocker; now built.** Workers stay
+dial-out-only (NAT-friendly), and the **owner** tier — which assumed public
+reachability — can now be a NAT'd consumer machine reached *through relays*.
+Built on **py-libp2p** as a transport+NAT substrate behind a `transport.kind:
+libp2p` seam (TCP stays the default, bit-identical anchor): Circuit Relay v2 (a
+`relay` role + `opendipaco relay` CLI), end-to-end **Noise** through the circuit
+(so a relay forwards only ciphertext — this *subsumes* the deferred per-frame
+signed envelopes), k≥2 relay reservations per NAT'd peer, **DCUtR** best-effort
+relayed→direct hole-punch (D9), and NAT'd owners as a first-class tier
+(`owner_eligible` accepts a relay-reachable peer; HRW placement / replication /
+gossip / quorum-audit all dial circuit addrs). Identity reconciles with no app
+churn — the libp2p host key derives from the peer's Ed25519 `PeerIdentity` and
+the app id stays `sha256(pubkey)`. Authentication (Noise) **and** enrollment
+(`admitted_peers` allowlist) both apply on the libp2p path. Design +
+per-slice status in [w1-nat-design.md](w1-nat-design.md); end-to-end harness
+`examples/validate_nat.py` (a relay + NAT'd owners + scheduler + workers training
+through the relay); libp2p tests behind the `[nat]` extra with their own CI job.
+
+*Remaining (0f-WAN-coupled, not a W1 gap):* **automatic discovery** of libp2p
+multiaddrs through the tracker (today multiaddrs are wired explicitly or
+in-process — the data/control plane over libp2p is proven, only the rendezvous
+*of* addresses is still manual), plus real NAT/CGNAT + DCUtR-success measurement
+and throughput at scale, which need the multi-node §0f run.
 
 ### W2 · Bandwidth: delta encoding + sparsification + lower-bit quant · B0 · [eng + research]
 
@@ -177,7 +190,7 @@ needs a reason to contribute. These are research-shaped, not just unbuilt.
         └──────────────────────────────────────┬──────────────────────────────────────┘
                                                 ▼
                         ┌───────────────────────┴───────────────────────┐
-                  W1 NAT / relay                                   W2 bandwidth      (parallel; both B0)
+                  W1 NAT / relay ✅                                W2 bandwidth      (parallel; both B0)
                         └───────────────────────┬───────────────────────┘
                                                 ▼
                        W3 VRAM fit   ·   W4 churn   ·   W5 task sizing       (B1: "large + consumer")

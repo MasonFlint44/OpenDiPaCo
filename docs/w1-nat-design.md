@@ -1,6 +1,6 @@
 # W1 design — NAT traversal / relay tier (libp2p substrate)
 
-Status: **design; no slices landed yet.** W1 (from [viability-roadmap.md](viability-roadmap.md))
+Status: **all slices landed (W1a–W1d).** W1 (from [viability-roadmap.md](viability-roadmap.md))
 removes the biggest *practical* wall to consumer-hardware training: today the
 **owner** tier (and owner↔owner replication/gossip) requires public
 reachability, but almost no consumer machine behind home NAT/CGNAT is reachable,
@@ -25,6 +25,45 @@ and **k≥2 relays** per NAT'd peer.
 > round-trip. The one real integration cost: py-libp2p is **trio-async** and our
 > stack is threads + a custom event-loop, so a trio↔threads bridge is required
 > (D3) — confined to the transport seam.
+
+**W1d status (DCUtR + launch wiring + enrollment + validation):**
+- *DCUtR hole-punch upgrade (D9).* Every libp2p host now runs `DCUtRProtocol`
+  (responder side always on; initiation gated by `transport.dcutr`, default on).
+  After a relayed dial the transport fires a **fire-and-forget** hole-punch
+  toward the peer (`_maybe_holepunch`) — it never blocks or fails the RPC, which
+  proceeds over the relay meanwhile; DCUtR self-dedups and falls back to the
+  relay if the NAT refuses. Tested: a relayed round-trip still completes with
+  DCUtR on (the upgrade is best-effort). *Honest caveat:* hole-punch **success**
+  needs two real NATs and rides the 0f WAN run; in-process / loopback it just
+  exercises the attempt + fallback.
+- *Full enrollment over libp2p.* `require_identity` (W1c) ensured an
+  *authenticated* peer; W1d adds the *authorization* gate. `serve_over_libp2p`
+  now refuses an authenticated-but-**unenrolled** peer when the server has an
+  `admitted_peers` allowlist — via a new `peer_id_admitted(peer_id)` on the base
+  server (Noise authenticates *who*, the allowlist authorizes *whether*; for
+  Ed25519 the app id `sha256(pubkey)` descends from the admitted pubkey, so no
+  signature re-check is needed). Open (no allowlist) admits any authenticated
+  peer, mirroring TCP. Tested: an enrolled peer is served, a stranger refused.
+- *Launch wiring.* `transport.kind: tcp|libp2p` (default `tcp`, validated at
+  load) selects the substrate; `transport.libp2p_listen`, `transport.relays`
+  (k≥2), `transport.dcutr`, and `transport.connect_libp2p` (the scheduler
+  multiaddr a libp2p worker dials) configure it. A new **`relay` role + CLI**
+  (`opendipaco relay`) stands up a Circuit Relay v2 forwarder. `run_scheduler` /
+  `run_parameter_server` additionally serve over libp2p (the TCP reactor stays
+  the anchor) and a NAT'd owner reserves the configured relays + advertises its
+  circuit addrs; `run_worker_role` runs the libp2p worker loop (sharded only).
+  The `[nat]` extra has its own CI job (`tests/test_p2p.py`).
+- *End-to-end validation.* `examples/validate_nat.py` stands up a relay + k NAT'd
+  owners (reachable *only* via circuit addrs) + a scheduler + workers, all over
+  libp2p, and trains to a generation budget through the relay — the runnable
+  counterpart to the per-seam unit tests.
+- *Remaining (rides the 0f WAN bring-up, not a W1 bug):* **automatic discovery**
+  of libp2p multiaddrs through the tracker (today a multiaddr is wired explicitly
+  via config/printed addrs, or in-process by the validation script) — the data &
+  control plane over libp2p is proven; only the rendezvous *of* multiaddrs is
+  still manual. Also still 0f-coupled: real NAT/CGNAT traversal + DCUtR success,
+  throughput at scale, and the per-peer lock-dict pruning / owner relay re-home
+  refinements carried from W1c.
 
 **W1c status (NAT'd owners as a first-class tier):**
 - *Identity threaded over libp2p* (above) — reputation/rate-limit/audit/

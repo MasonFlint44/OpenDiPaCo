@@ -117,6 +117,56 @@ def test_unauthenticatable_peer_is_refused_over_libp2p():
         ps.shutdown()
 
 
+def test_enrollment_allowlist_enforced_over_libp2p():
+    """W1d: Noise authenticates *who* a peer is; an ``admitted_peers`` allowlist
+    authorizes *whether* it may participate. An authenticated-but-unenrolled peer
+    is refused over libp2p exactly as the TCP signed-challenge handshake refuses
+    it; an enrolled peer is served."""
+    from opendipaco import DiLoCoConfig
+    from opendipaco.schedule import ParameterServer
+    from opendipaco.schedule.p2p import serve_over_libp2p
+
+    cfg = _cfg()
+    keys = sorted(cfg.build_topology().module_keys())
+    enrolled = PeerIdentity.generate()
+    stranger = PeerIdentity.generate()
+    ps = ParameterServer(cfg, keys, DiLoCoConfig(inner_steps=4), host="127.0.0.1", port=0,
+                         identity=PeerIdentity.generate(),
+                         admitted_peers=[enrolled.public_key_hex])   # allowlist
+    owner = serve_over_libp2p(ps)
+    c_ok = Libp2pTransport(enrolled).start()
+    c_no = Libp2pTransport(stranger).start()
+    try:
+        shared = next(k for k in keys if not _is_private(k))
+        req = {"type": "fetch", "keys": [shared], "have": {}}
+        assert c_no.rpc(dial_info(owner.addrs[0]), req, timeout=20) is None   # not enrolled
+        assert c_ok.rpc(dial_info(owner.addrs[0]), req, timeout=20)["versions"]  # enrolled
+    finally:
+        c_ok.close()
+        c_no.close()
+        owner.close()
+        ps.shutdown()
+
+
+def test_dcutr_enabled_relayed_round_trip_still_works():
+    """W1d/D9: with DCUtR on (the default), a relayed RPC still completes — the
+    hole-punch is a background best-effort upgrade that must never break or block
+    the relayed round-trip (it falls back to the relay)."""
+    relay = Libp2pTransport(PeerIdentity.generate(), relay=True).start()
+    listener = Libp2pTransport(PeerIdentity.generate(),
+                               handler=lambda m, pid: {"echo": m.get("n")}).start()
+    dialer = Libp2pTransport(PeerIdentity.generate()).start()       # dcutr=True default
+    try:
+        assert dialer._dcutr_on                       # initiation is enabled
+        circuit = listener.reserve_on(relay.addrs[0])
+        reply = dialer.rpc(circuit, {"n": 21}, timeout=30)
+        assert reply == {"echo": 21}                  # round-trip survived the punch attempt
+    finally:
+        dialer.close()
+        listener.close()
+        relay.close()
+
+
 def test_addrs_are_dialable_p2p_multiaddrs():
     server = Libp2pTransport(PeerIdentity.generate(), handler=lambda m, pid: {"ok": True}).start()
     try:
@@ -368,6 +418,44 @@ def test_owner_to_owner_rpc_over_libp2p():
         tb.close()
         a.shutdown()
         b.shutdown()
+
+
+def test_run_relay_role_stands_up_a_forwarding_relay():
+    """W1d launch wiring: the ``relay`` role builds a Circuit Relay v2 host a
+    NAT'd peer can reserve on. A listener reserves through it and is reached via
+    its circuit addr -- the role produces a working relay."""
+    import threading
+
+    from opendipaco.launch import run_relay
+    from opendipaco.launch.config import LaunchConfig
+
+    cfg = LaunchConfig.from_dict({"transport": {"kind": "libp2p"}})
+    box, ready, stop = {}, threading.Event(), threading.Event()
+
+    def on_start(relay):
+        box["relay"] = relay
+        ready.set()
+
+    th = threading.Thread(target=run_relay,
+                          kwargs=dict(cfg=cfg, on_start=on_start, stop_event=stop),
+                          daemon=True)
+    th.start()
+    try:
+        assert ready.wait(timeout=30)
+        relay = box["relay"]
+        assert relay.addrs and all("/p2p/" in a for a in relay.addrs)
+        listener = Libp2pTransport(PeerIdentity.generate(),
+                                   handler=lambda m, pid: {"echo": m.get("n")}).start()
+        dialer = Libp2pTransport(PeerIdentity.generate()).start()
+        try:
+            circuit = listener.reserve_on(relay.addrs[0])
+            assert dialer.rpc(circuit, {"n": 5}, timeout=30) == {"echo": 5}
+        finally:
+            dialer.close()
+            listener.close()
+    finally:
+        stop.set()
+        th.join(timeout=10)
 
 
 def test_nat_owner_served_through_a_relay():

@@ -62,6 +62,19 @@ def test_from_dict_rejects_bad_mode():
         LaunchConfig.from_dict({"mode": "potato"})
 
 
+def test_transport_kind_parses_and_validates():
+    """W1d: transport.kind selects the substrate (tcp default, libp2p opt-in)."""
+    assert LaunchConfig.from_dict({}).transport.kind == "tcp"
+    lp = LaunchConfig.from_dict({"transport": {"kind": "libp2p",
+                                               "relays": ["/ip4/1.2.3.4/tcp/9/p2p/Qm"],
+                                               "connect_libp2p": "/ip4/1.2.3.4/tcp/9/p2p/Qm"}})
+    assert lp.transport.kind == "libp2p"
+    assert lp.transport.relays == ["/ip4/1.2.3.4/tcp/9/p2p/Qm"]
+    assert lp.transport.dcutr is True
+    with pytest.raises(ValueError):
+        LaunchConfig.from_dict({"transport": {"kind": "carrier-pigeon"}})
+
+
 def test_load_config_json_and_yaml(tmp_path):
     d = _tiny_dict()
     jp = tmp_path / "c.json"

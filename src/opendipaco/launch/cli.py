@@ -9,6 +9,7 @@ Subcommands (each reads a cluster config; see ``init-config``):
     opendipaco worker      --config c.yaml [--max-tasks N]
     opendipaco ingest      --config c.yaml --shard-id N   # sharded resumable ingest
     opendipaco tracker     --config c.yaml           # rendezvous directory (Phase 1)
+    opendipaco relay       --config c.yaml           # libp2p Circuit Relay v2 (NAT traversal)
     opendipaco init-config --out c.yaml [--mode sharded]  # write a starter config
     opendipaco gen-cert    --out certs/              # self-signed cert for TLS
     opendipaco gen-identity --out peer.pem           # Ed25519 peer identity
@@ -30,6 +31,7 @@ from .roles import (
     run_ingest,
     run_local,
     run_parameter_server,
+    run_relay,
     run_scheduler,
     run_tracker,
     run_worker_role,
@@ -119,6 +121,13 @@ def cmd_gen_cert(args) -> int:
     return 0
 
 
+def cmd_relay(args) -> int:
+    cfg = load_config(args.config)
+    print(f"libp2p relay on {cfg.transport.libp2p_listen}; Ctrl-C to stop", flush=True)
+    run_relay(cfg)
+    return 0
+
+
 def cmd_tracker(args) -> int:
     cfg = load_config(args.config)
     print(f"tracker on {cfg.tracker.host}:{cfg.tracker.port} "
@@ -166,6 +175,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_in.set_defaults(func=cmd_ingest)
 
     with_config("tracker", "run the rendezvous directory").set_defaults(func=cmd_tracker)
+    with_config("relay", "run a libp2p Circuit Relay v2 relay (NAT traversal)").set_defaults(
+        func=cmd_relay)
 
     p_id = sub.add_parser("gen-identity", help="generate an Ed25519 peer identity")
     p_id.add_argument("--out", required=True, help="path for the private-key PEM")

@@ -36,6 +36,7 @@ from libp2p.network.stream.exceptions import StreamEOF, StreamError
 from libp2p.peer.id import ID
 from libp2p.peer.peerinfo import PeerInfo, info_from_p2p_addr
 from libp2p.relay.circuit_v2.config import RelayConfig
+from libp2p.relay.circuit_v2.dcutr import DCUtRProtocol
 from libp2p.relay.circuit_v2.protocol import PROTOCOL_ID as CIRCUIT_HOP_PROTOCOL
 from libp2p.relay.circuit_v2.protocol import CircuitV2Protocol
 from libp2p.relay.circuit_v2.transport import CircuitV2Transport
@@ -72,7 +73,8 @@ def _derive_keypair(identity: PeerIdentity) -> KeyPair:
 
 def serve_over_libp2p(server, *, identity: PeerIdentity | None = None,
                       listen_addrs=("/ip4/127.0.0.1/tcp/0",),
-                      require_identity: bool = True) -> "Libp2pTransport":
+                      require_identity: bool = True, dcutr: bool = True,
+                      max_msg_bytes: int | None = None) -> "Libp2pTransport":
     """Serve a server's ``_handle`` over libp2p (W1a owner-serving bridge).
 
     ``require_identity`` (default True) **refuses any peer whose app identity we
@@ -98,12 +100,20 @@ def serve_over_libp2p(server, *, identity: PeerIdentity | None = None,
     def handler(msg, peer_id):
         if require_identity and peer_id is None:
             return None  # unauthenticatable peer (non-Ed25519) -> deny service (W1c)
+        # Enrollment (W1d): Noise authenticates *who* the peer is; an allowlist
+        # (admitted_peers) authorizes *whether* it may participate. Refuse an
+        # authenticated-but-unenrolled peer here -- the TCP path enforces the same
+        # allowlist via the signed-challenge handshake (reactor._dispatch).
+        if peer_id is not None and not server.peer_id_admitted(peer_id):
+            return None
         # peer_id is the Noise-authenticated remote mapped to our app id (W1c), so
         # reputation / rate-limit / audit / owner-eligibility + enrollment gates
         # apply on the libp2p path exactly as on TCP.
         return server._handle(msg, _nbytes(msg), peer_id=peer_id)
 
-    t = Libp2pTransport(ident, handler=handler, listen_addrs=listen_addrs).start()
+    kw = {} if max_msg_bytes is None else {"max_msg_bytes": max_msg_bytes}
+    t = Libp2pTransport(ident, handler=handler, listen_addrs=listen_addrs,
+                        dcutr=dcutr, **kw).start()
     # Let the owner reuse this transport for outbound owner↔owner RPCs (_peer_rpc
     # dials co-owners over libp2p / through relays when their addr is a multiaddr).
     if hasattr(server, "libp2p"):
@@ -121,10 +131,14 @@ class Libp2pTransport:
     def __init__(self, identity: PeerIdentity, *, handler=None, relay: bool = False,
                  listen_addrs=("/ip4/127.0.0.1/tcp/0",),
                  max_msg_bytes: int = DEFAULT_MAX_MSG_BYTES, start_timeout: float = 30.0,
-                 serve_timeout: float = 300.0):
+                 serve_timeout: float = 300.0, dcutr: bool = True):
         self.identity = identity
         self._handler = handler
         self._relay = relay           # run Circuit Relay v2 in HOP mode (a relay peer, D6)
+        # DCUtR (D9): after a relayed dial, attempt to upgrade to a direct
+        # connection (the classic hole-punch), transparently falling back to the
+        # relay when the NAT won't allow it -- a ~free bandwidth win.
+        self._dcutr_on = dcutr
         self._listen = [multiaddr.Multiaddr(a) for a in listen_addrs]
         self._kp = _derive_keypair(identity)
         self.max_msg_bytes = max_msg_bytes
@@ -136,8 +150,9 @@ class Libp2pTransport:
         self._host = None
         self._token = None            # trio token: lets foreign threads call in
         self._stop = None             # trio.Event set on close
-        self._nursery = None          # for reservation refreshers (D6)
+        self._nursery = None          # for reservation refreshers (D6) + hole-punches
         self._ctransport = None       # CircuitV2Transport: reserve / dial-through-relay
+        self._dcutr = None            # DCUtRProtocol: relayed -> direct upgrade (D9)
         self._ready = threading.Event()
         # Per-peer locks: serialize concurrent dials to the SAME peer (they race
         # py-libp2p's swarm) while letting dials to different peers run in
@@ -176,10 +191,12 @@ class Libp2pTransport:
         # dial through, a relay. The relayed stream is Noise-secured end-to-end,
         # so a relay only ever sees ciphertext (D7).
         cproto = CircuitV2Protocol(host, allow_hop=self._relay)
+        dcutr = DCUtRProtocol(host)   # responder side is cheap; we gate *initiation*
         async with host.run(self._listen), background_trio_service(cproto), \
-                trio.open_nursery() as nursery:
+                background_trio_service(dcutr), trio.open_nursery() as nursery:
             self._nursery = nursery
             self._ctransport = CircuitV2Transport(host, cproto, RelayConfig())
+            self._dcutr = dcutr if self._dcutr_on else None
             if self._handler is not None:
                 host.set_stream_handler(RPC_PROTOCOL, self._on_stream)
             self._token = trio.lowlevel.current_trio_token()
@@ -295,10 +312,30 @@ class Libp2pTransport:
             if _CIRCUIT_SEP in target:                      # reach a NAT'd peer via its relay
                 dest, relay = dial_circuit(target)
                 await self._ctransport.dial_peer_info(dest, relay_info=relay)
+                # D9: try to upgrade this relayed link to a direct one in the
+                # background (the RPC proceeds over the relay meanwhile; DCUtR
+                # self-dedups and falls back to the relay if the NAT refuses).
+                self._maybe_holepunch(dest.peer_id)
                 return dest.peer_id
             target = dial_info(target)
         await self._host.connect(target)
         return target.peer_id
+
+    def _maybe_holepunch(self, peer_id) -> None:
+        """Fire-and-forget a DCUtR hole-punch toward a relayed peer (D9). Never
+        blocks the RPC and never fails it: a refused/failed punch just leaves the
+        relay in place. DCUtR short-circuits if a direct connection already
+        exists or an attempt is in flight."""
+        if self._dcutr is None or self._nursery is None:
+            return
+
+        async def _punch():
+            try:
+                await self._dcutr.initiate_hole_punch(peer_id)
+            except Exception:  # noqa: BLE001 -- an optimization; relay stays as fallback
+                pass
+
+        self._nursery.start_soon(_punch)
 
     @staticmethod
     def _remote_peer_id(stream) -> str | None:

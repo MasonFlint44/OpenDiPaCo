@@ -135,6 +135,26 @@ def _advertise_host(cfg: LaunchConfig) -> str:
             or (t.host if t.host not in ("0.0.0.0", "::") else "127.0.0.1"))
 
 
+def _serve_libp2p(server, cfg: LaunchConfig, identity=None):
+    """When ``transport.kind == 'libp2p'``, serve this server's RPC surface over a
+    *parallel* libp2p host (the TCP reactor stays the byte-for-byte anchor, W1
+    D10), reserve any configured relays so a NAT'd node is reachable, and return
+    the transport. ``None`` on the TCP path. The libp2p host key derives from the
+    node's Ed25519 identity (D4), so it must be configured for a libp2p run."""
+    if cfg.transport.kind != "libp2p":
+        return None
+    from ..schedule.p2p import serve_over_libp2p
+
+    ident = _node_identity(cfg, identity, generate=True)
+    t = serve_over_libp2p(
+        server, identity=ident, listen_addrs=tuple(cfg.transport.libp2p_listen),
+        require_identity=True, dcutr=cfg.transport.dcutr,
+        max_msg_bytes=cfg.transport.max_msg_bytes)
+    for relay in cfg.transport.relays:        # k>=2 for failover (D6)
+        t.reserve_on(relay)
+    return t
+
+
 def _node_identity(cfg: LaunchConfig, identity=None, *, generate=False):
     """This node's Ed25519 identity: an explicit object, the configured key
     file, or (rendezvous in-process smoke) a freshly generated one."""
@@ -303,6 +323,9 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None, identity=N
         idle_backoff=cfg.transport.idle_backoff,
         **_scheduler_robustness_kw(cfg), **_server_kw(cfg, extra_admitted))
     scheduler.start()
+    lp = _serve_libp2p(scheduler, cfg, ident)   # also serve over libp2p (kind: libp2p)
+    if lp is not None:
+        print(f"scheduler libp2p addrs: {lp.addrs}", flush=True)
     _attach_metrics(scheduler, cfg)
     if rendezvous:
         if cfg.run.resume and cfg.run.checkpoint_dir:
@@ -322,6 +345,8 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None, identity=N
         checkpoint_dir=cfg.run.checkpoint_dir, checkpoint_every=cfg.run.checkpoint_every,
         resume=cfg.run.resume)
     scheduler.shutdown()
+    if lp is not None:
+        lp.close()
     return scheduler, completed
 
 
@@ -354,8 +379,9 @@ def run_parameter_server(cfg: LaunchConfig, shard_id: int = 0, *, port=None,
         grant_key=cfg.transport.grant_key,
         max_update_norm=cfg.transport.max_update_norm, compress=cfg.transport.compress,
         resume_dir=resume_dir, **_ps_robustness_kw(cfg))
+    node_ident = None
     if own.mode == "rendezvous":
-        ident = _node_identity(cfg, identity, generate=True)
+        ident = node_ident = _node_identity(cfg, identity, generate=True)
         decentralized = cfg.schedule.mode == "decentralized"
         # Decentralized: no scheduler to poll for epochs (they're gossip-derived).
         sched_addr = None if decentralized else (scheduler_addr or cfg.connect_addr())
@@ -380,11 +406,17 @@ def run_parameter_server(cfg: LaunchConfig, shard_id: int = 0, *, port=None,
         ps = ParameterServer(model, owned, diloco, port=_ps_port(cfg, shard_id, port),
                              **common, **_server_kw(cfg, extra_admitted))
         ps.start()
+    lp = _serve_libp2p(ps, cfg, node_ident or identity)   # also serve over libp2p
+    if lp is not None:
+        addrs = lp.circuit_addrs or lp.addrs   # advertise relay addrs for a NAT'd owner
+        print(f"owner libp2p addrs: {addrs}", flush=True)
     _attach_metrics(ps, cfg)
     if on_start:
         on_start(ps)
     (stop_event or _wait_for_signal()).wait()
     ps.shutdown()
+    if lp is not None:
+        lp.close()
     return ps
 
 
@@ -394,6 +426,22 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
     mt = max_tasks if max_tasks is not None else cfg.run.max_tasks
     data_dir = cfg.data.shard_cache_dir  # spec mode: cache materialized shards here
     auth = _worker_auth(cfg)
+    if cfg.transport.kind == "libp2p":
+        # libp2p worker: dials the scheduler's multiaddr over Noise streams
+        # (NAT-traversing via relays/DCUtR). Sharded/owner topology only -- the
+        # single-coordinator path has no libp2p worker loop.
+        if cfg.mode != "sharded":
+            raise ValueError("transport.kind: libp2p is supported for sharded mode only")
+        target = scheduler_addr or cfg.transport.connect_libp2p
+        if not target:
+            raise ValueError("libp2p worker needs transport.connect_libp2p (scheduler multiaddr)")
+        run_sharded_worker(
+            model, diloco, target, device=cfg.run.device, seed=cfg.run.seed,
+            max_tasks=mt, reconnect=True,
+            heartbeat_interval=cfg.transport.heartbeat_interval,
+            data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch,
+            transport="libp2p", identity=_node_identity(cfg, generate=True))
+        return
     if cfg.mode == "sharded":
         target = scheduler_addr or cfg.connect_addr()
         run_sharded_worker(
@@ -564,6 +612,29 @@ def _run_local_rendezvous(cfg: LaunchConfig):
     for w in workers:
         w.join(timeout=5)
     return sresult["r"]
+
+
+def run_relay(cfg: LaunchConfig, *, on_start=None, stop_event=None):
+    """A Circuit Relay v2 **relay** node (W1 D6): a public peer that forwards
+    other peers' traffic so NAT'd owners are reachable. It runs ``allow_hop`` and
+    no RPC handler -- relayed streams are Noise-secured end-to-end, so it only
+    ever sees ciphertext (D7). Prints its dialable multiaddrs; wire one (k>=2 for
+    failover) into each NAT'd peer's ``transport.relays``. Needs the ``[nat]``
+    extra and ``transport.identity_key`` (the relay's libp2p id derives from it)."""
+    from ..schedule.p2p import Libp2pTransport
+
+    ident = _node_identity(cfg, generate=True)
+    relay = Libp2pTransport(ident, relay=True,
+                            listen_addrs=tuple(cfg.transport.libp2p_listen),
+                            dcutr=cfg.transport.dcutr).start()
+    print(f"relay peer id: {ident.peer_id}", flush=True)
+    for a in relay.addrs:
+        print(f"relay addr: {a}", flush=True)
+    if on_start:
+        on_start(relay)
+    (stop_event or _wait_for_signal()).wait()
+    relay.close()
+    return relay
 
 
 def run_tracker(cfg: LaunchConfig, *, on_start=None, stop_event=None):

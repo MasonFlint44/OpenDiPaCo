@@ -570,6 +570,18 @@ class _ReactorServer:
         with self._peer_lock:
             return self.admitted_peers is not None and pub.lower() in self.admitted_peers
 
+    def peer_id_admitted(self, peer_id: str) -> bool:
+        """Whether an *already-authenticated* peer (by app id ``sha256(pubkey)``)
+        is on the enrollment allowlist. The libp2p path authenticates the peer
+        cryptographically via Noise, so it gates enrollment by app id rather than
+        re-verifying a signature: ``peer_id`` must descend from an admitted
+        pubkey. Open (no allowlist) returns True -- mirrors TCP where
+        ``admitted_peers is None`` admits any HMAC-authed peer."""
+        with self._peer_lock:
+            if self.admitted_peers is None:
+                return True
+            return peer_id in {peer_id_of(p) for p in self.admitted_peers}
+
     def admit_peer(self, pub) -> None:
         """Admit an Ed25519 public key (hex or PeerIdentity) at runtime."""
         with self._peer_lock:
