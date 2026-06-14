@@ -1457,7 +1457,7 @@ class Scheduler(_ReactorServer):
                  identity=None, compress="none", idle_backoff=None,
                  reputation=None, rate_limiter=None, min_owner_reputation=0.25,
                  redundancy=3, redundancy_rate=0.0, audit_timeout=60.0,
-                 private_policy="overwrite", down="full", **reactor_kw):
+                 private_policy="overwrite", down="full", up_density=1.0, **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.ps_tls = ps_tls  # client context for the scheduler's checkpoint RPCs to PSs
         self.grant_key = grant_key  # shared with the PSs (not workers) to sign grants
@@ -1499,6 +1499,12 @@ class Scheduler(_ReactorServer):
         if down not in ("full", "delta"):
             raise ValueError(f"down must be 'full' or 'delta', got {down!r}")
         self.down = down
+        # Up-path sparsification (W2b): the worker keeps each pseudo-gradient's
+        # top `up_density` fraction (per-row for 2-D weights) and error-feeds the
+        # dropped mass. 1.0 (default) = dense = byte-identical. Stamped on tasks.
+        if not 0.0 < up_density <= 1.0:
+            raise ValueError(f"up_density must be in (0, 1], got {up_density!r}")
+        self.up_density = float(up_density)
         self.idle_backoff = idle_backoff      # server-paced idle polling (retry_in)
         self._worker_caps: dict = {}          # worker_id -> advertised capabilities
         self.config = config
@@ -1749,6 +1755,7 @@ class Scheduler(_ReactorServer):
             "path": path,
             "routing": routing,
             "compress": self.compress,  # uplink encoding the worker should use
+            "density": self.up_density,  # uplink top-k sparsification (W2b); 1.0 = dense
             "down": self.down,          # downlink policy: keep keyframes for deltas (W2a)
             "shard": compress_shard(shard, self.compress),
             "shard_spec": shard_spec,
@@ -2366,7 +2373,8 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions, keyfr
             # Encode only after acceptance, so the error-feedback residual always
             # reflects an update that is actually pushed.
             shared_payload, private_payload, pending_res = _compress_contribution(
-                contrib, task.get("compress") or "none", residuals, path
+                contrib, task.get("compress") or "none", residuals, path,
+                density=task.get("density") or 1.0,
             )
             _commit_residuals(residuals, path, pending_res)
 

@@ -1,6 +1,23 @@
 # W2 design — bandwidth: delta encoding + sparsification + sub-int8
 
-Status: **W2a landed; W2b/W2c/docs pending.** W2 (from [viability-roadmap.md](viability-roadmap.md))
+Status: **W2a + W2b landed; W2c/docs pending.** W2 (from [viability-roadmap.md](viability-roadmap.md))
+
+**W2b status (structured sparsification, up path):**
+- *Top-k sparsification works end to end.* `up_density` (∈ (0, 1], 1.0 = dense =
+  byte-identical) is stamped on tasks; the worker keeps each pseudo-gradient's
+  top `up_density` fraction — **per output-row** for a 2-D weight, flat
+  otherwise (`compress._sparsify`) — encodes the kept values via the existing
+  `compress` mode, and **error-feeds the dropped mass** through the same residual
+  carry (so a `current − reconstruction` residual captures dropped entries +
+  any value-quant error; tested: exact mass conservation in `none` mode). The
+  payload is self-describing (`{"sp": shape, "i": indices, "v": values}`), so
+  `maybe_dequantize` scatters it back to dense on the owner and a malformed one
+  is refused. Composes with int8 values (a step toward W2c). `validate_dynamics.py`
+  gained a `sparse-up` arm (~0.7× the anchor at toy scale — converges).
+- *Off by default; sharded only* — `up_density < 1.0` is rejected in coordinator
+  mode (it is stamped on sharded tasks), like delta-down.
+
+
 
 **W2a status (delta-down):**
 - *Delta-down works end to end.* `down="delta"` (scheduler + owners; default

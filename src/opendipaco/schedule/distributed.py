@@ -657,11 +657,13 @@ def _build_worker_engine(config, diloco, device, seed):
     )
 
 
-def _compress_contribution(contrib, mode, residuals, path):
+def _compress_contribution(contrib, mode, residuals, path, density=1.0):
     """Encode a contribution's uplink payloads per the server's compress policy.
 
-    In "bf16"/"int8" mode the per-(path, module) quantization residual is the
-    error-feedback carry: it is folded into this delta before encoding, and the
+    In "bf16"/"int8" mode (or with ``density`` < 1.0 sparsification, W2b) the
+    per-(path, module) residual is the error-feedback carry — quantization error
+    and/or the dropped top-k mass: it is folded into this delta before encoding,
+    and the
     *new* residual is returned as ``pending`` — **not** written back. The caller
     must commit it (:func:`_commit_residuals`) only once the server confirms the
     update was applied; committing for a rejected/stale/lost submit would both
@@ -669,12 +671,12 @@ def _compress_contribution(contrib, mode, residuals, path):
     error into a later accepted one. Returns
     ``(shared_payload, private_payload, pending_residuals | None)``.
     """
-    if mode == "none":
+    if mode == "none" and density >= 1.0:
         return contrib.shared_delta, contrib.private_state, None
     carry = residuals.get(path) or {}
     shared_payload, pending = {}, {}
     for key, delta in contrib.shared_delta.items():
-        payload, res = compress_delta(delta, mode, carry=carry.get(key))
+        payload, res = compress_delta(delta, mode, carry=carry.get(key), density=density)
         pending[key] = res
         shared_payload[key] = payload
     private_payload = {k: compress_state(sd, mode) for k, sd in contrib.private_state.items()}

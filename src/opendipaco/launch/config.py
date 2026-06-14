@@ -134,6 +134,11 @@ class TransportCfg:
     # cache the version churn defeats). Changes numerics -> off by default;
     # validate with examples/validate_dynamics.py. Set on the scheduler AND owners.
     down: str = "full"
+    # Up-path (pseudo-gradient) structured sparsification (W2b): the worker keeps
+    # each gradient's top `up_density` fraction (per output-row for 2-D weights)
+    # and error-feeds the dropped mass. 1.0 (default) = dense = byte-identical.
+    # Changes numerics -> validate with examples/validate_dynamics.py. Sharded only.
+    up_density: float = 1.0
     # When set, idle replies tell workers to wait this many seconds before
     # polling again (server-paced; otherwise workers use their own tight poll).
     idle_backoff: float | None = None
@@ -336,6 +341,12 @@ class LaunchConfig:
         if kw["transport"].down == "delta" and kw["mode"] != "sharded":
             raise ValueError("transport.down: delta requires mode: sharded "
                              "(delta-down is served by the owner tier)")
+        if not 0.0 < kw["transport"].up_density <= 1.0:
+            raise ValueError("transport.up_density must be in (0, 1], got "
+                             f"{kw['transport'].up_density!r}")
+        if kw["transport"].up_density < 1.0 and kw["mode"] != "sharded":
+            raise ValueError("transport.up_density < 1.0 requires mode: sharded "
+                             "(it is stamped on sharded tasks)")
         # Decentralized scheduling is built on the replicated owner tier, so it
         # requires rendezvous ownership (Phase 4 D9). Catch the mismatch at load
         # rather than half-wiring a run with no owners to mint grants.

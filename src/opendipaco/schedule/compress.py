@@ -140,20 +140,61 @@ def state_digest(state: dict) -> str:
     return h.hexdigest()
 
 
-def compress_delta(delta, mode: str, carry=None):
+def _sparsify(d: torch.Tensor, density: float, mode: str):
+    """Structured top-k of one tensor (W2b): keep the largest-|·| ``density``
+    fraction -- **per output-row** for a 2-D weight (so each row keeps its own
+    top entries), flat otherwise -- encode the kept values via ``mode``, and
+    return ``(payload, dense_reconstruction)``. The dropped entries are carried by
+    the caller as error-feedback (``original − reconstruction`` is the residual).
+    The payload is self-describing: ``{"sp": shape, "i": flat int64 indices,
+    "v": <encoded kept values>}``."""
+    d = d.detach()
+    if d.dim() == 2:
+        rows, cols = d.shape
+        k = max(1, math.ceil(density * cols))
+        idx = d.abs().topk(k, dim=1).indices                 # [rows, k] per-row
+        kept = torch.gather(d, 1, idx).reshape(-1)
+        flat_idx = (torch.arange(rows).unsqueeze(1) * cols + idx).reshape(-1)
+    else:
+        n = d.numel()
+        k = max(1, math.ceil(density * n))
+        flat = d.reshape(-1)
+        flat_idx = flat.abs().topk(k).indices
+        kept = flat[flat_idx]
+    if mode == "int8":
+        enc, _ = _quantize_int8(kept)
+        recon_vals = enc["q"].float() * enc["s"]
+    elif mode == "bf16":
+        enc = kept.to(torch.bfloat16)
+        recon_vals = enc.float()
+    else:  # "none": keep fp32 values, sparsify only
+        enc = kept.float()
+        recon_vals = enc
+    dense = torch.zeros(d.numel(), dtype=torch.float32)
+    dense[flat_idx] = recon_vals
+    return {"sp": list(d.shape), "i": flat_idx.to(torch.int64), "v": enc}, dense.reshape(d.shape)
+
+
+def compress_delta(delta, mode: str, carry=None, density: float = 1.0):
     """Compress one module's pseudo-gradient (a list of tensors).
 
     ``carry`` is the previous round's residual list for this (path, module) —
-    error feedback adds it in before encoding. Returns ``(payload, residual)``;
-    residual is ``None`` in "none" mode (nothing is lost, nothing to carry).
+    error feedback adds it in before encoding. ``density`` < 1.0 additionally
+    **sparsifies** each tensor to its top-k (W2b), error-feeding the dropped mass
+    via the same residual. Returns ``(payload, residual)``; residual is ``None``
+    only in "none" mode with no sparsification (nothing is lost, nothing to carry).
     """
-    if mode == "none":
+    if mode == "none" and density >= 1.0:
         return list(delta), None
     if carry is not None:
         delta = [d + c for d, c in zip(delta, carry)]
     payload, residual = [], []
     for d in delta:
-        if mode == "bf16":
+        if density < 1.0:
+            p, recon = _sparsify(d, density, mode)
+            payload.append(p)
+            residual.append(d.detach().float() - recon)   # dropped mass + kept quant error
+        elif mode == "bf16":
             c = d.detach().to(torch.bfloat16)
             payload.append(c)
             residual.append(d.detach().float() - c.float())
@@ -207,9 +248,10 @@ def apply_state_delta(base: dict, tensors: dict) -> dict:
 def maybe_dequantize(items) -> list[torch.Tensor]:
     """Restore a pseudo-gradient list to fp32 whatever encoding it arrived in.
 
-    Accepts fp32 (passthrough), bf16 (cast), or ``{"q", "s"}`` int8 payloads;
-    raises ``TypeError`` on anything else so the server can refuse a malformed
-    push instead of crashing.
+    Accepts fp32 (passthrough), bf16 (cast), ``{"q", "s"}`` int8 payloads, or a
+    ``{"sp", "i", "v"}`` sparse top-k payload (W2b, scattered back to a dense
+    tensor); raises ``TypeError`` on anything else so the server can refuse a
+    malformed push instead of crashing.
     """
     out = []
     for it in items:
@@ -217,6 +259,18 @@ def maybe_dequantize(items) -> list[torch.Tensor]:
             out.append(it if it.dtype == torch.float32 else it.to(torch.float32))
         elif isinstance(it, dict) and "q" in it and torch.is_tensor(it["q"]):
             out.append(it["q"].to(torch.float32) * float(it["s"]))
+        elif isinstance(it, dict) and "sp" in it and torch.is_tensor(it.get("i")):
+            shape = [int(s) for s in it["sp"]]
+            v = it["v"]
+            if isinstance(v, dict) and "q" in v:        # int8-encoded kept values
+                vals = v["q"].to(torch.float32) * float(v["s"])
+            elif torch.is_tensor(v):                    # fp32 / bf16 kept values
+                vals = v.to(torch.float32)
+            else:
+                raise TypeError(f"not a sparse-payload value: {type(v)}")
+            dense = torch.zeros(int(torch.tensor(shape).prod()), dtype=torch.float32)
+            dense[it["i"].to(torch.int64)] = vals
+            out.append(dense.reshape(shape))
         else:
             raise TypeError(f"not a pseudo-gradient tensor: {type(it)}")
     return out
