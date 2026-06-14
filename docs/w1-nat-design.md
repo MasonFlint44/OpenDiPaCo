@@ -41,10 +41,23 @@ and **k≥2 relays** per NAT'd peer.
   digest-audit all flow between NAT'd owners through relays. Tested: owner A
   fetches owner B's digest over libp2p; a NAT'd owner record is eligible and
   placed with its circuit addr.
-- *Remaining in W1c (refinements):* multi-relay failover / relay-death
-  re-homing (a NAT'd owner re-reserving when a relay dies, and dialers trying
-  each of an owner's circuit addrs), and per-peer rpc locking for an owner's
-  concurrent outbound replication.
+- *Per-peer rpc locking (done).* The transport now holds a lock **per peer**
+  instead of one global rpc lock, so an owner's concurrent dials to different
+  co-owners run in parallel while same-peer dials (which race py-libp2p's swarm)
+  still serialize.
+- *Multi-relay failover (done, dialer side).* A peer record carries *all* its
+  relay circuit addrs; `owner_addrs` + the epoch's `addrs` propagate them;
+  `rpc` accepts a **candidate list** and fails over across them (a dead relay →
+  the next), skipping any bad/malformed candidate (so a Byzantine record addr
+  can't crash a dialer); `_peer_rpc`/`_owner_targets` feed a co-owner's relay
+  candidates into the digest-audit path. A NAT'd owner stays reachable while ≥1
+  of its k relays is alive.
+- *Remaining (runtime, lands with W1d launch wiring):* a NAT'd owner
+  **re-reserving** on a fresh relay when one of its k dies (to *maintain*
+  redundancy over time — immediate availability already holds via the other
+  relays), and `_replicate_once`/`_gossip_once` using candidate lists (they
+  already have multi-*owner* fallback, so per-relay failover there is lower
+  value).
 
 **W1b amendments (discovered while building the orchestration):**
 - *Addressing is now transport-opaque (step 1).* `_addr_key` normalizes a JSON

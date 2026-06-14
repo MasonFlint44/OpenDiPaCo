@@ -125,8 +125,12 @@ class Libp2pTransport:
         self._nursery = None          # for reservation refreshers (D6)
         self._ctransport = None       # CircuitV2Transport: reserve / dial-through-relay
         self._ready = threading.Event()
-        self._rpc_lock = threading.Lock()  # serialize outbound rpcs: concurrent
-        self._thread = None                # same-peer dials race py-libp2p's swarm
+        # Per-peer locks: serialize concurrent dials to the SAME peer (they race
+        # py-libp2p's swarm) while letting dials to different peers run in
+        # parallel (an owner replicating to several co-owners at once).
+        self._locks: dict = {}
+        self._locks_guard = threading.Lock()
+        self._thread = None
         self._err = None
         self._libp2p_id = None
         self._addrs: list[str] = []
@@ -221,22 +225,31 @@ class Libp2pTransport:
 
     # -- RPC (sync facade over the trio loop) ----------------------------------
 
+    def _lock_for(self, target) -> threading.Lock:
+        key = target if isinstance(target, str) else str(getattr(target, "peer_id", id(target)))
+        with self._locks_guard:
+            return self._locks.setdefault(key, threading.Lock())
+
     def rpc(self, target, msg, *, timeout: float | None = None):
         """Open a stream to ``target``, send ``msg``, return the reply. ``target``
-        is a :class:`PeerInfo`, a direct ``/…/p2p/<id>`` addr, or a
-        ``/…/p2p-circuit/p2p/<id>`` circuit addr (dialed through the relay).
-        Blocks the calling thread until the trio round-trip completes."""
+        is a :class:`PeerInfo`, a direct ``/…/p2p/<id>`` addr, a
+        ``/…/p2p-circuit/p2p/<id>`` circuit addr, or a **list of candidate addrs**
+        tried in order for failover (e.g. a NAT'd owner's k relays — W1c). Blocks
+        the calling thread until a candidate's trio round-trip completes; libp2p
+        faults surface as ``ConnectionError``."""
         if self._token is None:
             raise RuntimeError("transport not started")
-        with self._rpc_lock:
+        candidates = list(target) if isinstance(target, list) else [target]
+        last = None
+        for c in candidates:
             try:
-                return trio.from_thread.run(self._rpc_async, target, msg, timeout,
-                                            trio_token=self._token)
-            except (SwarmException, StreamError, StreamEOF, trio.TooSlowError,
-                    trio.BrokenResourceError, trio.ClosedResourceError) as e:
-                # Surface libp2p/trio transport faults as ConnectionError so callers
-                # (the worker loop) handle them with their existing OSError paths.
-                raise ConnectionError(f"libp2p rpc to {target} failed: {e}") from e
+                with self._lock_for(c):  # per-peer: same-peer dials serialize, others free
+                    return trio.from_thread.run(self._rpc_async, c, msg, timeout,
+                                                trio_token=self._token)
+            except Exception as e:  # noqa: BLE001 -- any bad candidate (down relay,
+                last = e            # malformed addr from a record, transport fault)
+                #                      -> try the next; trio.Cancelled still propagates
+        raise ConnectionError(f"libp2p rpc to {target} failed: {last}")
 
     async def _rpc_async(self, target, msg, timeout):
         with trio.fail_after(timeout) if timeout else _nullcm():

@@ -924,11 +924,20 @@ class ParameterServer(_ReactorServer):
         self._beat_thread = threading.Thread(target=beat, daemon=True)
         self._beat_thread.start()
 
+    def _owner_targets(self, owner):
+        """Dial target(s) for an owner epoch entry: a candidate list of its relay
+        circuit addrs (libp2p — tried in order for multi-relay failover, W1c) or
+        a single ``(host, port)`` (TCP)."""
+        if self.libp2p is not None:
+            return owner.get("addrs") or [owner["addr"]]
+        return _addr_key(owner["addr"])
+
     def _peer_rpc(self, addr, msg):
         # libp2p owners (W1c): a co-owner's addr is a multiaddr (direct or a
-        # /p2p-circuit through a relay) -> dial it over the owner's libp2p
-        # transport, which handles connection reuse + relay routing.
-        if self.libp2p is not None and isinstance(addr, str):
+        # /p2p-circuit through a relay), or a *list* of its k relay circuit addrs
+        # tried in order for failover -> dial over the owner's libp2p transport,
+        # which handles connection reuse + relay routing.
+        if self.libp2p is not None and isinstance(addr, (str, list)):
             return self.libp2p.rpc(addr, msg, timeout=60.0)
         sock = self._peer_conns.get(addr)
         if sock is None:
@@ -1094,12 +1103,14 @@ class ParameterServer(_ReactorServer):
                     for k in keys if k in self.bank}
         reports: dict = {k: {self.peer_id: (tuple(v), state_digest(sd))}
                          for k, (v, sd) in snap.items()}
-        by_peer: dict = {}  # peer_id -> (addr, [keys it co-owns with us])
+        by_peer: dict = {}  # peer_id -> (dial target(s), [keys it co-owns with us])
         for k in reports:
             for o in owners_for(k, epoch):
                 if o["peer_id"] == self.peer_id:
                     continue
-                by_peer.setdefault(o["peer_id"], (_addr_key(o["addr"]), []))[1].append(k)
+                # _owner_targets gives a co-owner's relay candidates (libp2p) so
+                # the digest fetch fails over across its k relays (W1c).
+                by_peer.setdefault(o["peer_id"], (self._owner_targets(o), []))[1].append(k)
         for pid, (addr, ks) in by_peer.items():
             try:
                 reply = self._peer_rpc(addr, {"type": "digest", "keys": ks})

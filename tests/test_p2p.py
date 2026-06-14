@@ -271,6 +271,25 @@ def test_sharded_cluster_trains_over_libp2p():
             w.join(timeout=10)
 
 
+def test_rpc_fails_over_across_candidate_addrs():
+    """W1c multi-relay failover at the transport: rpc tried over a list of
+    candidate addrs uses the first that works (a dead relay -> the next)."""
+    server = Libp2pTransport(PeerIdentity.generate(),
+                             handler=lambda m, pid: {"ok": True}).start()
+    dead_t = Libp2pTransport(PeerIdentity.generate()).start()
+    dead = dead_t.addrs[0]
+    dead_t.close()                       # well-formed addr, now unreachable (a dead relay)
+    client = Libp2pTransport(PeerIdentity.generate()).start()
+    try:
+        # All-dead -> ConnectionError; [dead, live] -> fails over to live.
+        with pytest.raises(ConnectionError):
+            client.rpc([dead], {"x": 1}, timeout=8)
+        assert client.rpc([dead, server.addrs[0]], {"x": 1}, timeout=20) == {"ok": True}
+    finally:
+        client.close()
+        server.close()
+
+
 def test_owner_to_owner_rpc_over_libp2p():
     """Owners dial each other over libp2p via _peer_rpc (W1c) — replication,
     gossip, and digest-audit ride this. Here owner A fetches owner B's digest

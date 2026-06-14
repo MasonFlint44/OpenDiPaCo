@@ -387,3 +387,18 @@ def test_epoch_record_carries_a_nat_owners_circuit_addr():
     cfg = _cfg()
     key = sorted(cfg.build_topology().module_keys())[0]
     assert owners_for(key, epoch)[0]["addr"] == circuit
+
+
+def test_owner_addrs_lists_all_relays_for_failover():
+    """A NAT'd owner's k relay circuit addrs are all carried through the epoch,
+    so a dialer can fail over across them (W1c)."""
+    from opendipaco.schedule import make_epoch_record, owner_addrs, owners_for
+
+    c1 = "/ip4/198.51.100.2/tcp/1/p2p/R1/p2p-circuit/p2p/SELF"
+    c2 = "/ip4/198.51.100.3/tcp/2/p2p/R2/p2p-circuit/p2p/SELF"
+    nat = make_peer_record(PeerIdentity.generate(), reachability="nat",
+                           roles=("owner",), circuit_addrs=[c1, c2])
+    assert owner_addrs(nat) == [c1, c2]
+    epoch = make_epoch_record(PeerIdentity.generate(), epoch=0, owner_records=[nat], k=1)
+    key = sorted(_cfg().build_topology().module_keys())[0]
+    assert owners_for(key, epoch)[0]["addrs"] == [c1, c2]   # both relays carried

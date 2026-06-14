@@ -48,6 +48,15 @@ def owner_addr(record: dict):
     return circuits[0] if circuits else None
 
 
+def owner_addrs(record: dict) -> list:
+    """All addresses a dialer may try to reach this owner, in preference order:
+    its direct addr (public) or *all* its relay circuit addrs (nat) — so a
+    dialer can fail over across the owner's k relays (W1c)."""
+    if record.get("addr"):
+        return [record["addr"]]
+    return list(record.get("circuit_addrs") or [])
+
+
 def owner_eligible(record: dict) -> bool:
     """May this (already-verified) peer record host modules?
 
@@ -110,7 +119,8 @@ def make_epoch_record(identity: PeerIdentity, *, epoch: int, owner_records,
     for r in owner_records:
         if not owner_eligible(r):
             raise ValueError(f"record not owner-eligible: {r.get('peer_id')!r}")
-        owners.append({"peer_id": r["peer_id"], "addr": owner_addr(r)})
+        owners.append({"peer_id": r["peer_id"], "addr": owner_addr(r),
+                       "addrs": owner_addrs(r)})
     owners.sort(key=lambda o: o["peer_id"])
     return sign_record(identity, {
         "kind": "epoch",
@@ -126,7 +136,7 @@ def make_epoch_record(identity: PeerIdentity, *, epoch: int, owner_records,
 def _members_sig(owners) -> str:
     """A stable hash of an owner set (peer_id + addr), so identical membership
     maps to the same epoch on every node (Phase 4 D6)."""
-    payload = [[o["peer_id"], list(o["addr"])] for o in owners]
+    payload = [[o["peer_id"], o["addr"]] for o in owners]  # addr is a list (public) or str (nat)
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -158,7 +168,8 @@ def derive_epoch(owner_records, *, k: int = DEFAULT_REPLICATION, salt: str = "",
     owners = []
     for r in owner_records:
         if owner_eligible(r) and (is_eligible is None or is_eligible(r["peer_id"])):
-            owners.append({"peer_id": r["peer_id"], "addr": owner_addr(r)})
+            owners.append({"peer_id": r["peer_id"], "addr": owner_addr(r),
+                           "addrs": owner_addrs(r)})
     owners.sort(key=lambda o: o["peer_id"])
     sig = _members_sig(owners)
     if prev is not None and prev.get("members_sig") == sig and int(prev.get("k", k)) == int(k):
