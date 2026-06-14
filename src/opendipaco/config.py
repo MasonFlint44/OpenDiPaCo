@@ -163,6 +163,12 @@ class DiLoCoConfig:
     # for ~one extra forward. Bit-exact (it only changes what's stored), so off
     # here keeps the in-process anchor fast; real worker runs default it on.
     activation_checkpoint: bool = False
+    # Chunked cross-entropy (W3c): compute the vocab logits + loss in this many
+    # token-chunks so the full [tokens, vocab] logit tensor never materializes --
+    # a large activation cut for a big vocab. 1 = off. Mathematically exact but
+    # the loss sum is in chunk order (~1e-7, far below the int8-digest noise),
+    # so off here keeps the in-process anchor bit-identical; opt in on the worker.
+    loss_chunks: int = 1
 
     # Inner LR schedule over the *whole* run (paper: cosine, peak 4e-4). Needs the
     # total number of rounds, which ``DiPaCoEngine.fit`` supplies automatically;

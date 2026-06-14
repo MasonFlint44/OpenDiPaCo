@@ -1,7 +1,29 @@
 # W3 design — fit one path in consumer VRAM
 
-Status: **W3a + W3b(checkpointing) landed; D4 reclassified; W3c/W3d pending.**
+Status: **W3a + W3b + W3c landed; D4 reclassified; W3d pending.**
 W3 (from [viability-roadmap.md](viability-roadmap.md))
+
+**W3c status (exact param/activation levers).**
+- *Tied embed/head now actually works (D6 + a real bug fix).* The bank tied the
+  weights, but `build_path_model(deepcopy=True)` deep-copied each module
+  *separately*, **severing the tie** — a tied worker held two independent copies
+  and trained them apart (no memory saving, wrong dynamics). Fixed by
+  deep-copying the selection in one call (shared memo preserves the tie);
+  bit-identical when nothing is tied. Tying now halves the dominant embed/head.
+- *Chunked cross-entropy (D6).* `diloco.loss_chunks > 1` computes the vocab
+  logits + loss in token-chunks (`PathModel._chunked_loss`), so the full
+  `[tokens, vocab]` logits never materialize — the big activation cut for a large
+  vocab. The training path discards logits, so it returns `(None, loss)`;
+  callers wanting logits pass `labels=None`. Mathematically the dense loss, but
+  the sum runs in chunk order (~1e-7, far below the int8-digest noise), so it's
+  **opt-in** (default off keeps the anchor bit-identical).
+- *Deferred from D5 (not landed).* **Optimizer-state CPU-offload** is superseded
+  by W3d's 8-bit Adam (which cuts the moments on-GPU without per-step PCIe
+  traffic). **Embedding row CPU-gather** is largely addressed by tying (D6) +
+  (for private embed) the W3d de-dup; the PCIe-bound gather is a later follow-up,
+  not needed to fit the 12 GB target alongside checkpointing + chunked CE.
+
+
 
 **W3b status (activation checkpointing) + a correction to D4.**
 - *Activation checkpointing landed (exact).* `diloco.activation_checkpoint`
@@ -214,7 +236,7 @@ measured-priority), the exact levers before the lossy one.
 |---|---|---|
 | **W3a** | VRAM profiler (D1): analytical calculator (params/Adam/activations/embedding breakdown + fit-vs-budget) + real `max_memory_allocated` measurement of a worker round (CPU fallback = the estimate). `examples/vram_budget.py`. | The calculator's breakdown sums to the measured peak within tolerance on a small GPU/CPU run; fit-vs-budget reports correctly; CPU fallback returns the estimate. |
 | **W3b** | Activation checkpointing over the body (D3), exact + default-on for real runs. *(Private-copy de-dup, D4, moved to W3d — it turned out to be a dynamics change, not exact.)* | Training **bit-identical** with/without checkpointing; the flag flows from `diloco`; inert outside training; anchor unchanged. |
-| **W3c** | Offload (D5) + embedding tie/chunk (D6), exact, by measured priority. | Optimizer/embedding offload cuts the peak; results bit-identical; tied-head halves `R`; chunked logits match unchunked exactly. |
+| **W3c** | Tied embed/head fixed through the working-copy deepcopy + chunked cross-entropy (D6). *(D5 CPU-offloads deferred: optimizer offload → superseded by W3d 8-bit Adam; embedding gather → a PCIe-bound follow-up, tying covers the embedding.)* | Tying survives `deepcopy` (one shared weight, half `R`) + stays tied through training; untied stays bit-identical; chunked CE matches the dense loss to fp tolerance and skips the full logits; chunked CE trains. |
 | **W3d** | Dynamics-gated levers (off by default, §0f, on-box-validated): custom blockwise 8-bit AdamW (D7) **and** the private-copy de-dup / warming (D4). | 8-bit Adam round-trips within the blockwise bound; private-warming + `quant-optim` arms converge in `validate_dynamics`; peak `2P → ~0.5P`. |
 
 Rough sizing: W3a M, W3b M, W3c M–L, W3d M. M–L overall — worker-local, no new

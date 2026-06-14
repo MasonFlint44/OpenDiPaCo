@@ -54,6 +54,10 @@ class DiLoCoCfg:
     # for a large activation-memory cut at ~one extra forward. Bit-exact, so it's
     # default-on for real runs (turn off only to trade memory back for speed).
     activation_checkpoint: bool = True
+    # Chunked cross-entropy over this many token-chunks (W3c): avoids the full
+    # [tokens, vocab] logits tensor -- set > 1 for a large vocab. 1 = off (the loss
+    # sum order shifts ~1e-7 when on, so it's opt-in rather than default).
+    loss_chunks: int = 1
 
 
 @dataclass
@@ -434,4 +438,5 @@ def diloco_config(d: DiLoCoCfg) -> DiLoCoConfig:
         outer_momentum=d.outer_momentum, outer_nesterov=d.outer_nesterov,
         rescale_by_sqrt_sharing=d.rescale_by_sqrt_sharing,
         inner_autocast=d.inner_autocast, activation_checkpoint=d.activation_checkpoint,
+        loss_chunks=d.loss_chunks,
     )

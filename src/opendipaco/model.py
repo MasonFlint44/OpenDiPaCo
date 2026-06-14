@@ -101,6 +101,9 @@ class PathModel(nn.Module):
         # activations in backward instead of storing them. Set by the trainer
         # (off for inference/encode). Bit-exact -- only changes what is stored.
         self.checkpoint = False
+        # Chunked cross-entropy (W3c): >1 computes logits+loss in N token-chunks so
+        # the full [tokens, vocab] logits never materialize. Set by the trainer.
+        self.loss_chunks = 1
 
     def modules_by_key(self) -> dict[str, nn.Module]:
         """Map topology key -> the live submodule instance in this path."""
@@ -151,6 +154,23 @@ class PathModel(nn.Module):
         norm = getattr(self.head, "norm", None)
         return norm(hidden) if norm is not None else hidden
 
+    def _chunked_loss(self, hidden: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Cross-entropy without materializing the full [tokens, vocab] logits:
+        norm the hidden states (per-token, so it's safe to do whole), then apply
+        the vocab projection + CE in token-chunks and accumulate. Mathematically
+        the same loss as the dense path (fp summation order differs ~1e-7)."""
+        norm = getattr(self.head, "norm", None)
+        normed = norm(hidden) if norm is not None else hidden
+        h = normed[:, :-1, :].reshape(-1, normed.size(-1))   # shifted, flattened tokens
+        y = labels[:, 1:].reshape(-1)
+        total = h.new_zeros(())
+        count = 0
+        for hc, yc in zip(h.chunk(self.loss_chunks), y.chunk(self.loss_chunks)):
+            total = total + F.cross_entropy(self.head.lm_head(hc), yc,
+                                            ignore_index=-100, reduction="sum")
+            count += int((yc != -100).sum())
+        return total / max(count, 1)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -158,8 +178,12 @@ class PathModel(nn.Module):
         labels: torch.Tensor | None = None,
     ):
         hidden = self._backbone(input_ids, attention_mask)
-        logits = self.head(hidden)
+        # Chunked CE (W3c): when on and we only need the loss (training), skip the
+        # full logits tensor entirely. Callers that want logits pass labels=None.
+        if labels is not None and self.loss_chunks > 1:
+            return None, self._chunked_loss(hidden, labels)
 
+        logits = self.head(hidden)
         loss = None
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
@@ -193,5 +217,9 @@ def build_path_model(
         )
     selected = {k: bank[k] for k in keys}
     if deepcopy:
-        selected = {k: copy.deepcopy(v) for k, v in selected.items()}
+        # Deep-copy the whole selection in ONE call so cross-module shared tensors
+        # (tied embed/head weights, W3c/D6) stay shared in the copy -- per-module
+        # deepcopy would sever the tie, doubling memory and training the two copies
+        # apart. Identical to per-module copy when nothing is tied.
+        selected = copy.deepcopy(selected)
     return PathModel(config, path, selected)
