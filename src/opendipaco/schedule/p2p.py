@@ -41,7 +41,7 @@ from libp2p.relay.circuit_v2.protocol import CircuitV2Protocol
 from libp2p.relay.circuit_v2.transport import CircuitV2Transport
 from libp2p.tools.async_service import background_trio_service
 
-from .identity import PeerIdentity
+from .identity import PeerIdentity, peer_id_of
 from .wire import DEFAULT_MAX_MSG_BYTES, _HEADER, decode, encode
 
 RPC_PROTOCOL = "/opendipaco/rpc/1.0.0"
@@ -88,8 +88,11 @@ def serve_over_libp2p(server, *, identity: PeerIdentity | None = None,
     if ident is None:
         raise ValueError("serve_over_libp2p needs an identity (server.identity or identity=)")
 
-    def handler(msg):
-        return server._handle(msg, _nbytes(msg), peer_id=None)
+    def handler(msg, peer_id):
+        # peer_id is the Noise-authenticated remote mapped to our app id (W1c), so
+        # reputation / rate-limit / audit / owner-eligibility + enrollment gates
+        # apply on the libp2p path exactly as on TCP.
+        return server._handle(msg, _nbytes(msg), peer_id=peer_id)
 
     return Libp2pTransport(ident, handler=handler, listen_addrs=listen_addrs).start()
 
@@ -265,12 +268,26 @@ class Libp2pTransport:
         await self._host.connect(target)
         return target.peer_id
 
+    @staticmethod
+    def _remote_peer_id(stream) -> str | None:
+        """Our app-layer (sha256) peer id for the stream's remote, derived from
+        the identity libp2p **already authenticated** via Noise (W1c). For
+        Ed25519 the libp2p id embeds the pubkey, and our id is sha256(pubkey), so
+        no directory lookup is needed -- the binding is the key itself. None if
+        the remote used a non-extractable key (e.g. RSA)."""
+        try:
+            pub = stream.muxed_conn.peer_id.extract_public_key()
+            return peer_id_of(pub.to_bytes().hex()) if pub is not None else None
+        except Exception:  # noqa: BLE001 -- never let id extraction break serving
+            return None
+
     async def _on_stream(self, stream) -> None:
         try:
             msg = await self._recv(stream)
             if msg is None:
                 return
-            reply = await trio.to_thread.run_sync(self._handler, msg)
+            peer_id = self._remote_peer_id(stream)
+            reply = await trio.to_thread.run_sync(self._handler, msg, peer_id)
             if reply is not None:
                 await self._send(stream, reply)
         except Exception:  # noqa: BLE001 -- serving untrusted peers: one bad request

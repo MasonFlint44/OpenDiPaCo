@@ -33,7 +33,7 @@ def test_transport_round_trips_a_wire_frame():
     trio loop and the reply comes back -- our frames over a libp2p Noise stream."""
     seen = {}
 
-    def handler(msg):
+    def handler(msg, peer_id):
         seen["msg"] = msg
         return {"type": "ack", "echo": msg.get("n")}
 
@@ -50,7 +50,7 @@ def test_transport_round_trips_a_wire_frame():
 
 def test_transport_carries_tensors():
     """The wire codec handles tensors over the stream (weights/grads ride this)."""
-    def handler(msg):
+    def handler(msg, peer_id):
         t = msg["w"]
         return {"type": "ack", "w": t * 2}
 
@@ -65,8 +65,29 @@ def test_transport_carries_tensors():
         server.close()
 
 
+def test_authenticated_peer_id_is_threaded_to_the_handler():
+    """W1c: the Noise-authenticated remote is mapped to OUR app peer id and passed
+    to the handler, so reputation / rate-limit / enrollment gates apply over
+    libp2p exactly as on TCP. The id matches the dialer's PeerIdentity."""
+    seen = {}
+
+    def handler(msg, peer_id):
+        seen["pid"] = peer_id
+        return {"ok": True}
+
+    server = Libp2pTransport(PeerIdentity.generate(), handler=handler).start()
+    client_id = PeerIdentity.generate()
+    client = Libp2pTransport(client_id).start()
+    try:
+        client.rpc(dial_info(server.addrs[0]), {"x": 1}, timeout=20)
+        assert seen["pid"] == client_id.peer_id   # authenticated, not None
+    finally:
+        client.close()
+        server.close()
+
+
 def test_addrs_are_dialable_p2p_multiaddrs():
-    server = Libp2pTransport(PeerIdentity.generate(), handler=lambda m: {"ok": True}).start()
+    server = Libp2pTransport(PeerIdentity.generate(), handler=lambda m, pid: {"ok": True}).start()
     try:
         assert server.addrs and all("/p2p/" in a for a in server.addrs)
         info = dial_info(server.addrs[0])
@@ -137,7 +158,7 @@ def test_relayed_rpc_round_trip():
     relay = Libp2pTransport(PeerIdentity.generate(), relay=True).start()
     seen = {}
 
-    def handler(msg):
+    def handler(msg, peer_id):
         seen["n"] = msg.get("n")
         return {"type": "ack", "echo": msg.get("n")}
 
@@ -163,7 +184,7 @@ def test_server_survives_a_raising_handler():
     the host -- it drops that stream and keeps serving (Byzantine hardening)."""
     calls = {"n": 0}
 
-    def handler(msg):
+    def handler(msg, peer_id):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("boom")     # first request blows up the handler
@@ -184,7 +205,7 @@ def test_oversized_reply_is_a_connection_error_not_a_crash():
     """A frame over the receiver's cap (a buggy/Byzantine peer) surfaces as
     ConnectionError -- which the worker's retry/next-replica paths handle -- not
     an uncaught crash."""
-    def handler(msg):
+    def handler(msg, peer_id):
         return {"big": torch.zeros(5000)}              # ~20 KB, over the 1 KB cap
 
     server = Libp2pTransport(PeerIdentity.generate(), handler=handler).start()
