@@ -53,6 +53,15 @@ and **k≥2 relays** per NAT'd peer.
   hanging the worker while it held the rpc lock. Now bounded (rpc 120s, heartbeat
   15s) and a timeout surfaces as `ConnectionError`, which the worker's
   retry/next-replica paths already absorb.
+- *Fixed — a malformed/oversized/hostile frame must not crash a peer
+  (Byzantine hardening).* A reply over the receiver's cap, or that fails to
+  decode, now raises `ConnectionError` (a transport fault the worker's
+  retry/next-replica paths absorb) instead of an uncaught `ValueError` that
+  killed the worker; the server's stream handler catches any per-request error
+  (vanished peer, bad frame, handler exception) so one bad request can't escape
+  and kill the host — while letting `trio.Cancelled` through so shutdown still
+  works. Tested: a raising handler leaves the host serving; an oversized reply is
+  a `ConnectionError`.
 - *Gap, deferred to W1c — the authenticated peer identity is not threaded over
   libp2p.* `serve_over_libp2p` calls `_handle(..., peer_id=None)`, so the
   Phase 3/4 reputation, rate-limit, redundant-execution, and owner-eligibility

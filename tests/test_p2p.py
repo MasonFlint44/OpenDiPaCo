@@ -158,6 +158,45 @@ def test_relayed_rpc_round_trip():
         relay.close()
 
 
+def test_server_survives_a_raising_handler():
+    """A handler error on one request (a malformed/hostile call) must not kill
+    the host -- it drops that stream and keeps serving (Byzantine hardening)."""
+    calls = {"n": 0}
+
+    def handler(msg):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom")     # first request blows up the handler
+        return {"ok": True}
+
+    server = Libp2pTransport(PeerIdentity.generate(), handler=handler).start()
+    client = Libp2pTransport(PeerIdentity.generate()).start()
+    try:
+        info = dial_info(server.addrs[0])
+        assert client.rpc(info, {"x": 1}, timeout=20) is None   # no reply, stream dropped
+        assert client.rpc(info, {"x": 2}, timeout=20) == {"ok": True}  # host survived
+    finally:
+        client.close()
+        server.close()
+
+
+def test_oversized_reply_is_a_connection_error_not_a_crash():
+    """A frame over the receiver's cap (a buggy/Byzantine peer) surfaces as
+    ConnectionError -- which the worker's retry/next-replica paths handle -- not
+    an uncaught crash."""
+    def handler(msg):
+        return {"big": torch.zeros(5000)}              # ~20 KB, over the 1 KB cap
+
+    server = Libp2pTransport(PeerIdentity.generate(), handler=handler).start()
+    client = Libp2pTransport(PeerIdentity.generate(), max_msg_bytes=1024).start()
+    try:
+        with pytest.raises(ConnectionError):
+            client.rpc(dial_info(server.addrs[0]), {"x": 1}, timeout=20)
+    finally:
+        client.close()
+        server.close()
+
+
 def test_sharded_cluster_trains_over_libp2p():
     """The W1b orchestration payoff: a full sharded cluster -- scheduler + 2
     parameter servers + 2 workers -- runs end-to-end over libp2p (addresses are

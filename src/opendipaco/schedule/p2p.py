@@ -273,9 +273,10 @@ class Libp2pTransport:
             reply = await trio.to_thread.run_sync(self._handler, msg)
             if reply is not None:
                 await self._send(stream, reply)
-        except (trio.BrokenResourceError, trio.ClosedResourceError, ValueError,
-                StreamEOF, StreamError):
-            pass  # peer vanished / oversized frame -> drop this stream, keep serving
+        except Exception:  # noqa: BLE001 -- serving untrusted peers: one bad request
+            pass            # (vanished peer, malformed frame, handler error) must
+            #                  never escape and kill the host; trio.Cancelled (a
+            #                  BaseException) still propagates so shutdown works
         finally:
             await stream.close()
 
@@ -298,9 +299,16 @@ class Libp2pTransport:
             return None
         (n,) = _HEADER.unpack(header)
         if n > self.max_msg_bytes:
-            raise ValueError(f"incoming message of {n} bytes exceeds cap {self.max_msg_bytes}")
+            # A Byzantine/buggy peer must not crash us: a bad frame is a transport
+            # fault (ConnectionError) the worker's retry/next-replica paths handle.
+            raise ConnectionError(f"incoming frame of {n} bytes exceeds cap {self.max_msg_bytes}")
         body = await self._read_exactly(stream, n)
-        return None if body is None else decode(body)
+        if body is None:
+            return None
+        try:
+            return decode(body)
+        except Exception as e:  # noqa: BLE001 -- a malformed frame is a transport fault
+            raise ConnectionError(f"malformed frame: {e}") from e
 
     @staticmethod
     async def _read_exactly(stream, n: int) -> bytes | None:
