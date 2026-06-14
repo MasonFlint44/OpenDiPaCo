@@ -2278,7 +2278,16 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions, keyfr
                         base_v = tuple(sd.get("base") or ())
                         if kf is None or kf[0] != base_v:
                             raise OSError(f"delta for {k} vs keyframe {base_v} not held")
-                        _load_into(engine, k, apply_state_delta(kf[1], sd["tensors"]))
+                        try:
+                            recon = apply_state_delta(kf[1], sd["tensors"])
+                        except (TypeError, ValueError, RuntimeError) as e:
+                            # A malformed delta from a buggy/Byzantine owner must
+                            # not crash the worker: drop the suspect keyframe (so
+                            # the retry re-fetches a full) and treat it as a
+                            # replica fault the reconnect/next-replica path absorbs.
+                            keyframes.pop(k, None)
+                            raise OSError(f"malformed delta for {k}: {e}") from e
+                        _load_into(engine, k, recon)
                     else:
                         _load_into(engine, k, sd)
                         if down_delta and not is_private_key(k) and k in reply_versions:

@@ -83,6 +83,20 @@ def test_malformed_int4_payload_refused():
     # And it composes with the push decode path (maybe_dequantize).
     with pytest.raises(ValueError):
         maybe_dequantize([{**good, "shape": [128], "s": torch.zeros(99)}])
+    # A valid int4 payload but a shape whose product != element count would
+    # reshape-crash (uncaught RuntimeError); refuse as ValueError instead.
+    with pytest.raises(ValueError):
+        maybe_dequantize([{**good, "shape": [7, 7]}])           # 49 != 128
+    # Same for an int4 down-delta whose element count != the base tensor.
+    delta = encode_state_delta({"w": torch.randn(2, 130)}, {"w": torch.zeros(2, 130)},
+                               mode="int4")
+    with pytest.raises(ValueError):
+        apply_state_delta({"w": torch.zeros(4, 4)}, delta)      # base 16 != delta 260
+    # And an int8 down-delta whose tensor shape != the base.
+    with pytest.raises(ValueError):
+        apply_state_delta({"w": torch.zeros(4, 4)},
+                          encode_state_delta({"w": torch.randn(2, 8)},
+                                             {"w": torch.zeros(2, 8)}))
 
 
 def test_run_local_sharded_trains_with_int4():

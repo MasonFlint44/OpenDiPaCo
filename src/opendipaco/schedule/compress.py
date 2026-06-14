@@ -291,10 +291,16 @@ def apply_state_delta(base: dict, tensors: dict) -> dict:
     out = {}
     for n, t in tensors.items():
         if isinstance(t, dict) and "q" in t and torch.is_tensor(t["q"]):
-            out[n] = base[n].float() + t["q"].to(torch.float32) * float(t["s"])
+            b = base[n]
+            if t["q"].shape != b.shape:   # a mismatched delta would broadcast-crash
+                raise ValueError(f"int8 delta shape {tuple(t['q'].shape)} != base {tuple(b.shape)}")
+            out[n] = b.float() + t["q"].to(torch.float32) * float(t["s"])
         elif isinstance(t, dict) and "q4" in t:
             b = base[n]
-            out[n] = b.float() + _dequant_int4(t).reshape(b.shape)
+            deq = _dequant_int4(t)
+            if deq.numel() != b.numel():   # a mismatched delta would reshape-crash
+                raise ValueError(f"int4 delta has {deq.numel()} elems != base {b.numel()}")
+            out[n] = b.float() + deq.reshape(b.shape)
         elif torch.is_tensor(t):
             out[n] = t                      # verbatim (non-float / shape change)
         else:
@@ -318,7 +324,11 @@ def maybe_dequantize(items) -> list[torch.Tensor]:
         elif isinstance(it, dict) and "q" in it and torch.is_tensor(it["q"]):
             out.append(it["q"].to(torch.float32) * float(it["s"]))
         elif isinstance(it, dict) and "q4" in it:       # int4 per-group (dense)
-            out.append(_dequant_int4(it).reshape([int(s) for s in it["shape"]]))
+            deq = _dequant_int4(it)
+            shape = [int(s) for s in it["shape"]]
+            if any(s < 0 for s in shape) or math.prod(shape) != deq.numel():
+                raise ValueError("int4 payload: shape does not match element count")
+            out.append(deq.reshape(shape))
         elif isinstance(it, dict) and "sp" in it and torch.is_tensor(it.get("i")):
             shape = [int(s) for s in it["sp"]]
             v = it["v"]
