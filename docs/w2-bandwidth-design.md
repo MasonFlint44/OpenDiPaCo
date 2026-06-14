@@ -10,12 +10,20 @@ Status: **W2a + W2b landed; W2c/docs pending.** W2 (from [viability-roadmap.md](
   `compress` mode, and **error-feeds the dropped mass** through the same residual
   carry (so a `current − reconstruction` residual captures dropped entries +
   any value-quant error; tested: exact mass conservation in `none` mode). The
-  payload is self-describing (`{"sp": shape, "i": indices, "v": values}`), so
+  payload is self-describing (`{"sp": shape, "i": int32 indices, "v": values}`),
+  so
   `maybe_dequantize` scatters it back to dense on the owner and a malformed one
   is refused. Composes with int8 values (a step toward W2c). `validate_dynamics.py`
   gained a `sparse-up` arm (~0.7× the anchor at toy scale — converges).
 - *Off by default; sharded only* — `up_density < 1.0` is rejected in coordinator
   mode (it is stamped on sharded tasks), like delta-down.
+- *Honest byte tradeoff.* Each kept entry costs an int32 index + the encoded
+  value (≈ 5 B with int8 values), vs ~1 B/param for a dense int8 ship — so
+  sparsification is a net win only at **low density** (≈ ρ < 0.2 with int8
+  values; a bigger win at the ρ ≈ 0.01–0.05 typical of gradient sparsification).
+  A future refinement (W2c-era) could shrink the index further (per-row int16, or
+  a bitmask) to raise that break-even density. The tests use larger ρ for clear
+  assertions, not as a recommended operating point.
 
 
 

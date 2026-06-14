@@ -149,12 +149,17 @@ def _sparsify(d: torch.Tensor, density: float, mode: str):
     The payload is self-describing: ``{"sp": shape, "i": flat int64 indices,
     "v": <encoded kept values>}``."""
     d = d.detach()
+    # Stay on d's device throughout (a worker's pseudo-gradient lives on its
+    # training device, often GPU); arange/zeros default to CPU, which would
+    # device-mismatch the GPU topk indices. The payload rides the wire from
+    # whatever device, exactly like the int8 path.
     if d.dim() == 2:
         rows, cols = d.shape
         k = max(1, math.ceil(density * cols))
         idx = d.abs().topk(k, dim=1).indices                 # [rows, k] per-row
         kept = torch.gather(d, 1, idx).reshape(-1)
-        flat_idx = (torch.arange(rows).unsqueeze(1) * cols + idx).reshape(-1)
+        rid = torch.arange(rows, device=d.device).unsqueeze(1)
+        flat_idx = (rid * cols + idx).reshape(-1)
     else:
         n = d.numel()
         k = max(1, math.ceil(density * n))
@@ -170,9 +175,12 @@ def _sparsify(d: torch.Tensor, density: float, mode: str):
     else:  # "none": keep fp32 values, sparsify only
         enc = kept.float()
         recon_vals = enc
-    dense = torch.zeros(d.numel(), dtype=torch.float32)
+    dense = torch.zeros(d.numel(), dtype=torch.float32, device=d.device)
     dense[flat_idx] = recon_vals
-    return {"sp": list(d.shape), "i": flat_idx.to(torch.int64), "v": enc}, dense.reshape(d.shape)
+    # int32 indices halve the index wire cost vs int64 (a single module tensor is
+    # always far under 2^31 elements) -- the index is the dominant overhead, so
+    # this roughly doubles the density at which sparsification beats a dense ship.
+    return {"sp": list(d.shape), "i": flat_idx.to(torch.int32), "v": enc}, dense.reshape(d.shape)
 
 
 def compress_delta(delta, mode: str, carry=None, density: float = 1.0):

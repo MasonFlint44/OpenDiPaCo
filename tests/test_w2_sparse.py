@@ -79,6 +79,20 @@ def test_sparse_int8_values_roundtrip():
     assert (recon != 0).sum(dim=1).tolist() == [4, 4, 4, 4]   # top-4 of 8 per row
 
 
+def test_sparsify_stays_on_input_device():
+    """The payload + reconstruction stay on the pseudo-gradient's device (a GPU
+    worker's gradient is on cuda; a CPU arange/zeros would device-mismatch the
+    GPU topk indices). Pins device-consistency -- also runs on cuda if present."""
+    from opendipaco.schedule.compress import _sparsify
+
+    for dev in (["cpu"] + (["cuda"] if torch.cuda.is_available() else [])):
+        d = torch.randn(4, 8, device=dev)
+        payload, recon = _sparsify(d, 0.5, "int8")
+        assert recon.device.type == d.device.type
+        assert payload["i"].device.type == d.device.type
+        assert payload["v"]["q"].device.type == d.device.type
+
+
 def test_malformed_sparse_payload_refused():
     with pytest.raises(TypeError):
         maybe_dequantize([{"sp": [2, 2], "i": torch.tensor([0]), "v": "not a tensor"}])
