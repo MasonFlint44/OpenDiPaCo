@@ -75,6 +75,37 @@ def test_transport_kind_parses_and_validates():
         LaunchConfig.from_dict({"transport": {"kind": "carrier-pigeon"}})
 
 
+def test_libp2p_routes_gate():
+    """W1d: libp2p routing is wired for static sharded mode; rendezvous keeps
+    routing over TCP (epoch records carry TCP addrs) until multiaddr discovery
+    lands, and tcp mode never routes over libp2p."""
+    from opendipaco.launch.roles import _libp2p_routes
+
+    assert _libp2p_routes(LaunchConfig.from_dict({})) is False         # tcp default
+    static = LaunchConfig.from_dict({"transport": {"kind": "libp2p"}})
+    assert _libp2p_routes(static) is True
+    rdv = LaunchConfig.from_dict({"transport": {"kind": "libp2p"},
+                                  "ownership": {"mode": "rendezvous"}})
+    assert _libp2p_routes(rdv) is False                                # routes over TCP
+
+
+def test_scheduler_keeps_multiaddr_ps_addrs(tmp_path):
+    """W1d Fix: a libp2p scheduler's PS addresses are multiaddr strings; routing
+    must pass them through, not tuple() them into per-character shards."""
+    from opendipaco.schedule import Scheduler
+
+    cfg = LaunchConfig.from_dict(_tiny_dict("sharded"))
+    model = dipaco_config(cfg.model)
+    docs = [torch.randint(0, cfg.model.vocab_size, (8,)) for _ in range(8)]
+    assign = torch.tensor([i % model.num_paths for i in range(len(docs))])
+    corpus = ShardedCorpus.from_assignments(docs, assign, model.num_paths, 8)
+    ma = ["/ip4/127.0.0.1/tcp/4001/p2p/Qm1", "/ip4/127.0.0.1/tcp/4002/p2p/Qm2"]
+    sched = Scheduler(model, corpus, ma, diloco_config(cfg.diloco), batch_size=4,
+                      host="127.0.0.1", port=0)
+    assert sched.ps_addrs == ma                       # strings intact, not tupled
+    assert all(v[0] in ma for v in sched._routing.values())
+
+
 def test_load_config_json_and_yaml(tmp_path):
     d = _tiny_dict()
     jp = tmp_path / "c.json"

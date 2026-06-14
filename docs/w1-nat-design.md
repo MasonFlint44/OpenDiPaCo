@@ -48,21 +48,34 @@ and **k≥2 relays** per NAT'd peer.
   load) selects the substrate; `transport.libp2p_listen`, `transport.relays`
   (k≥2), `transport.dcutr`, and `transport.connect_libp2p` (the scheduler
   multiaddr a libp2p worker dials) configure it. A new **`relay` role + CLI**
-  (`opendipaco relay`) stands up a Circuit Relay v2 forwarder. `run_scheduler` /
-  `run_parameter_server` additionally serve over libp2p (the TCP reactor stays
-  the anchor) and a NAT'd owner reserves the configured relays + advertises its
-  circuit addrs; `run_worker_role` runs the libp2p worker loop (sharded only).
-  The `[nat]` extra has its own CI job (`tests/test_p2p.py`).
+  (`opendipaco relay`) stands up a Circuit Relay v2 forwarder. In **static
+  sharded** mode `run_scheduler` / `run_parameter_server` serve over libp2p (the
+  TCP reactor stays the anchor), a NAT'd owner reserves the configured relays +
+  advertises its circuit addrs, and `run_worker_role` runs the libp2p worker
+  loop — addresses flow as multiaddrs (each role prints its own; the operator
+  wires them, like the relay addr), so a manually-addressed cluster routes fully
+  over libp2p. The `[nat]` extra has its own CI job (`tests/test_p2p.py`).
+- *Two launch caveats made explicit (review hardening).* (1) **Access control
+  over libp2p is identity-based**: Noise authenticates the peer, `admitted_peers`
+  authorizes it — the HMAC `auth_key` (the TCP bootstrap secret) does *not* gate
+  the libp2p path, so a libp2p server with no allowlist warns loudly that it
+  accepts any authenticated peer. (2) **libp2p routing is static-mode only**:
+  rendezvous routing derives owner addresses from the tracker/epoch records,
+  which carry TCP addresses today, so `kind: libp2p + ownership.mode: rendezvous`
+  prints a notice and keeps routing over TCP (the parallel libp2p surface is not
+  served, to avoid an inert/misleading endpoint).
 - *End-to-end validation.* `examples/validate_nat.py` stands up a relay + k NAT'd
   owners (reachable *only* via circuit addrs) + a scheduler + workers, all over
   libp2p, and trains to a generation budget through the relay — the runnable
   counterpart to the per-seam unit tests.
 - *Remaining (rides the 0f WAN bring-up, not a W1 bug):* **automatic discovery**
-  of libp2p multiaddrs through the tracker (today a multiaddr is wired explicitly
-  via config/printed addrs, or in-process by the validation script) — the data &
-  control plane over libp2p is proven; only the rendezvous *of* multiaddrs is
-  still manual. Also still 0f-coupled: real NAT/CGNAT traversal + DCUtR success,
-  throughput at scale, and the per-peer lock-dict pruning / owner relay re-home
+  of libp2p multiaddrs through the tracker — i.e. libp2p *rendezvous* routing
+  (today multiaddrs are wired explicitly via config/printed addrs in static mode,
+  or in-process by the validation script); the data & control plane over libp2p
+  is proven, only the rendezvous *of* multiaddrs is manual. Also still
+  0f-coupled: real NAT/CGNAT traversal + DCUtR success, throughput at scale,
+  scheduler→owner **checkpoint** RPCs over libp2p (they still use the TCP
+  `_ps_connect` seam), and the per-peer lock-dict pruning / owner relay re-home
   refinements carried from W1c.
 
 **W1c status (NAT'd owners as a first-class tier):**

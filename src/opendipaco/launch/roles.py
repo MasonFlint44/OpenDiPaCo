@@ -146,6 +146,14 @@ def _serve_libp2p(server, cfg: LaunchConfig, identity=None):
     from ..schedule.p2p import serve_over_libp2p
 
     ident = _node_identity(cfg, identity, generate=True)
+    # Access control over libp2p is *identity-based* (Noise authenticates the
+    # peer; admitted_peers authorizes it). The HMAC auth_key -- the TCP bootstrap
+    # secret -- does NOT gate the libp2p path, so a server with no allowlist
+    # accepts any authenticated peer. Warn loudly rather than silently open up.
+    if getattr(server, "admitted_peers", None) is None:
+        print("WARNING: transport.kind: libp2p with no transport.admitted_peers -- "
+              "any authenticated peer is accepted (the HMAC auth_key does not gate "
+              "libp2p). Set transport.admitted_peers to restrict access.", flush=True)
     t = serve_over_libp2p(
         server, identity=ident, listen_addrs=tuple(cfg.transport.libp2p_listen),
         require_identity=True, dcutr=cfg.transport.dcutr,
@@ -153,6 +161,23 @@ def _serve_libp2p(server, cfg: LaunchConfig, identity=None):
     for relay in cfg.transport.relays:        # k>=2 for failover (D6)
         t.reserve_on(relay)
     return t
+
+
+def _libp2p_routes(cfg: LaunchConfig) -> bool:
+    """Whether this role should actually serve + route over libp2p. Rendezvous
+    routing derives owner addresses from the tracker/epoch records, which carry
+    TCP addresses today (not multiaddrs), so serving libp2p there would be inert.
+    libp2p routing is wired for **static** sharded mode (manual multiaddrs);
+    libp2p rendezvous (tracker-multiaddr discovery) rides the 0f WAN run."""
+    if cfg.transport.kind != "libp2p":
+        return False
+    if cfg.ownership.mode == "rendezvous":
+        print("NOTE: transport.kind: libp2p + ownership.mode: rendezvous -- routing "
+              "still uses TCP addresses from the tracker (libp2p multiaddr discovery "
+              "is not yet wired); use static sharded mode for libp2p routing.",
+              flush=True)
+        return False
+    return True
 
 
 def _node_identity(cfg: LaunchConfig, identity=None, *, generate=False):
@@ -307,9 +332,16 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None, identity=N
     ident = _node_identity(cfg, identity, generate=rendezvous)
     if rendezvous:
         addrs = []
+    elif ps_addrs is not None:
+        addrs = ps_addrs
+    elif cfg.transport.kind == "libp2p":
+        # libp2p PS addrs are multiaddr strings (each owner prints its own); pass
+        # them through untouched -- tupling them would shred the string.
+        addrs = list(cfg.sharded.parameter_servers)
+        if not addrs:
+            raise ValueError("sharded libp2p mode needs sharded.parameter_servers (multiaddrs)")
     else:
-        addrs = (ps_addrs if ps_addrs is not None
-                 else [tuple(a) for a in cfg.sharded.parameter_servers])
+        addrs = [tuple(a) for a in cfg.sharded.parameter_servers]
         if not addrs:
             raise ValueError("sharded mode needs sharded.parameter_servers (or ps_addrs)")
     scheduler = Scheduler(
@@ -323,7 +355,7 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None, identity=N
         idle_backoff=cfg.transport.idle_backoff,
         **_scheduler_robustness_kw(cfg), **_server_kw(cfg, extra_admitted))
     scheduler.start()
-    lp = _serve_libp2p(scheduler, cfg, ident)   # also serve over libp2p (kind: libp2p)
+    lp = _serve_libp2p(scheduler, cfg, ident) if _libp2p_routes(cfg) else None
     if lp is not None:
         print(f"scheduler libp2p addrs: {lp.addrs}", flush=True)
     _attach_metrics(scheduler, cfg)
@@ -406,7 +438,7 @@ def run_parameter_server(cfg: LaunchConfig, shard_id: int = 0, *, port=None,
         ps = ParameterServer(model, owned, diloco, port=_ps_port(cfg, shard_id, port),
                              **common, **_server_kw(cfg, extra_admitted))
         ps.start()
-    lp = _serve_libp2p(ps, cfg, node_ident or identity)   # also serve over libp2p
+    lp = _serve_libp2p(ps, cfg, node_ident or identity) if _libp2p_routes(cfg) else None
     if lp is not None:
         addrs = lp.circuit_addrs or lp.addrs   # advertise relay addrs for a NAT'd owner
         print(f"owner libp2p addrs: {addrs}", flush=True)

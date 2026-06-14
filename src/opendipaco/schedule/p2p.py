@@ -335,7 +335,10 @@ class Libp2pTransport:
             except Exception:  # noqa: BLE001 -- an optimization; relay stays as fallback
                 pass
 
-        self._nursery.start_soon(_punch)
+        try:
+            self._nursery.start_soon(_punch)
+        except RuntimeError:
+            pass  # nursery closing (shutdown race) -- skip the punch, keep the RPC
 
     @staticmethod
     def _remote_peer_id(stream) -> str | None:
