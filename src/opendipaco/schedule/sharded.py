@@ -2028,7 +2028,6 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
     warm: set = set()
     shard_cache: dict = {}
     versions: dict = {}          # shared key -> held version
-    ps_conns: dict = {}          # (host, port) -> connected socket
     residuals: dict = {}         # path -> {key: [tensors]}: compression error feedback
     data_ctx = {"dir": data_dir, "source": data_source, "tokenizer": data_tokenizer}
     caps = {"device": str(device)}
@@ -2046,60 +2045,40 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
         except ConnectionError:
             return  # scheduler unreachable
         first = False
+        # One link per scheduler connection: it owns the PS connection cache, so
+        # a reconnect naturally drops stale PS sockets (fresh link next loop).
+        link = _WorkerLink(sch, auth_key=auth_key, max_msg_bytes=max_msg_bytes,
+                           connect_timeout=connect_timeout, tls=tls)
         clean = False
         try:
-            clean = _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions,
-                                   ps_conns, residuals, data_ctx, caps, state, auth_key,
-                                   max_msg_bytes, connect_timeout, heartbeat_interval,
-                                   poll_interval, max_tasks, fault_hook, tls=tls)
+            clean = _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions,
+                                   residuals, data_ctx, caps, state, heartbeat_interval,
+                                   poll_interval, max_tasks, fault_hook)
         except (OSError, ConnectionError):
             clean = False  # disconnected -> reconnect (if enabled)
         finally:
+            link.close()
             try:
                 sch.close()
             except OSError:
                 pass
         if clean or not reconnect:
-            for s in ps_conns.values():
-                try:
-                    s.close()
-                except OSError:
-                    pass
             return
-        # Reconnect: drop stale PS sockets; they reconnect lazily next task.
-        for s in ps_conns.values():
-            try:
-                s.close()
-            except OSError:
-                pass
-        ps_conns.clear()
         time.sleep(backoff)
         backoff = min(backoff * 2, 1.0)
 
 
-def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_conns,
-                   residuals, data_ctx, caps, state, auth_key, max_msg_bytes,
-                   connect_timeout, heartbeat_interval, poll_interval, max_tasks,
-                   fault_hook, *, tls=None) -> bool:
+def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions,
+                   residuals, data_ctx, caps, state, heartbeat_interval, poll_interval,
+                   max_tasks, fault_hook) -> bool:
     """One scheduler connection: serve tasks. Returns True on a clean finish (stop /
-    budget), raises ``OSError`` on a disconnect (so the caller can reconnect)."""
-    send_lock = threading.Lock()
-
-    def sch_send(m):
-        with send_lock:
-            send_msg(sch, m)
-
-    def ps_sock(addr):
-        if addr not in ps_conns:
-            ps_conns[addr] = _ps_connect(addr, auth_key, max_msg_bytes, connect_timeout,
-                                         tls=tls, server_hostname=addr[0])
-        return ps_conns[addr]
-
+    budget), raises ``OSError`` on a disconnect (so the caller can reconnect). All
+    peer comms go through ``link`` (the transport seam), so TCP and libp2p share
+    this loop verbatim."""
     while True:
-        sch_send({"type": "request", "worker_id": wid,
-                  "warm_paths": list(warm), "cached_shards": list(shard_cache),
-                  "capabilities": caps})
-        task = recv_msg(sch, max_msg_bytes)
+        task = link.sch_rpc({"type": "request", "worker_id": wid,
+                             "warm_paths": list(warm), "cached_shards": list(shard_cache),
+                             "capabilities": caps})
         if task is None:
             raise OSError("scheduler disconnected")  # not a clean stop -> reconnect
         if task["type"] == "stop":
@@ -2131,7 +2110,8 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
             must serve those exact versions; an aged-out pin can't be reproduced,
             so it raises ``_CheckAborted`` and the caller abstains."""
             pending = {
-                k: [a for a in addrs if a in ps_conns] + [a for a in addrs if a not in ps_conns]
+                k: [a for a in addrs if link.connected(a)]
+                + [a for a in addrs if not link.connected(a)]
                 for k, addrs in routing.items()
             }
             while pending:
@@ -2143,11 +2123,10 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
                 if pin:
                     req["pin"] = {k: list(pin[k]) for k in batch if k in pin}
                 try:
-                    reply = _rpc(ps_sock(addr), req, max_msg_bytes)
+                    reply = link.ps_rpc(addr, req)
                     if reply is None:
                         raise OSError(f"replica {addr} closed")
                 except (OSError, ConnectionError):
-                    ps_conns.pop(addr, None)
                     for k in batch:
                         pending[k] = pending[k][1:]
                         if not pending[k]:
@@ -2198,23 +2177,22 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
                         by_owner.setdefault(routing[k][0], {})[k] = sd
                 for addr, states in by_owner.items():
                     try:
-                        _rpc(ps_sock(addr),
-                             {"type": "private_proposal", "private": states,
-                              "grant": task.get("grant")}, max_msg_bytes)
+                        link.ps_rpc(addr, {"type": "private_proposal", "private": states,
+                                           "grant": task.get("grant")})
                     except (OSError, ConnectionError):
-                        ps_conns.pop(addr, None)  # owner away; corroboration just waits
+                        pass  # owner away; corroboration just waits (link drops the conn)
             engine._opt_state.pop(path, None)  # leave no warm trace of the check
-            ack = _rpc_send(sch, send_lock, max_msg_bytes,
-                            {"type": "commit", "check_only": True, "path": path,
-                             "worker_id": wid, "lease": lease, "digest": digest,
-                             "gen_id": task["gen_id"]})
+            ack = link.sch_rpc({"type": "commit", "check_only": True, "path": path,
+                                "worker_id": wid, "lease": lease, "digest": digest,
+                                "gen_id": task["gen_id"]})
             if ack is None:
                 raise OSError("scheduler disconnected during check commit")
             continue
 
         stop_beat = threading.Event()
         beat = threading.Thread(target=_sch_heartbeat,
-                                args=(sch_send, stop_beat, heartbeat_interval, wid, lease, path),
+                                args=(link.sch_send, stop_beat, heartbeat_interval, wid,
+                                      lease, path),
                                 daemon=True)
         beat.start()
         base, digest = None, None
@@ -2239,7 +2217,7 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
                   "loss": contrib.loss, "empty": contrib.empty}
         if audit:
             commit["digest"], commit["base"] = digest, base
-        ack = _rpc_send(sch, send_lock, max_msg_bytes, commit)
+        ack = link.sch_rpc(commit)
         if ack is None:
             raise OSError("scheduler disconnected during commit")
         if ack.get("accepted"):
@@ -2251,16 +2229,7 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
             )
             _commit_residuals(residuals, path, pending_res)
 
-            def drop_conn(addr):
-                s = ps_conns.pop(addr, None)
-                if s is not None:
-                    try:
-                        s.close()
-                    except OSError:
-                        pass
-
-            failed = _push_group(routing, grant, shared_payload, private_payload,
-                                 ps_sock, drop_conn, max_msg_bytes)
+            failed = _push_group(routing, grant, shared_payload, private_payload, link)
             if failed:
                 # The epoch moved under this task: the old primary refused (or
                 # died). The scheduler already accepted the commit, so re-route
@@ -2268,16 +2237,14 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
                 # grant once (it is single-use per server, so a new primary
                 # accepts it). A second failure drops the update -- the
                 # documented bounded-loss window.
-                fresh = _rpc_send(sch, send_lock, max_msg_bytes,
-                                  {"type": "routing", "path": path})
+                fresh = link.sch_rpc({"type": "routing", "path": path})
                 if fresh is None:
                     raise OSError("scheduler disconnected during push retry")
                 fresh_routing = fresh.get("routing") or {}
                 retry = {k: [_addr_key(a) for a in fresh_routing[k]]
                          for k in failed if k in fresh_routing}
                 if retry:
-                    _push_group(retry, grant, shared_payload, private_payload,
-                                ps_sock, drop_conn, max_msg_bytes)
+                    _push_group(retry, grant, shared_payload, private_payload, link)
             engine._opt_state[path] = contrib.opt_state          # warm-back
             _load_private(engine, contrib.private_state)
             warm.add(path)
@@ -2287,9 +2254,8 @@ def _serve_sharded(sch, engine, worker, wid, warm, shard_cache, versions, ps_con
         # rejected -> discard the contribution; warm caches stay
 
 
-def _push_group(routing, grant, shared_payload, private_payload, ps_sock, drop_conn,
-                max_msg_bytes) -> set:
-    """Push each key's update to its primary (``routing[k][0]``).
+def _push_group(routing, grant, shared_payload, private_payload, link) -> set:
+    """Push each key's update to its primary (``routing[k][0]``) via the link.
 
     Returns the keys whose update did **not** land for a retryable reason:
     the server refused them as ``not_primary`` (the worker's routing is from
@@ -2308,13 +2274,10 @@ def _push_group(routing, grant, shared_payload, private_payload, ps_sock, drop_c
         if not updates and not private:
             continue
         try:
-            reply = _rpc(ps_sock(addr),
-                         {"type": "push", "grant": grant, "updates": updates,
-                          "private": private},
-                         max_msg_bytes)
+            reply = link.ps_rpc(addr, {"type": "push", "grant": grant,
+                                       "updates": updates, "private": private})
         except (OSError, ConnectionError):
-            drop_conn(addr)
-            failed |= set(updates) | set(private)
+            failed |= set(updates) | set(private)   # link drops the stale conn itself
             continue
         if reply and reply.get("reason") == "not_primary":
             failed |= set(reply.get("skipped") or [])
@@ -2355,6 +2318,67 @@ def _rpc_send(sock, lock, max_msg_bytes, msg):
     with lock:
         send_msg(sock, msg)
         return recv_msg(sock, max_msg_bytes)
+
+
+class _WorkerLink:
+    """The worker's comm seam to the scheduler + parameter servers (W1b step 2).
+
+    A persistent request/reply channel to the scheduler (``sch_rpc``) with a
+    fire-and-forget path for heartbeats (``sch_send``), plus a connection-cached
+    request/reply to each parameter server (``ps_rpc``). This TCP implementation
+    preserves today's behavior exactly (same sockets, same ``send_lock``-serialized
+    writes, same ``_ps_connect`` cache, same drop-on-error); the libp2p
+    implementation (W1b step 3) swaps the byte pipe without touching the worker
+    loop, which now speaks only to this seam."""
+
+    def __init__(self, sch_sock, *, auth_key, max_msg_bytes, connect_timeout, tls=None):
+        self._sch = sch_sock
+        self._lock = threading.Lock()
+        self._auth = auth_key
+        self._max = max_msg_bytes
+        self._timeout = connect_timeout
+        self._tls = tls
+        self._ps: dict = {}   # addr_key -> connected socket
+
+    def sch_send(self, msg) -> None:
+        with self._lock:
+            send_msg(self._sch, msg)
+
+    def sch_rpc(self, msg):
+        with self._lock:                      # serialize writes; heartbeat waits its turn
+            send_msg(self._sch, msg)
+            return recv_msg(self._sch, self._max)
+
+    def connected(self, addr) -> bool:
+        return addr in self._ps
+
+    def ps_rpc(self, addr, msg):
+        sock = self._ps.get(addr)
+        if sock is None:
+            sock = _ps_connect(addr, self._auth, self._max, self._timeout,
+                               tls=self._tls, server_hostname=addr[0])
+            self._ps[addr] = sock
+        try:
+            return _rpc(sock, msg, self._max)
+        except (OSError, ConnectionError):
+            self._drop(addr)               # stale socket -> reconnect lazily next call
+            raise
+
+    def _drop(self, addr) -> None:
+        s = self._ps.pop(addr, None)
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        for s in self._ps.values():
+            try:
+                s.close()
+            except OSError:
+                pass
+        self._ps.clear()
 
 
 def _sch_heartbeat(sch_send, stop_beat, interval, wid, lease, path):

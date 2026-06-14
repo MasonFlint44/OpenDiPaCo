@@ -195,7 +195,7 @@ def test_stale_routing_push_retried_to_new_primary():
     old primary refuses (``not_primary``) or is dead, the worker re-resolves
     routing from the scheduler, and re-presents the same grant to the new
     primary (grants are single-use *per server*, so this is sound)."""
-    from opendipaco.schedule.sharded import DEFAULT_MAX_MSG_BYTES, _ps_connect, _push_group
+    from opendipaco.schedule.sharded import DEFAULT_MAX_MSG_BYTES, _WorkerLink, _push_group
 
     cfg = _cfg()
     sched_id = PeerIdentity.generate()
@@ -211,17 +211,8 @@ def test_stale_routing_push_retried_to_new_primary():
     rec_by_id = {ida.peer_id: recs[0], idb.peer_id: recs[1]}
     sched = Scheduler(cfg, _corpus(cfg), [], _diloco(), batch_size=BATCH,
                       host="127.0.0.1", port=0, identity=sched_id, auth_key="t")
-    socks: dict = {}
-
-    def ps_sock(addr):
-        if addr not in socks:
-            socks[addr] = _ps_connect(addr, "t", DEFAULT_MAX_MSG_BYTES, 5.0)
-        return socks[addr]
-
-    def drop_conn(addr):
-        s = socks.pop(addr, None)
-        if s is not None:
-            s.close()
+    link = _WorkerLink(None, auth_key="t", max_msg_bytes=DEFAULT_MAX_MSG_BYTES,
+                       connect_timeout=5.0)
 
     try:
         epoch0 = sched.publish_epoch(recs, k=1)
@@ -250,35 +241,30 @@ def test_stale_routing_push_retried_to_new_primary():
 
         # Stale push -> old refuses as not_primary -> retry against fresh routing.
         grant = make_grant(path, [key], 1.0, "tok-retry-1")
-        failed = _push_group(stale, grant, {key: grads}, {}, ps_sock, drop_conn,
-                             DEFAULT_MAX_MSG_BYTES)
+        failed = _push_group(stale, grant, {key: grads}, {}, link)
         assert failed == {key}
         assert new._versions[key][1] == 0        # nothing landed yet
         fresh = sched._handle({"type": "routing", "path": list(path)}, 0)
         assert fresh["epoch"] == 1
         retry = {k: [tuple(x) for x in v] for k, v in fresh["routing"].items() if k in failed}
         assert retry[key][0] == ("127.0.0.1", new.port)
-        assert _push_group(retry, grant, {key: grads}, {}, ps_sock, drop_conn,
-                           DEFAULT_MAX_MSG_BYTES) == set()
+        assert _push_group(retry, grant, {key: grads}, {}, link) == set()
         assert new._versions[key] == (1, 1)      # landed on the promoted primary
 
         # Dead-primary flavor: the old primary is gone entirely; the push
         # fails on connect, and the same retry path lands the update.
         old.shutdown()
-        drop_conn(("127.0.0.1", old.port))
+        link._drop(("127.0.0.1", old.port))
         grant2 = make_grant(path, [key], 1.0, "tok-retry-2")
-        failed = _push_group(stale, grant2, {key: grads}, {}, ps_sock, drop_conn,
-                             DEFAULT_MAX_MSG_BYTES)
+        failed = _push_group(stale, grant2, {key: grads}, {}, link)
         assert failed == {key}
-        assert _push_group(retry, grant2, {key: grads}, {}, ps_sock, drop_conn,
-                           DEFAULT_MAX_MSG_BYTES) == set()
+        assert _push_group(retry, grant2, {key: grads}, {}, link) == set()
         assert new._versions[key] == (1, 2)
     finally:
+        link.close()
         sched.shutdown()
         for ps in pss:
             ps.shutdown()
-        for s in socks.values():
-            s.close()
 
 
 def test_scheduler_restart_resumes_epoch_numbering(tmp_path):
