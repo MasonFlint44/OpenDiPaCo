@@ -461,7 +461,11 @@ def run_parameter_server(cfg: LaunchConfig, shard_id: int = 0, *, port=None,
         ps = ParameterServer(model, owned, diloco, port=_ps_port(cfg, shard_id, port),
                              **common, **_server_kw(cfg, extra_admitted))
         ps.start()
-    lp = _serve_libp2p(ps, cfg, node_ident or identity) if _libp2p_routes(cfg) else None
+    try:
+        lp = _serve_libp2p(ps, cfg, node_ident or identity) if _libp2p_routes(cfg) else None
+    except Exception:
+        ps.shutdown()   # don't leak the started TCP reactor if libp2p bring-up fails
+        raise
     if lp is not None:
         addrs = lp.circuit_addrs or lp.addrs   # advertise relay addrs for a NAT'd owner
         print(f"owner libp2p addrs: {addrs}", flush=True)
