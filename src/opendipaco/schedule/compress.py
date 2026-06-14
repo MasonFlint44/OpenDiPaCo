@@ -276,8 +276,20 @@ def maybe_dequantize(items) -> list[torch.Tensor]:
                 vals = v.to(torch.float32)
             else:
                 raise TypeError(f"not a sparse-payload value: {type(v)}")
-            dense = torch.zeros(int(torch.tensor(shape).prod()), dtype=torch.float32)
-            dense[it["i"].to(torch.int64)] = vals
+            # Validate before scattering: a Byzantine peer (valid grant) could craft
+            # out-of-bounds / mismatched indices, whose scatter would raise an
+            # *uncaught* IndexError/RuntimeError and crash the handler. Refuse as a
+            # ValueError (which the push path treats as an invalid push).
+            if any(s < 0 for s in shape):
+                raise ValueError("sparse payload: negative shape dim")
+            n = math.prod(shape)
+            idx, vals = it["i"].to(torch.int64).reshape(-1), vals.reshape(-1)
+            if idx.numel() != vals.numel():
+                raise ValueError("sparse payload: index/value length mismatch")
+            if idx.numel() and (int(idx.min()) < 0 or int(idx.max()) >= n):
+                raise ValueError("sparse payload: index out of range")
+            dense = torch.zeros(n, dtype=torch.float32)
+            dense[idx] = vals
             out.append(dense.reshape(shape))
         else:
             raise TypeError(f"not a pseudo-gradient tensor: {type(it)}")

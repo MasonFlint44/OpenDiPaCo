@@ -94,8 +94,51 @@ def test_sparsify_stays_on_input_device():
 
 
 def test_malformed_sparse_payload_refused():
+    """A Byzantine peer (valid grant) must not crash the owner with a crafted
+    sparse payload: bad value type, out-of-bounds / mismatched indices, or a
+    negative shape all raise a *caught* TypeError/ValueError, not an uncaught
+    IndexError/RuntimeError from the scatter (the push path treats these as an
+    invalid push)."""
     with pytest.raises(TypeError):
         maybe_dequantize([{"sp": [2, 2], "i": torch.tensor([0]), "v": "not a tensor"}])
+    with pytest.raises(ValueError):                                  # index >= numel
+        maybe_dequantize([{"sp": [2, 2], "i": torch.tensor([99]), "v": torch.tensor([1.0])}])
+    with pytest.raises(ValueError):                                  # negative index
+        maybe_dequantize([{"sp": [2, 2], "i": torch.tensor([-1]), "v": torch.tensor([1.0])}])
+    with pytest.raises(ValueError):                                  # length mismatch
+        maybe_dequantize([{"sp": [2, 2], "i": torch.tensor([0, 1]), "v": torch.tensor([1.0])}])
+    with pytest.raises(ValueError):                                  # negative shape dim
+        maybe_dequantize([{"sp": [-1, 2], "i": torch.tensor([0]), "v": torch.tensor([1.0])}])
+
+
+def test_owner_rejects_malformed_sparse_push_without_crashing():
+    """End to end: an owner served a crafted out-of-bounds sparse push (with a
+    valid grant) rejects it (applied=False) and keeps serving -- the decode
+    ValueError is caught by the push path, not an uncaught scatter crash."""
+    from opendipaco import BackboneConfig, DiLoCoConfig, DiPaCoConfig
+    from opendipaco.schedule import ParameterServer, make_grant
+    from opendipaco.topology import is_private_key
+
+    bb = BackboneConfig(vocab_size=48, hidden_size=32, num_attention_heads=4,
+                        intermediate_size=64, layers_per_level=[1, 1],
+                        max_position_embeddings=64)
+    cfg = DiPaCoConfig(backbone=bb, level_sizes=[2, 2], sequence_length=16)
+    keys = sorted(cfg.build_topology().module_keys())
+    shared = next(k for k in keys if not is_private_key(k))
+    path = cfg.build_topology().path_from_index(0)
+    ps = ParameterServer(cfg, keys, DiLoCoConfig(inner_steps=2), host="127.0.0.1",
+                         port=0, grant_key="s")
+    try:
+        nparams = len(list(ps.bank[shared].parameters()))
+        bad = [{"sp": [4], "i": torch.tensor([9999]), "v": torch.tensor([1.0])}
+               for _ in range(nparams)]
+        grant = make_grant(path, [shared], 1.0, "tok", grant_key="s")
+        r = ps._push({"grant": grant, "updates": {shared: {"grad": bad}}})
+        assert r["applied"] is False              # rejected, not crashed
+        # The owner still serves a normal fetch afterward.
+        assert ps._fetch({"keys": [shared], "have": {}})["versions"][shared] == (0, 0)
+    finally:
+        ps.shutdown()
 
 
 def test_run_local_sharded_trains_with_sparse_up():
@@ -111,6 +154,29 @@ def test_run_local_sharded_trains_with_sparse_up():
         "diloco": {"inner_steps": 4, "inner_lr": 1e-3},
         "data": {"source": "synthetic", "num_documents": 64},
         "transport": {"compress": "int8", "up_density": 0.25},
+        "sharded": {"num_shards": 2, "parameter_servers": [["127.0.0.1", 0], ["127.0.0.1", 0]]},
+        "run": {"generations": 2, "batch_size": 8, "local_workers": 2},
+    })
+    server, completed = run_local(cfg)
+    assert sum(completed.values()) >= 2 * cfg.model.level_sizes[0] * cfg.model.level_sizes[1]
+    assert server.metrics.accepted_updates > 0
+
+
+def test_delta_down_and_sparse_up_compose():
+    """Both bandwidth levers on at once (the real deployment config): delta-down
+    on the weights AND sparsified pseudo-gradients up. They are orthogonal
+    directions sharing no state, but train end to end together."""
+    from opendipaco.launch import run_local
+    from opendipaco.launch.config import LaunchConfig
+
+    cfg = LaunchConfig.from_dict({
+        "mode": "sharded",
+        "model": {"vocab_size": 64, "hidden_size": 32, "num_attention_heads": 4,
+                  "intermediate_size": 64, "max_position_embeddings": 64,
+                  "layers_per_level": [1, 1], "level_sizes": [2, 2], "sequence_length": 16},
+        "diloco": {"inner_steps": 4, "inner_lr": 1e-3},
+        "data": {"source": "synthetic", "num_documents": 64},
+        "transport": {"compress": "int8", "down": "delta", "up_density": 0.25},
         "sharded": {"num_shards": 2, "parameter_servers": [["127.0.0.1", 0], ["127.0.0.1", 0]]},
         "run": {"generations": 2, "batch_size": 8, "local_workers": 2},
     })
