@@ -520,6 +520,22 @@ class ParameterServer(_ReactorServer):
                 return False
         return True
 
+    def _private_well_shaped_locked(self, private) -> bool:
+        """Every private state-dict must match its module's keys and tensor
+        shapes, so a malformed push is refused rather than crashing the strict
+        ``load_state_dict`` in ``_load_into`` (dtype is free -- it casts)."""
+        for k, sd in private.items():
+            mod = self.bank.get(k)
+            if mod is None:
+                continue
+            if not isinstance(sd, dict):
+                return False
+            ref = mod.state_dict()
+            if set(sd) != set(ref) or any(
+                    not torch.is_tensor(sd[n]) or sd[n].shape != ref[n].shape for n in ref):
+                return False
+        return True
+
     def _down_payload_locked(self, key, have_version):
         """The downlink weights for a stale shared key (W2a). In ``down="delta"``
         mode, if the worker's keyframe (``have_version``) is still in the version
@@ -567,6 +583,9 @@ class ParameterServer(_ReactorServer):
         token, allowed = grant["token"], set(grant["keys"])
         applied = []
         with self._lock:
+            if not self._private_well_shaped_locked(states):  # malformed -> no crash on apply
+                self.metrics.record_invalid_reject()
+                return {"type": "ack", "applied": False}
             if token in self._seen_grants:
                 return {"type": "ack", "applied": False}  # replay -> no double vote
             self._seen_grants[token] = True
@@ -1321,7 +1340,8 @@ class ParameterServer(_ReactorServer):
             # broadcast-corrupt or crash apply_outer_grads (which blindly assigns
             # p.grad = d). Reject the whole push on either.
             if not (all_finite(updates) and all_finite(private)
-                    and self._grads_well_shaped_locked(updates)):
+                    and self._grads_well_shaped_locked(updates)
+                    and self._private_well_shaped_locked(private)):
                 self.metrics.record_invalid_reject()
                 return {"type": "ack", "applied": False}
             for k, grad in updates.items():

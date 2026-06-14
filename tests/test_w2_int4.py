@@ -138,6 +138,36 @@ def test_owner_rejects_wrong_shaped_grad_push():
         ps.shutdown()
 
 
+def test_private_state_shape_guard():
+    """A malformed private state-dict (wrong shape / missing key / non-dict) is
+    refused, so the strict load_state_dict in _load_into can't crash the owner.
+    The symmetric twin of the grad-shape guard."""
+    from opendipaco import BackboneConfig, DiLoCoConfig, DiPaCoConfig
+    from opendipaco.schedule import ParameterServer
+    from opendipaco.topology import is_private_key
+
+    bb = BackboneConfig(vocab_size=48, hidden_size=32, num_attention_heads=4,
+                        intermediate_size=64, layers_per_level=[1, 1],
+                        max_position_embeddings=64)
+    cfg = DiPaCoConfig(backbone=bb, level_sizes=[2, 2], sequence_length=16,
+                       embedding="private")            # gives a private module
+    keys = sorted(cfg.build_topology().module_keys())
+    priv = next(k for k in keys if is_private_key(k))
+    ps = ParameterServer(cfg, keys, DiLoCoConfig(inner_steps=2), host="127.0.0.1", port=0)
+    try:
+        ref = ps.bank[priv].state_dict()
+        assert ps._private_well_shaped_locked({priv: ref}) is True       # honest
+        n0 = next(iter(ref))
+        assert ps._private_well_shaped_locked(
+            {priv: {**ref, n0: torch.zeros(3)}}) is False                # wrong shape
+        assert ps._private_well_shaped_locked(
+            {priv: {n: v for n, v in ref.items() if n != n0}}) is False  # missing key
+        assert ps._private_well_shaped_locked({priv: "nope"}) is False   # not a dict
+        assert ps._private_well_shaped_locked({"unknown": "x"}) is True  # not ours -> skip
+    finally:
+        ps.shutdown()
+
+
 def test_run_local_sharded_trains_with_int4():
     """A full sharded cluster with compress="int4" trains to budget -- int4
     pseudo-gradients/deltas still carry the signal."""
