@@ -104,7 +104,15 @@ in-process — the data/control plane over libp2p is proven, only the rendezvous
 *of* addresses is still manual), plus real NAT/CGNAT + DCUtR-success measurement
 and throughput at scale, which need the multi-node §0f run.
 
-### W2 · Bandwidth: delta encoding + sparsification + lower-bit quant · B0 · [eng + research]
+### W2 · Bandwidth: delta encoding + sparsification + lower-bit quant · B0 · [eng + research] · **W2a landed**
+
+Design + per-slice status in [w2-bandwidth-design.md](w2-bandwidth-design.md).
+**W2a (delta-down) landed**: `transport.down: delta` ships int8 `current −
+keyframe` weights (keyframe + non-chained deltas bound the quant error; owner
+version ring + full fallback), off by default, byte-identical when `full`, with a
+converging `delta-down` arm in `validate_dynamics.py`. Remaining: **W2b**
+structured sparsification of up pseudo-gradients, **W2c** sub-int8 (int4 +
+per-group), and the `inner_steps` docs lever. WAN §0f stays the final verdict.
 
 Phase 0c got ~2× down / 4× up, but the "ship only changed weights" cache is
 **structurally defeated in async mode** (every accepted contribution bumps the

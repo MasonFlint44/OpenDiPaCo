@@ -1,6 +1,30 @@
 # W2 design — bandwidth: delta encoding + sparsification + sub-int8
 
-Status: **design; no slices landed yet.** W2 (from [viability-roadmap.md](viability-roadmap.md))
+Status: **W2a landed; W2b/W2c/docs pending.** W2 (from [viability-roadmap.md](viability-roadmap.md))
+
+**W2a status (delta-down):**
+- *Delta-down works end to end.* `down="delta"` (scheduler + owners; default
+  `full` is byte-identical): the owner ships `current − keyframe` int8 against the
+  exact bytes the worker holds (`_down_payload_locked`, reusing the version ring
+  `_history`/`_pinned_state_locked`), falling back to a **full** ship (a new
+  keyframe) when the worker's keyframe ages out of the ring. The worker keeps one
+  keyframe baseline per shared key, sends the **keyframe** version in `have`, and
+  reconstructs `keyframe + dequant(delta)` (`compress.encode_state_delta`/
+  `apply_state_delta`); its trained-against version (the push `base`) stays the
+  nominal current, so staleness is unaffected. Payloads are self-describing
+  (`{"__delta__","base","tensors"}`), so a full-mode owner and a delta-mode worker
+  interoperate. `examples/validate_dynamics.py` gained a `delta-down` arm (lands
+  ~0.8× the anchor at toy scale — converges).
+- *Deviation from D4 — owner-side error feedback is NOT carried (yet).* The design
+  imagined folding the down-quant residual into the next delta. But an owner
+  serves many workers at **different keyframes**, so a single per-key residual is
+  incoherent (it would mix recipients), and a per-(key, keyframe, recipient)
+  residual is heavy and short-lived. Since the keyframe scheme already bounds the
+  error to a **single, non-accumulating** int8 step (D2), W2a ships without
+  owner-side error feedback; revisit only if the §0f run shows the within-window
+  error matters. The worker-side *up-path* error feedback is unchanged.
+
+
 removes the second big *practical* wall to consumer-hardware training:
 **bandwidth**. Phase 0c got ~2× down / 4× up with `compress.py` (bf16 weights
 down, int8 pseudo-gradients up with error feedback), but the "ship only changed
@@ -125,14 +149,14 @@ keyed by `(key, keyframe_version)` and dropped when the key leaves the path's
 resident set. Net worker cost: ~one bf16 copy of the path in host RAM.
 
 ### D4. Delta encoding reuses the pseudo-gradient quantizer + error feedback
-A delta is "a small-magnitude tensor list," exactly what `compress_delta`
-already handles (symmetric int8, `{"q","s"}`, residual). W2a reuses it: the
-**owner** quantizes the down-delta and carries the per-key residual into the next
-delta *to the same keyframe* (error feedback within a keyframe window), so the
-within-window reconstruction converges toward exact rather than sitting at the
-quant floor. Payloads stay self-describing (`{"d": <int8payload>, "base":
-<version>}`), so `maybe_dequantize` gains a delta-apply branch and refuses
-malformed input as today.
+A delta is "a small-magnitude tensor list," exactly what the int8 quantizer
+already handles (symmetric int8, `{"q","s"}`). W2a reuses it via
+`encode_state_delta`/`apply_state_delta`; payloads stay self-describing
+(`{"__delta__","base","tensors"}`) and `apply_state_delta` refuses malformed
+input as today. *(Owner-side error feedback was designed here but is **not**
+carried in W2a — an owner serves many workers at different keyframes, so a single
+per-key residual is incoherent; the keyframe scheme already bounds the error to a
+non-accumulating single step. See the W2a status note above.)*
 
 ### D5. Down-compression becomes a negotiated policy, additive to `compress`
 `compress` (`none|bf16|int8`) keeps its current meaning (it governs the *up*

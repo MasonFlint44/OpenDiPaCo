@@ -128,6 +128,12 @@ class TransportCfg:
     # Wire compression: "none" (fp32, default), "bf16" (2x), or "int8"
     # (bf16 weights + int8 pseudo-gradients with error feedback, ~4x up).
     compress: str = "none"
+    # Downlink (weights) policy (W2; docs/w2-bandwidth-design.md): "full"
+    # (default, byte-identical) re-ships full weights; "delta" ships int8
+    # current-minus-keyframe when the worker holds a recent keyframe (the async
+    # cache the version churn defeats). Changes numerics -> off by default;
+    # validate with examples/validate_dynamics.py. Set on the scheduler AND owners.
+    down: str = "full"
     # When set, idle replies tell workers to wait this many seconds before
     # polling again (server-paced; otherwise workers use their own tight poll).
     idle_backoff: float | None = None
@@ -321,6 +327,9 @@ class LaunchConfig:
         if kw["transport"].kind not in ("tcp", "libp2p"):
             raise ValueError(
                 f"transport.kind must be 'tcp' or 'libp2p', got {kw['transport'].kind!r}")
+        if kw["transport"].down not in ("full", "delta"):
+            raise ValueError(
+                f"transport.down must be 'full' or 'delta', got {kw['transport'].down!r}")
         # Decentralized scheduling is built on the replicated owner tier, so it
         # requires rendezvous ownership (Phase 4 D9). Catch the mismatch at load
         # rather than half-wiring a run with no owners to mint grants.

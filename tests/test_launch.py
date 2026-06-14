@@ -75,6 +75,14 @@ def test_transport_kind_parses_and_validates():
         LaunchConfig.from_dict({"transport": {"kind": "carrier-pigeon"}})
 
 
+def test_transport_down_parses_and_validates():
+    """W2a: transport.down selects the weights downlink policy (full default)."""
+    assert LaunchConfig.from_dict({}).transport.down == "full"
+    assert LaunchConfig.from_dict({"transport": {"down": "delta"}}).transport.down == "delta"
+    with pytest.raises(ValueError):
+        LaunchConfig.from_dict({"transport": {"down": "gzip"}})
+
+
 def test_libp2p_routes_gate():
     """W1d: libp2p routing is wired for static sharded mode; rendezvous keeps
     routing over TCP (epoch records carry TCP addrs) until multiaddr discovery

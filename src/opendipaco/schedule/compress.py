@@ -164,6 +164,46 @@ def compress_delta(delta, mode: str, carry=None):
     return payload, residual
 
 
+# -- weight deltas (W2a delta-down; docs/w2-bandwidth-design.md) -----------------
+
+
+def encode_state_delta(cur: dict, base: dict) -> dict:
+    """Encode a state_dict as an **int8 delta against ``base``** (a prior version
+    the receiver holds exactly -- a keyframe). Floating tensors become a small-
+    magnitude ``cur - base`` quantized symmetric int8 (``{"q","s"}``) -- deltas
+    have far smaller range than raw weights, so int8 captures them at pseudo-
+    gradient quality (raw weights would need bf16). Non-floating (or shape-
+    changed) tensors ship verbatim; their delta would be meaningless. ``base`` is
+    the *same bytes the receiver holds* (the caller passes ``compress_state``-d
+    history), so the only reconstruction error is one bounded int8 step."""
+    out = {}
+    for n, c in cur.items():
+        b = base.get(n)
+        if c.is_floating_point() and b is not None and b.shape == c.shape:
+            q, _ = _quantize_int8(c.float() - b.float())
+            out[n] = q                      # {"q": int8, "s": scale}
+        else:
+            out[n] = c                      # non-float / shape change -> verbatim
+    return out
+
+
+def apply_state_delta(base: dict, tensors: dict) -> dict:
+    """Reconstruct a state_dict from a keyframe ``base`` + an
+    :func:`encode_state_delta` payload: ``base + dequant(delta)`` for the int8
+    entries, verbatim for the rest. Raises ``TypeError`` on a malformed entry so
+    a receiver refuses a bad delta instead of crashing."""
+    out = {}
+    for n, t in tensors.items():
+        if isinstance(t, dict) and "q" in t and torch.is_tensor(t["q"]):
+            b = base[n]
+            out[n] = b.float() + t["q"].to(torch.float32) * float(t["s"])
+        elif torch.is_tensor(t):
+            out[n] = t                      # verbatim (non-float / shape change)
+        else:
+            raise TypeError(f"not a state-delta entry: {type(t)}")
+    return out
+
+
 def maybe_dequantize(items) -> list[torch.Tensor]:
     """Restore a pseudo-gradient list to fp32 whatever encoding it arrived in.
 

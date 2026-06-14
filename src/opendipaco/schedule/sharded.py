@@ -44,9 +44,11 @@ from ..optim.diloco import apply_outer_grads, make_outer_optimizer
 from ..topology import is_private_key
 from ..train.loop import _optimizer_state_to_cpu, _state_to_cpu
 from .compress import (
+    apply_state_delta,
     check_mode,
     compress_shard,
     compress_state,
+    encode_state_delta,
     maybe_dequantize,
     pseudograd_digest,
     restore_shard,
@@ -263,7 +265,7 @@ class ParameterServer(_ReactorServer):
                  corpus_weights=None, reputation=None, rate_limiter=None,
                  min_owner_reputation=0.25, staleness_bound=None,
                  staleness_weight="inverse", read_quorum=2, k=3,
-                 directory_ttl=120.0, **reactor_kw):
+                 directory_ttl=120.0, down="full", **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.config = config
         self.diloco = diloco
@@ -299,6 +301,16 @@ class ParameterServer(_ReactorServer):
         # primary trained against even after the module has advanced. 1 (default)
         # = off, no snapshots, zero cost on the normal path.
         self.version_history = max(1, int(version_history))
+        # Delta-down (W2a): ship "current - keyframe" int8 instead of full bf16
+        # weights when the worker holds a recent keyframe (in the version ring).
+        # "full" (default) is byte-identical to today. Delta needs the ring, so a
+        # delta owner with no history gets a default depth (the ring depth is the
+        # keyframe interval: a keyframe that ages out forces a full refresh).
+        if down not in ("full", "delta"):
+            raise ValueError(f"down must be 'full' or 'delta', got {down!r}")
+        self.down = down
+        if self.down == "delta" and self.version_history <= 1:
+            self.version_history = 8
         self._history: dict = {}     # key -> OrderedDict[version -> cpu state_dict]
         # Private-module policy (Phase 3d, decision D5/3a). ``overwrite``
         # (default) applies a private push verbatim (today). ``proposal`` holds
@@ -492,6 +504,24 @@ class ParameterServer(_ReactorServer):
             return _state_to_cpu(hist[version])
         return None
 
+    def _down_payload_locked(self, key, have_version):
+        """The downlink weights for a stale shared key (W2a). In ``down="delta"``
+        mode, if the worker's keyframe (``have_version``) is still in the version
+        ring, ship an int8 delta ``current - keyframe`` against the *same bytes
+        the worker holds* (``compress_state``-d history, so reconstruction error
+        is one bounded int8 step); otherwise -- delta off, no keyframe, or the
+        keyframe aged out of the ring -- ship the full weights (a fresh
+        keyframe). ``down="full"`` and the no-``have`` case are byte-identical to
+        the pre-W2 path."""
+        cur = _state_to_cpu(self.bank[key].state_dict())
+        if self.down == "delta" and have_version:
+            held = self._pinned_state_locked(key, have_version)
+            if held is not None:
+                base = compress_state(held, self.compress)  # == the bytes the worker holds
+                return {"__delta__": list(self._versions[key]), "base": list(have_version),
+                        "tensors": encode_state_delta(cur, base)}
+        return compress_state(cur, self.compress)
+
     # -- private proposals (Phase 3d, policy D5/3a) ----------------------------
 
     def _private_proposal(self, msg: dict, peer_id: str | None = None) -> dict:
@@ -670,8 +700,7 @@ class ParameterServer(_ReactorServer):
                 else:
                     versions[k] = self._versions[k]
                     if tuple(have.get(k) or ()) != self._versions[k]:  # ship only stale
-                        weights[k] = compress_state(
-                            _state_to_cpu(self.bank[k].state_dict()), self.compress)
+                        weights[k] = self._down_payload_locked(k, tuple(have.get(k) or ()))
         out = {"type": "weights", "weights": weights, "versions": versions}
         if want_state:
             out["state"] = state
@@ -1428,7 +1457,7 @@ class Scheduler(_ReactorServer):
                  identity=None, compress="none", idle_backoff=None,
                  reputation=None, rate_limiter=None, min_owner_reputation=0.25,
                  redundancy=3, redundancy_rate=0.0, audit_timeout=60.0,
-                 private_policy="overwrite", **reactor_kw):
+                 private_policy="overwrite", down="full", **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         self.ps_tls = ps_tls  # client context for the scheduler's checkpoint RPCs to PSs
         self.grant_key = grant_key  # shared with the PSs (not workers) to sign grants
@@ -1462,6 +1491,14 @@ class Scheduler(_ReactorServer):
         self._watch_stop = threading.Event()  # stops the watch_tracker thread
         self._watch_thread = None
         self.compress = check_mode(compress)  # stamped on tasks; workers follow it
+        # Downlink policy stamped on tasks (W2a): "delta" tells the worker to keep
+        # keyframe baselines and send keyframe versions in `have`, so owners can
+        # ship deltas. "full" (default) is byte-identical to today. Owners must
+        # also run down="delta" to actually ship deltas (self-describing payloads
+        # keep a mismatch safe: a full-mode owner just ships full).
+        if down not in ("full", "delta"):
+            raise ValueError(f"down must be 'full' or 'delta', got {down!r}")
+        self.down = down
         self.idle_backoff = idle_backoff      # server-paced idle polling (retry_in)
         self._worker_caps: dict = {}          # worker_id -> advertised capabilities
         self.config = config
@@ -1712,6 +1749,7 @@ class Scheduler(_ReactorServer):
             "path": path,
             "routing": routing,
             "compress": self.compress,  # uplink encoding the worker should use
+            "down": self.down,          # downlink policy: keep keyframes for deltas (W2a)
             "shard": compress_shard(shard, self.compress),
             "shard_spec": shard_spec,
             "batch_size": (max(1, min(self.batch_size, int(caps["max_batch"])))
@@ -2061,7 +2099,8 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
     wid = uuid.uuid4().hex
     warm: set = set()
     shard_cache: dict = {}
-    versions: dict = {}          # shared key -> held version
+    versions: dict = {}          # shared key -> held (trained-against / nominal) version
+    keyframes: dict = {}         # shared key -> (version, exact state) baseline for deltas (W2a)
     residuals: dict = {}         # path -> {key: [tensors]}: compression error feedback
     data_ctx = {"dir": data_dir, "source": data_source, "tokenizer": data_tokenizer}
     caps = {"device": str(device)}
@@ -2086,7 +2125,7 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
             while fails < 8:   # give up only after sustained no-progress failures
                 try:
                     if _serve_sharded(link, engine, worker, wid, warm, shard_cache,
-                                      versions, residuals, data_ctx, caps, state,
+                                      versions, keyframes, residuals, data_ctx, caps, state,
                                       heartbeat_interval, poll_interval, max_tasks,
                                       fault_hook):
                         return  # clean finish (stop / budget)
@@ -2119,8 +2158,8 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
         clean = False
         try:
             clean = _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions,
-                                   residuals, data_ctx, caps, state, heartbeat_interval,
-                                   poll_interval, max_tasks, fault_hook)
+                                   keyframes, residuals, data_ctx, caps, state,
+                                   heartbeat_interval, poll_interval, max_tasks, fault_hook)
         except (OSError, ConnectionError):
             clean = False  # disconnected -> reconnect (if enabled)
         finally:
@@ -2135,7 +2174,7 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
         backoff = min(backoff * 2, 1.0)
 
 
-def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions,
+def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions, keyframes,
                    residuals, data_ctx, caps, state, heartbeat_interval, poll_interval,
                    max_tasks, fault_hook) -> bool:
     """One scheduler connection: serve tasks. Returns True on a clean finish (stop /
@@ -2166,6 +2205,7 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions,
                    for k, addrs in task["routing"].items()}
         check_only = bool(task.get("check_only"))
         audit = bool(task.get("audit"))
+        down_delta = task.get("down") == "delta"   # keep keyframes, send keyframe `have` (W2a)
         # A check pins the audited primary's exact base; an audited primary (and
         # any check) runs *cold* so the computation is reproducible by replicas
         # -- a warm inner-optimizer state can't cross the wire (a core invariant).
@@ -2188,9 +2228,16 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions,
             while pending:
                 addr = next(iter(pending.values()))[0]
                 batch = [k for k, cands in pending.items() if cands[0] == addr]
+                # In delta mode `have` is the *keyframe* version (the bytes we
+                # hold exactly), not the trained-against version, so the owner
+                # deltas against what we can reconstruct from (W2a).
+                def _have(k):
+                    if down_delta and k in keyframes:
+                        return keyframes[k][0]
+                    return versions.get(k)
                 req = {"type": "fetch", "keys": batch, "cold": cold,
                        "have": {} if pin else
-                               {k: versions.get(k) for k in batch if not is_private_key(k)}}
+                               {k: _have(k) for k in batch if not is_private_key(k)}}
                 if pin:
                     req["pin"] = {k: list(pin[k]) for k in batch if k in pin}
                 try:
@@ -2204,9 +2251,22 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions,
                             raise OSError(f"no replica could serve {k}")
                     continue
                 missing = set(reply.get("missing") or [])
+                reply_versions = reply.get("versions", {})
                 for k, sd in reply["weights"].items():
-                    _load_into(engine, k, sd)
-                versions.update(reply.get("versions", {}))
+                    if isinstance(sd, dict) and "__delta__" in sd:
+                        # Reconstruct current = keyframe + dequant(delta). The
+                        # keyframe is exact and unchanged, so error is one bounded
+                        # int8 step (non-chained); the keyframe is NOT advanced.
+                        kf = keyframes.get(k)
+                        base_v = tuple(sd.get("base") or ())
+                        if kf is None or kf[0] != base_v:
+                            raise OSError(f"delta for {k} vs keyframe {base_v} not held")
+                        _load_into(engine, k, apply_state_delta(kf[1], sd["tensors"]))
+                    else:
+                        _load_into(engine, k, sd)
+                        if down_delta and not is_private_key(k) and k in reply_versions:
+                            keyframes[k] = (tuple(reply_versions[k]), sd)  # new keyframe (full)
+                versions.update(reply_versions)
                 for k in batch:
                     if k in missing:
                         if pin:
