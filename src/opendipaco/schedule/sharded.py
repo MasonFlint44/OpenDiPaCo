@@ -2009,7 +2009,7 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
                        connect_timeout=10.0, reconnect=False, reconnect_timeout=30.0,
                        fault_hook=None, tls=None, tls_hostname=None,
                        data_dir=None, data_source=None, data_tokenizer=None,
-                       max_batch_size=None):
+                       max_batch_size=None, transport="tcp", identity=None):
     """Train path-tasks for a sharded scheduler + parameter servers.
 
     Per task: lease from the scheduler, fetch the path's modules from the owning
@@ -2034,6 +2034,36 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
     if max_batch_size is not None:
         caps["max_batch"] = int(max_batch_size)
     state = {"done": 0}
+
+    if transport == "libp2p":
+        # libp2p path: scheduler_addr + routing addrs are multiaddrs; the worker
+        # dials owners (direct or through a relay) over Noise streams. Lazy import
+        # so the default install never imports libp2p (W1, optional [nat] extra).
+        from .p2p import Libp2pTransport, _Libp2pLink
+
+        if identity is None:
+            raise ValueError("transport='libp2p' needs identity=")
+        link = _Libp2pLink(Libp2pTransport(identity).start(), scheduler_addr)
+        backoff, fails, last_done = 0.05, 0, state["done"]
+        try:
+            while fails < 8:   # give up only after sustained no-progress failures
+                try:
+                    if _serve_sharded(link, engine, worker, wid, warm, shard_cache,
+                                      versions, residuals, data_ctx, caps, state,
+                                      heartbeat_interval, poll_interval, max_tasks,
+                                      fault_hook):
+                        return  # clean finish (stop / budget)
+                except (OSError, ConnectionError):
+                    pass  # transient libp2p fault (e.g. a raced dial) -> retry
+                if state["done"] > last_done:    # progress -> the fault was transient
+                    fails, backoff, last_done = 0, 0.05, state["done"]
+                else:                             # no progress -> scheduler likely gone
+                    fails += 1
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 1.0)
+        finally:
+            link.close()
+        return
 
     first = True
     backoff = 0.05

@@ -31,6 +31,8 @@ import trio
 from libp2p import new_host
 from libp2p.crypto.ed25519 import Ed25519PrivateKey
 from libp2p.crypto.keys import KeyPair
+from libp2p.network.exceptions import SwarmException
+from libp2p.network.stream.exceptions import StreamEOF, StreamError
 from libp2p.peer.id import ID
 from libp2p.peer.peerinfo import PeerInfo, info_from_p2p_addr
 from libp2p.relay.circuit_v2.config import RelayConfig
@@ -115,7 +117,8 @@ class Libp2pTransport:
         self._nursery = None          # for reservation refreshers (D6)
         self._ctransport = None       # CircuitV2Transport: reserve / dial-through-relay
         self._ready = threading.Event()
-        self._thread = None
+        self._rpc_lock = threading.Lock()  # serialize outbound rpcs: concurrent
+        self._thread = None                # same-peer dials race py-libp2p's swarm
         self._err = None
         self._libp2p_id = None
         self._addrs: list[str] = []
@@ -217,18 +220,39 @@ class Libp2pTransport:
         Blocks the calling thread until the trio round-trip completes."""
         if self._token is None:
             raise RuntimeError("transport not started")
-        return trio.from_thread.run(self._rpc_async, target, msg, timeout,
-                                    trio_token=self._token)
+        with self._rpc_lock:
+            try:
+                return trio.from_thread.run(self._rpc_async, target, msg, timeout,
+                                            trio_token=self._token)
+            except (SwarmException, StreamError, StreamEOF, trio.TooSlowError,
+                    trio.BrokenResourceError, trio.ClosedResourceError) as e:
+                # Surface libp2p/trio transport faults as ConnectionError so callers
+                # (the worker loop) handle them with their existing OSError paths.
+                raise ConnectionError(f"libp2p rpc to {target} failed: {e}") from e
 
     async def _rpc_async(self, target, msg, timeout):
         with trio.fail_after(timeout) if timeout else _nullcm():
-            peer_id = await self._connect(target)
-            stream = await self._host.new_stream(peer_id, [RPC_PROTOCOL])
+            stream = await self._open_stream(target)
             try:
                 await self._send(stream, msg)
                 return await self._recv(stream)
             finally:
                 await stream.close()
+
+    async def _open_stream(self, target):
+        """Connect + open an RPC stream, retrying transient failures — concurrent
+        dials to the same peer (across workers, and a worker's heartbeat racing
+        its fetch/push) can momentarily fail stream setup in py-libp2p's swarm;
+        a short backoff lets a half-open connection settle or re-dial."""
+        last = None
+        for attempt in range(6):
+            try:
+                peer_id = await self._connect(target)
+                return await self._host.new_stream(peer_id, [RPC_PROTOCOL])
+            except (SwarmException, StreamError, trio.BrokenResourceError) as e:
+                last = e
+                await trio.sleep(0.05 * (attempt + 1))
+        raise ConnectionError(f"could not open stream to {target}: {last}")
 
     async def _connect(self, target):
         """Resolve+connect to ``target`` (direct or relayed); return its peer id."""
@@ -249,16 +273,24 @@ class Libp2pTransport:
             reply = await trio.to_thread.run_sync(self._handler, msg)
             if reply is not None:
                 await self._send(stream, reply)
-        except (trio.BrokenResourceError, trio.ClosedResourceError, ValueError):
+        except (trio.BrokenResourceError, trio.ClosedResourceError, ValueError,
+                StreamEOF, StreamError):
             pass  # peer vanished / oversized frame -> drop this stream, keep serving
         finally:
             await stream.close()
 
     # -- framing: our wire codec over a libp2p stream --------------------------
 
+    # libp2p's Noise channel rejects any single write over 65535 bytes, so frames
+    # (a task's shard, a path's weights, pseudo-gradients) are written in chunks;
+    # the length-prefixed reader reassembles them transparently.
+    _WRITE_CHUNK = 32768
+
     async def _send(self, stream, obj) -> None:
-        data = encode(obj)
-        await stream.write(_HEADER.pack(len(data)) + data)
+        payload = encode(obj)
+        framed = _HEADER.pack(len(payload)) + payload
+        for i in range(0, len(framed), self._WRITE_CHUNK):
+            await stream.write(framed[i:i + self._WRITE_CHUNK])
 
     async def _recv(self, stream):
         header = await self._read_exactly(stream, _HEADER.size)
@@ -275,12 +307,47 @@ class Libp2pTransport:
         chunks: list[bytes] = []
         got = 0
         while got < n:
-            b = await stream.read(n - got)
+            try:
+                b = await stream.read(n - got)
+            except StreamEOF:
+                return None  # libp2p signals close by raising, not by returning b""
             if not b:
                 return None  # stream closed mid-frame
             chunks.append(b)
             got += len(b)
         return b"".join(chunks)
+
+
+class _Libp2pLink:
+    """A ``_WorkerLink``-compatible seam backed by a libp2p transport (W1b step 3).
+
+    Drop-in for the worker's TCP ``_WorkerLink``: the worker loop speaks only to
+    this interface, so it runs unchanged over libp2p. ``sched_addr`` and the PS
+    addrs in routing are multiaddrs (direct or ``/p2p-circuit`` for a relayed
+    owner). libp2p multiplexes streams over reused connections, so there is no
+    socket cache to manage and no "prefer connected" preference to express."""
+
+    def __init__(self, transport: "Libp2pTransport", sched_addr: str):
+        self._t = transport
+        self._sched = sched_addr
+
+    def sch_rpc(self, msg):
+        return self._t.rpc(self._sched, msg)
+
+    def sch_send(self, msg) -> None:
+        try:
+            self._t.rpc(self._sched, msg)  # heartbeat: handler returns None, reply is None
+        except Exception:  # noqa: BLE001 -- a heartbeat is best-effort
+            pass
+
+    def connected(self, addr) -> bool:
+        return False  # libp2p reuses connections itself; no preference to express
+
+    def ps_rpc(self, addr, msg):
+        return self._t.rpc(addr, msg)
+
+    def close(self) -> None:
+        self._t.close()
 
 
 class _nullcm:

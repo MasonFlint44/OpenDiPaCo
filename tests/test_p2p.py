@@ -158,6 +158,59 @@ def test_relayed_rpc_round_trip():
         relay.close()
 
 
+def test_sharded_cluster_trains_over_libp2p():
+    """The W1b orchestration payoff: a full sharded cluster -- scheduler + 2
+    parameter servers + 2 workers -- runs end-to-end over libp2p (addresses are
+    multiaddrs, RPCs are Noise streams), training to its generation budget."""
+    import threading
+
+    from opendipaco import DiLoCoConfig
+    from opendipaco.data import ShardedCorpus
+    from opendipaco.schedule import (
+        ParameterServer, Scheduler, assign_shards, run_sharded_worker,
+    )
+    from opendipaco.schedule.p2p import serve_over_libp2p
+
+    cfg = _cfg()
+    diloco = DiLoCoConfig(inner_steps=4, inner_lr=1e-3)
+    g = torch.Generator().manual_seed(0)
+    span = 48 // 4
+    docs = [torch.randint(t * span, (t + 1) * span, (32,), generator=g)
+            for t in range(4) for _ in range(8)]
+    assign = torch.tensor([i % cfg.num_paths for i in range(len(docs))])
+    corpus = ShardedCorpus.from_assignments(docs, assign, cfg.num_paths, 16)
+
+    keys = cfg.build_topology().module_keys()
+    shards = [[k for k, s in assign_shards(keys, 2).items() if s == i] for i in range(2)]
+    pss = [ParameterServer(cfg, sk, diloco, host="127.0.0.1", port=0,
+                           identity=PeerIdentity.generate()) for sk in shards]
+    ps_t = [serve_over_libp2p(ps) for ps in pss]          # owners over libp2p
+    ps_addrs = [t.addrs[0] for t in ps_t]                 # multiaddr per shard
+
+    sched = Scheduler(cfg, corpus, ps_addrs, diloco, batch_size=8, host="127.0.0.1",
+                      port=0, identity=PeerIdentity.generate())
+    sched_t = serve_over_libp2p(sched)
+    workers = [threading.Thread(
+        target=run_sharded_worker, args=(cfg, diloco, sched_t.addrs[0]),
+        kwargs=dict(transport="libp2p", identity=PeerIdentity.generate(),
+                    heartbeat_interval=2.0), daemon=True) for _ in range(2)]
+    for w in workers:
+        w.start()
+    try:
+        completed = sched.fit(num_generations=2, total_generations=2)
+        assert sum(completed.values()) >= 2 * cfg.num_paths   # the budget was met
+        assert sched.metrics.accepted_updates > 0             # updates landed over libp2p
+    finally:
+        sched_t.close()
+        for t in ps_t:
+            t.close()
+        sched.shutdown()
+        for ps in pss:
+            ps.shutdown()
+        for w in workers:
+            w.join(timeout=10)
+
+
 def test_nat_owner_served_through_a_relay():
     """The W1 payoff: a ParameterServer (owner) with no usable direct route is
     reached through a relay -- fetch over the circuit returns its versioned

@@ -26,6 +26,27 @@ and **k≥2 relays** per NAT'd peer.
 > stack is threads + a custom event-loop, so a trio↔threads bridge is required
 > (D3) — confined to the transport seam.
 
+**W1b amendments (discovered while building the orchestration):**
+- *Addressing is now transport-opaque (step 1).* `_addr_key` normalizes a JSON
+  `[host,port]` to a hashable tuple and passes a multiaddr string through, killing
+  the `tuple()`/`list()` coercions that broke on multiaddrs — byte-faithful for
+  TCP (the 351-test baseline is unchanged).
+- *The worker speaks only to a `link` seam (step 2).* `_WorkerLink` (TCP,
+  byte-faithful) and `_Libp2pLink` (libp2p) share the worker loop verbatim; the
+  scheduler/PSs serve over libp2p via `serve_over_libp2p`, routing carries
+  multiaddrs, and a full in-process sharded cluster (scheduler + 2 PSs + 2
+  workers) trains end-to-end over libp2p (tested).
+- *Three libp2p realities the spike hadn't hit, fixed in the link:* (1) Noise
+  caps a single `stream.write` at 65535 bytes, so frames (shards, weights,
+  pseudo-gradients) are **chunked** (the length-prefixed reader reassembles);
+  (2) libp2p signals stream close by **raising `StreamEOF`**, not returning
+  `b""`; (3) concurrent same-peer dials (a worker's heartbeat racing its
+  fetch/push, multiple workers) **transiently fail stream setup** in py-libp2p's
+  swarm — handled by serializing outbound rpcs per transport, retrying
+  `_open_stream` with backoff, and surfacing residual faults as `ConnectionError`
+  so the worker's existing retry/next-replica paths absorb them (the libp2p
+  worker retries while making progress, gives up only on sustained no-progress).
+
 **W1a amendments (discovered while building):**
 - *The trio↔threads bridge (the risk) is landed and proven* — `schedule/p2p.py`
   `Libp2pTransport` runs the host in a trio thread with a synchronous
