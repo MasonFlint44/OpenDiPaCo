@@ -1,0 +1,122 @@
+"""Blockwise 8-bit AdamW (W3d; docs/w3-vram-design.md D7).
+
+The inner AdamW keeps two fp32 moments per parameter (``2P`` = 8 bytes/param) --
+often the largest single VRAM term during a worker round. This stores them in
+**blockwise int8** (~2 bytes/param, a ~4x cut): each moment is split into blocks
+of ``block_size`` elements, each quantized symmetrically by its own absmax. The
+moments are dequantized to fp32 for the step (so the parameter update is full-
+precision) and requantized for storage; the quantization error enters only via
+the carried-forward moment.
+
+This is **lossy** -- a dynamics change, off by default, validated on-box
+(``examples/validate_dynamics.py``) with the WAN §0f run as the final verdict,
+exactly like W2's compression. A portable, CPU-testable alternative to a CUDA-
+only ``bitsandbytes`` dependency; bitsandbytes is the drop-in for production
+CUDA throughput.
+"""
+
+from __future__ import annotations
+
+import torch
+from torch.optim import Optimizer
+
+_BLOCK = 256
+
+
+def _to_blocks(t: torch.Tensor, block_size: int):
+    flat = t.reshape(-1)
+    n = flat.numel()
+    pad = (-n) % block_size
+    if pad:
+        flat = torch.cat([flat, flat.new_zeros(pad)])
+    return flat.reshape(-1, block_size), n
+
+
+def _quantize_blockwise(t: torch.Tensor, block_size: int):
+    """Symmetric int8 per block (for the first moment ``m``, which is signed and
+    may be ~0): returns (``q`` [nblocks, block_size] int8, ``absmax`` [nblocks])."""
+    blocks, _ = _to_blocks(t, block_size)
+    absmax = blocks.abs().amax(dim=1)
+    scale = torch.where(absmax > 0, absmax / 127.0, torch.ones_like(absmax)).unsqueeze(1)
+    q = torch.round(blocks / scale).clamp_(-127, 127).to(torch.int8)
+    return q, absmax
+
+
+def _dequantize_blockwise(q: torch.Tensor, absmax: torch.Tensor, numel: int,
+                          shape) -> torch.Tensor:
+    scale = (absmax / 127.0).unsqueeze(1)
+    return (q.to(torch.float32) * scale).reshape(-1)[:numel].reshape(shape)
+
+
+# The second moment v >= 0 spans orders of magnitude, and a *linear* int8 zeros
+# small values in a mixed-magnitude block -> denom = sqrt(v)+eps collapses to eps
+# -> exploding step. Quantize it in the **log domain** (relative precision) so the
+# smallest value in a block maps to a level, never to zero.
+_V_FLOOR = 1e-20
+
+
+def _quantize_v(v: torch.Tensor, block_size: int):
+    """Log-domain uint8 per block: returns (q uint8, lo [nblocks], scale [nblocks])."""
+    blocks, _ = _to_blocks(v, block_size)
+    lv = torch.log(blocks.clamp_min(_V_FLOOR))
+    lo = lv.amin(dim=1, keepdim=True)
+    scale = ((lv.amax(dim=1, keepdim=True) - lo) / 255.0).clamp_min(1e-12)
+    q = torch.round((lv - lo) / scale).clamp_(0, 255).to(torch.uint8)
+    return q, lo.squeeze(1), scale.squeeze(1)
+
+
+def _dequantize_v(q: torch.Tensor, lo: torch.Tensor, scale: torch.Tensor, numel: int,
+                  shape) -> torch.Tensor:
+    lv = q.to(torch.float32) * scale.unsqueeze(1) + lo.unsqueeze(1)
+    return torch.exp(lv).reshape(-1)[:numel].reshape(shape)
+
+
+class Adam8bit(Optimizer):
+    """AdamW whose moments are stored in blockwise int8 (W3d). The math matches
+    ``torch.optim.AdamW`` (decoupled weight decay, bias correction); only the
+    moment *storage* is quantized."""
+
+    def __init__(self, params, lr: float, betas=(0.9, 0.999), eps: float = 1e-8,
+                 weight_decay: float = 0.0, block_size: int = _BLOCK):
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps,
+                                      weight_decay=weight_decay, block_size=block_size))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            b1, b2 = group["betas"]
+            lr, eps, wd, bs = group["lr"], group["eps"], group["weight_decay"], group["block_size"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+                if not state:
+                    nblocks = (p.numel() + bs - 1) // bs
+                    state["step"] = 0
+                    state["m_q"] = torch.zeros((nblocks, bs), dtype=torch.int8, device=p.device)
+                    state["m_absmax"] = torch.zeros(nblocks, device=p.device)
+                    state["v_q"] = torch.zeros((nblocks, bs), dtype=torch.uint8, device=p.device)
+                    state["v_lo"] = torch.zeros(nblocks, device=p.device)
+                    state["v_scale"] = torch.zeros(nblocks, device=p.device)
+                m = _dequantize_blockwise(state["m_q"], state["m_absmax"], p.numel(), p.shape)
+                # v is stored in the log domain, so a zero-init dequant would be
+                # exp(0)=1; on the first step v is exactly 0.
+                v = (_dequantize_v(state["v_q"], state["v_lo"], state["v_scale"], p.numel(),
+                                   p.shape) if state["step"] > 0 else torch.zeros_like(p))
+                state["step"] += 1
+                t = state["step"]
+                m.mul_(b1).add_(g, alpha=1 - b1)
+                v.mul_(b2).addcmul_(g, g, value=1 - b2)
+                state["m_q"], state["m_absmax"] = _quantize_blockwise(m, bs)
+                state["v_q"], state["v_lo"], state["v_scale"] = _quantize_v(v, bs)
+                bc1 = 1 - b1 ** t
+                bc2 = 1 - b2 ** t
+                denom = (v.sqrt() / (bc2 ** 0.5)).add_(eps)
+                p.mul_(1 - lr * wd)                      # decoupled weight decay
+                p.addcdiv_(m, denom, value=-lr / bc1)
+        return loss

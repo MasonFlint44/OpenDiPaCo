@@ -1,7 +1,26 @@
 # W3 design — fit one path in consumer VRAM
 
-Status: **W3a + W3b + W3c landed; D4 reclassified; W3d pending.**
-W3 (from [viability-roadmap.md](viability-roadmap.md))
+Status: **W3 complete (W3a–W3d).** W3 (from [viability-roadmap.md](viability-roadmap.md))
+
+**W3d status (the §0f-gated lossy levers).**
+- *Blockwise 8-bit AdamW* (`diloco.optim_8bit`, `optim/adam8bit.py`): the inner
+  optimizer's moments are stored quantized — symmetric int8 for `m`, **log-domain
+  uint8 for `v`** — ~2 B/param vs fp32's 8 (a ~4× cut of the often-dominant
+  optimizer term). The param update is full-precision (moments dequantized for the
+  step, requantized for storage). *Implementation finding:* linear int8 for `v`
+  zeroed small second-moments in mixed-magnitude blocks → `denom = √v + eps`
+  collapsed → exploding step; the log domain (relative precision) fixed it. Off by
+  default, §0f-gated; tracks fp32 AdamW on-box (`validate_dynamics` arm converges).
+- *Private-copy de-dup* (`diloco.dedup_private`, reclassified from D4): aliases
+  the worker's private modules (deep-copies only shared, tie-safe) — saves ~the
+  embed/head and lets private warm in-place across tasks. Off by default,
+  §0f-gated (it changes warm-round private dynamics); `validate_dynamics` arm
+  converges.
+- *Deferred (D5 CPU-offloads):* optimizer CPU-offload (superseded by 8-bit Adam)
+  and embedding row-gather (covered by tying) remain unbuilt PCIe-bound
+  follow-ups, not needed to hit 12 GB.
+
+
 
 **W3c status (exact param/activation levers).**
 - *Tied embed/head now actually works (D6 + a real bug fix).* The bank tied the

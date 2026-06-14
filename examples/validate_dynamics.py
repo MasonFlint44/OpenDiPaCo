@@ -25,6 +25,10 @@ genuinely race and go stale), with two further deltas layered on:
   still train?
 * ``int4`` (W2c, ``compress: int4``) — int4 per-group pseudo-gradients/deltas; does
   4-bit communication still train? (plus a ``W2 stacked`` arm with all three on.)
+* ``8-bit Adam`` (W3d, ``optim_8bit``) — blockwise int8 optimizer moments; does the
+  quantized inner optimizer still train?
+* ``dedup-private`` (W3d, ``dedup_private``) — aliasing the worker's private modules
+  changes warm-round private warming; does it still converge?
 
 All configs train the **same** corpus/sharding/seed and are evaluated by the same
 router-free metric (best-path perplexity on a held-out split), so the numbers are
@@ -128,10 +132,14 @@ def train_sync(config, diloco, corpus) -> dict:
 
 
 def train_async(config, diloco, corpus, *, compress="none", robustness="off",
-                down="full", up_density=1.0) -> dict:
+                down="full", up_density=1.0, optim_8bit=False, dedup_private=False) -> dict:
     """The real in-process async sharded path (localhost TCP, worker oversupply
     so commits race + go stale). Returns the merged authoritative bank from the
     parameter servers -- no node held it whole."""
+    import dataclasses
+    # W3d worker-side levers live on the worker's diloco (8-bit inner optimizer;
+    # private-copy de-dup in _train_path).
+    diloco = dataclasses.replace(diloco, optim_8bit=optim_8bit, dedup_private=dedup_private)
     keys = config.build_topology().module_keys()
     shards = [[k for k, s in assign_shards(keys, NUM_SHARDS).items() if s == i]
               for i in range(NUM_SHARDS)]
@@ -208,6 +216,8 @@ def main() -> None:
         ("async + sparse-up", dict(compress="int8", up_density=0.25)),  # W2b
         ("async + int4", dict(compress="int4")),                        # W2c
         ("async + W2 stacked", dict(compress="int4", down="delta", up_density=0.25)),
+        ("async + 8-bit Adam", dict(optim_8bit=True)),                   # W3d
+        ("async + dedup-private", dict(dedup_private=True)),             # W3d
     ]
     worst, all_learned = 1.0, True
     for name, kw in variants:

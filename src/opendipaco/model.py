@@ -19,7 +19,7 @@ from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 
 from .config import DiPaCoConfig
 from .modules import BlockModule, EmbeddingModule, HeadModule, to_llama_config
-from .topology import Path, PathTopology, embed_key, head_key
+from .topology import Path, PathTopology, embed_key, head_key, is_private_key
 
 
 def _build_module(topo: PathTopology, bb, key: str) -> nn.Module:
@@ -199,13 +199,21 @@ class PathModel(nn.Module):
 
 
 def build_path_model(
-    config: DiPaCoConfig, path: Path, bank: dict[str, nn.Module], deepcopy: bool = True
+    config: DiPaCoConfig, path: Path, bank: dict[str, nn.Module], deepcopy: bool = True,
+    dedup_private: bool = False,
 ) -> PathModel:
     """Instantiate a :class:`PathModel` from the module bank.
 
     ``deepcopy=True`` (default) gives the worker independent weights so its inner
     steps don't mutate the shared bank; pass ``False`` to alias the bank
     directly (useful for a single-worker / inference setup).
+
+    ``dedup_private`` (W3d, off by default) aliases the **private** modules from
+    the bank instead of copying them -- only the *shared* modules need an
+    independent copy (the pseudo-gradient ``global − local`` is computed for them
+    against the bank). It saves ~the embed/head, but it changes the worker's
+    warm-round private trajectory (private accumulates in-place), so it is a
+    §0f-gated dynamics change, not an exact win.
     """
     topo = config.build_topology()
     keys = topo.path_module_keys(path)
@@ -223,5 +231,11 @@ def build_path_model(
         # (tied embed/head weights, W3c/D6) stay shared in the copy -- per-module
         # deepcopy would sever the tie, doubling memory and training the two copies
         # apart. Identical to per-module copy when nothing is tied.
-        selected = copy.deepcopy(selected)
+        if dedup_private:
+            # Copy only shared modules (tie-safe single call); alias private from
+            # the bank -- private needs no independent global copy (W3d).
+            shared = copy.deepcopy({k: selected[k] for k in keys if not is_private_key(k)})
+            selected = {k: shared.get(k, selected[k]) for k in keys}
+        else:
+            selected = copy.deepcopy(selected)
     return PathModel(config, path, selected)

@@ -169,6 +169,15 @@ class DiLoCoConfig:
     # the loss sum is in chunk order (~1e-7, far below the int8-digest noise),
     # so off here keeps the in-process anchor bit-identical; opt in on the worker.
     loss_chunks: int = 1
+    # Blockwise 8-bit AdamW moments (W3d): store the inner optimizer's m, v in
+    # int8 (~2 B/param vs 8), a ~4x cut of the often-dominant optimizer term.
+    # Lossy (a dynamics change) -> off by default, §0f-gated, on-box validated.
+    optim_8bit: bool = False
+    # Don't duplicate the worker's private modules (W3d): alias the dominant
+    # embed/head from the bank instead of deep-copying. Saves ~that memory but
+    # makes private accumulate in-place across warm tasks (a private-warming
+    # change), so it's a §0f-gated dynamics lever, off by default.
+    dedup_private: bool = False
 
     # Inner LR schedule over the *whole* run (paper: cosine, peak 4e-4). Needs the
     # total number of rounds, which ``DiPaCoEngine.fit`` supplies automatically;

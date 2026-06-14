@@ -276,7 +276,8 @@ class AsyncScheduler:
         if shard.size(0) == 0:
             return Contribution(path, path_idx, float("nan"), {}, {}, {}, empty=True)
 
-        pm = build_path_model(e.config, path, e.bank, deepcopy=True).to(e.device)
+        pm = build_path_model(e.config, path, e.bank, deepcopy=True,
+                              dedup_private=getattr(e.diloco, "dedup_private", False)).to(e.device)
         opt = make_inner_optimizer(pm, e.diloco)
         prior = e._opt_state.get(path)
         if prior is not None:

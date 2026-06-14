@@ -58,6 +58,11 @@ class DiLoCoCfg:
     # [tokens, vocab] logits tensor -- set > 1 for a large vocab. 1 = off (the loss
     # sum order shifts ~1e-7 when on, so it's opt-in rather than default).
     loss_chunks: int = 1
+    # Lossy VRAM levers (W3d; §0f-gated, off by default): int8 AdamW moments
+    # (~4x optimizer cut) and aliasing the worker's private embed/head (saves the
+    # copy, changes warm-round private dynamics). Validate before enabling.
+    optim_8bit: bool = False
+    dedup_private: bool = False
 
 
 @dataclass
@@ -438,5 +443,5 @@ def diloco_config(d: DiLoCoCfg) -> DiLoCoConfig:
         outer_momentum=d.outer_momentum, outer_nesterov=d.outer_nesterov,
         rescale_by_sqrt_sharing=d.rescale_by_sqrt_sharing,
         inner_autocast=d.inner_autocast, activation_checkpoint=d.activation_checkpoint,
-        loss_chunks=d.loss_chunks,
+        loss_chunks=d.loss_chunks, optim_8bit=d.optim_8bit, dedup_private=d.dedup_private,
     )

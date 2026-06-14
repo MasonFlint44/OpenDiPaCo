@@ -44,6 +44,10 @@ def inner_lr_at(step: int, total_steps: int | None, cfg: DiLoCoConfig) -> float:
 
 
 def make_inner_optimizer(model: nn.Module, cfg: DiLoCoConfig) -> torch.optim.Optimizer:
+    if getattr(cfg, "optim_8bit", False):
+        from .adam8bit import Adam8bit  # lossy; W3d
+        return Adam8bit(model.parameters(), lr=cfg.inner_lr, betas=cfg.inner_betas,
+                        weight_decay=cfg.inner_weight_decay)
     return torch.optim.AdamW(
         model.parameters(),
         lr=cfg.inner_lr,
