@@ -90,6 +90,15 @@ and **k≥2 relays** per NAT'd peer.
   so the worker's existing retry/next-replica paths absorb them (the libp2p
   worker retries while making progress, gives up only on sustained no-progress).
 
+**W1 checkpoint review (continued):**
+- *Fixed — server-side slow-loris bound.* The client rpc had a timeout, but the
+  *server's* inbound handler (`_on_stream`) didn't: a Byzantine peer could tie up
+  a stream handler forever by dribbling a frame's body (slow-loris) or stalling.
+  `_on_stream` now runs under `serve_timeout` (default 300s, generous for a large
+  legit push) — a stall raises `trio.TooSlowError`, the stream is dropped, the
+  host keeps serving. Tested: a request that blocks past `serve_timeout` is
+  dropped and the server still answers the next one.
+
 **W1 checkpoint review (after W1a+W1b):**
 - *Fixed — libp2p rpcs had no timeout.* `_Libp2pLink` rpcs blocked forever if a
   peer was alive but unresponsive (a half-open NAT connection / network stall),

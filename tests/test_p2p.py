@@ -232,6 +232,29 @@ def test_server_survives_a_raising_handler():
         server.close()
 
 
+def test_server_times_out_a_stuck_request():
+    """A request that ties up the handler past serve_timeout (a stall / handler
+    that blocks; same path a slow-loris read hits) is dropped, and the server
+    keeps serving — bounded inbound work, no unbounded resource hold."""
+    import time as _time
+
+    def handler(msg, peer_id):
+        if msg.get("slow"):
+            _time.sleep(5)          # blocks longer than the 1s serve_timeout
+        return {"ok": True}
+
+    server = Libp2pTransport(PeerIdentity.generate(), handler=handler,
+                             serve_timeout=1.0).start()
+    client = Libp2pTransport(PeerIdentity.generate()).start()
+    try:
+        info = dial_info(server.addrs[0])
+        assert client.rpc(info, {"slow": True}, timeout=10) is None     # timed out, dropped
+        assert client.rpc(info, {"slow": False}, timeout=10) == {"ok": True}  # survived
+    finally:
+        client.close()
+        server.close()
+
+
 def test_oversized_reply_is_a_connection_error_not_a_crash():
     """A frame over the receiver's cap (a buggy/Byzantine peer) surfaces as
     ConnectionError -- which the worker's retry/next-replica paths handle -- not

@@ -120,7 +120,8 @@ class Libp2pTransport:
 
     def __init__(self, identity: PeerIdentity, *, handler=None, relay: bool = False,
                  listen_addrs=("/ip4/127.0.0.1/tcp/0",),
-                 max_msg_bytes: int = DEFAULT_MAX_MSG_BYTES, start_timeout: float = 30.0):
+                 max_msg_bytes: int = DEFAULT_MAX_MSG_BYTES, start_timeout: float = 30.0,
+                 serve_timeout: float = 300.0):
         self.identity = identity
         self._handler = handler
         self._relay = relay           # run Circuit Relay v2 in HOP mode (a relay peer, D6)
@@ -128,6 +129,10 @@ class Libp2pTransport:
         self._kp = _derive_keypair(identity)
         self.max_msg_bytes = max_msg_bytes
         self._start_timeout = start_timeout
+        # Bound on one inbound request (read + handle + reply): a Byzantine peer
+        # must not tie up a stream handler forever by dribbling a frame
+        # (slow-loris) or stalling -- generous so a large legit push still fits.
+        self._serve_timeout = serve_timeout
         self._host = None
         self._token = None            # trio token: lets foreign threads call in
         self._stop = None             # trio.Event set on close
@@ -310,17 +315,18 @@ class Libp2pTransport:
 
     async def _on_stream(self, stream) -> None:
         try:
-            msg = await self._recv(stream)
-            if msg is None:
-                return
-            peer_id = self._remote_peer_id(stream)
-            reply = await trio.to_thread.run_sync(self._handler, msg, peer_id)
-            if reply is not None:
-                await self._send(stream, reply)
+            with trio.fail_after(self._serve_timeout):   # slow-loris / stall bound
+                msg = await self._recv(stream)
+                if msg is None:
+                    return
+                peer_id = self._remote_peer_id(stream)
+                reply = await trio.to_thread.run_sync(self._handler, msg, peer_id)
+                if reply is not None:
+                    await self._send(stream, reply)
         except Exception:  # noqa: BLE001 -- serving untrusted peers: one bad request
-            pass            # (vanished peer, malformed frame, handler error) must
-            #                  never escape and kill the host; trio.Cancelled (a
-            #                  BaseException) still propagates so shutdown works
+            pass            # (vanished peer, malformed frame, handler error, a
+            #                  slow-loris -> trio.TooSlowError) must never escape
+            #                  and kill the host; trio.Cancelled still propagates
         finally:
             await stream.close()
 
