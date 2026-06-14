@@ -305,6 +305,10 @@ class ParameterServer(_ReactorServer):
 
         self.identity = identity
         self.peer_id = getattr(identity, "peer_id", None)
+        # The libp2p transport that serves this owner (set by serve_over_libp2p);
+        # owner↔owner RPCs (_peer_rpc) reuse it to dial co-owners over libp2p /
+        # through relays when their addr is a multiaddr (W1c).
+        self.libp2p = None
         self._all_keys = set(self._topology.module_keys())
         self._epoch = None
         self._epoch_num = 0
@@ -921,6 +925,11 @@ class ParameterServer(_ReactorServer):
         self._beat_thread.start()
 
     def _peer_rpc(self, addr, msg):
+        # libp2p owners (W1c): a co-owner's addr is a multiaddr (direct or a
+        # /p2p-circuit through a relay) -> dial it over the owner's libp2p
+        # transport, which handles connection reuse + relay routing.
+        if self.libp2p is not None and isinstance(addr, str):
+            return self.libp2p.rpc(addr, msg, timeout=60.0)
         sock = self._peer_conns.get(addr)
         if sock is None:
             sock = _ps_connect(addr, self._peer_auth, self.max_msg_bytes, 5.0,

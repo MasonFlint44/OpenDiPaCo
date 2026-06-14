@@ -26,6 +26,26 @@ and **k≥2 relays** per NAT'd peer.
 > stack is threads + a custom event-loop, so a trio↔threads bridge is required
 > (D3) — confined to the transport seam.
 
+**W1c status (NAT'd owners as a first-class tier):**
+- *Identity threaded over libp2p* (above) — reputation/rate-limit/audit/
+  eligibility + enrollment now apply on the libp2p path.
+- *NAT'd owners are eligible + placeable.* A peer record may carry
+  `circuit_addrs` (relay `/p2p-circuit` multiaddrs); `owner_eligible` accepts a
+  `nat` peer with ≥1 of them, `owner_addr` returns the dialable address (direct
+  for public, first circuit for nat), and `make_epoch_record`/`derive_epoch`
+  place a NAT'd owner with its circuit addr — so HRW routing hands dialers a
+  relay-reachable address.
+- *Owner↔owner over libp2p.* `serve_over_libp2p` wires the transport onto the
+  owner (`server.libp2p`), and `_peer_rpc` dials a co-owner over libp2p (direct
+  or through a relay) when its addr is a multiaddr — so replication, gossip, and
+  digest-audit all flow between NAT'd owners through relays. Tested: owner A
+  fetches owner B's digest over libp2p; a NAT'd owner record is eligible and
+  placed with its circuit addr.
+- *Remaining in W1c (refinements):* multi-relay failover / relay-death
+  re-homing (a NAT'd owner re-reserving when a relay dies, and dialers trying
+  each of an owner's circuit addrs), and per-peer rpc locking for an owner's
+  concurrent outbound replication.
+
 **W1b amendments (discovered while building the orchestration):**
 - *Addressing is now transport-opaque (step 1).* `_addr_key` normalizes a JSON
   `[host,port]` to a hashable tuple and passes a multiaddr string through, killing

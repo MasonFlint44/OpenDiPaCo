@@ -271,6 +271,32 @@ def test_sharded_cluster_trains_over_libp2p():
             w.join(timeout=10)
 
 
+def test_owner_to_owner_rpc_over_libp2p():
+    """Owners dial each other over libp2p via _peer_rpc (W1c) — replication,
+    gossip, and digest-audit ride this. Here owner A fetches owner B's digest
+    over a libp2p stream (a multiaddr addr routes to the libp2p path)."""
+    from opendipaco import DiLoCoConfig
+    from opendipaco.schedule import ParameterServer
+    from opendipaco.schedule.p2p import serve_over_libp2p
+
+    cfg = _cfg()
+    keys = sorted(cfg.build_topology().module_keys())
+    a = ParameterServer(cfg, keys, DiLoCoConfig(inner_steps=4), host="127.0.0.1", port=0,
+                        identity=PeerIdentity.generate())
+    b = ParameterServer(cfg, keys, DiLoCoConfig(inner_steps=4), host="127.0.0.1", port=0,
+                        identity=PeerIdentity.generate())
+    ta, tb = serve_over_libp2p(a), serve_over_libp2p(b)
+    try:
+        assert a.libp2p is ta                       # serve_over_libp2p wired the transport
+        reply = a._peer_rpc(tb.addrs[0], {"type": "digest", "keys": None})
+        assert reply["type"] == "digest" and reply["digests"]
+    finally:
+        ta.close()
+        tb.close()
+        a.shutdown()
+        b.shutdown()
+
+
 def test_nat_owner_served_through_a_relay():
     """The W1 payoff: a ParameterServer (owner) with no usable direct route is
     reached through a relay -- fetch over the circuit returns its versioned

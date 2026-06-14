@@ -345,3 +345,45 @@ def test_tracker_epoch_cache_pins_signer_and_orders_epochs():
         assert put_epoch(addr2, r0)["type"] == "epoch_cached"
     finally:
         t2.shutdown()
+
+
+# -- NAT'd owners reachable through relays (W1c) --------------------------------
+
+
+def test_owner_eligible_accepts_nat_with_relay_circuit_addrs():
+    """A NAT'd consumer machine becomes owner-eligible by advertising relay
+    circuit addrs (the W1 goal); a bare NAT peer (no relays) does not."""
+    from opendipaco.schedule import make_peer_record, owner_addr, owner_eligible
+
+    pub = make_peer_record(PeerIdentity.generate(), reachability="public",
+                           addr=("203.0.113.5", 9000), roles=("owner",))
+    circuit = "/ip4/198.51.100.2/tcp/4001/p2p/RELAY/p2p-circuit/p2p/SELF"
+    nat = make_peer_record(PeerIdentity.generate(), reachability="nat",
+                           roles=("owner",), circuit_addrs=[circuit])
+    nat_bare = make_peer_record(PeerIdentity.generate(), reachability="nat",
+                                roles=("owner",))
+    non_owner = make_peer_record(PeerIdentity.generate(), reachability="nat",
+                                 roles=("relay",), circuit_addrs=[circuit])
+
+    assert owner_eligible(pub) and owner_eligible(nat)
+    assert not owner_eligible(nat_bare)     # NAT with no relay reservation
+    assert not owner_eligible(non_owner)    # has relays but not the owner role
+    assert owner_addr(pub) == ["203.0.113.5", 9000]
+    assert owner_addr(nat) == circuit       # dialed through its relay
+    assert owner_addr(nat_bare) is None
+
+
+def test_epoch_record_carries_a_nat_owners_circuit_addr():
+    """make_epoch_record places a NAT'd owner with its circuit addr, so HRW
+    routing hands dialers a relay-reachable address."""
+    from opendipaco.schedule import make_epoch_record, owners_for
+
+    sched = PeerIdentity.generate()
+    nat_id = PeerIdentity.generate()
+    circuit = "/ip4/198.51.100.2/tcp/4001/p2p/RELAY/p2p-circuit/p2p/SELF"
+    rec = make_peer_record(nat_id, reachability="nat", roles=("owner",),
+                           circuit_addrs=[circuit])
+    epoch = make_epoch_record(sched, epoch=0, owner_records=[rec], k=1)
+    cfg = _cfg()
+    key = sorted(cfg.build_topology().module_keys())[0]
+    assert owners_for(key, epoch)[0]["addr"] == circuit

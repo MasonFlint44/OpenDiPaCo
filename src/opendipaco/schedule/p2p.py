@@ -94,7 +94,12 @@ def serve_over_libp2p(server, *, identity: PeerIdentity | None = None,
         # apply on the libp2p path exactly as on TCP.
         return server._handle(msg, _nbytes(msg), peer_id=peer_id)
 
-    return Libp2pTransport(ident, handler=handler, listen_addrs=listen_addrs).start()
+    t = Libp2pTransport(ident, handler=handler, listen_addrs=listen_addrs).start()
+    # Let the owner reuse this transport for outbound owner↔owner RPCs (_peer_rpc
+    # dials co-owners over libp2p / through relays when their addr is a multiaddr).
+    if hasattr(server, "libp2p"):
+        server.libp2p = t
+    return t
 
 
 class Libp2pTransport:

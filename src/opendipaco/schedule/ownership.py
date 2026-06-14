@@ -38,16 +38,30 @@ OWNER_ROLE = "owner"
 DEFAULT_REPLICATION = 3
 
 
+def owner_addr(record: dict):
+    """The address other peers dial to reach this owner: its direct ``addr``
+    (a ``public`` peer) or its first relay ``/p2p-circuit`` addr (a ``nat`` peer
+    reachable through relays, W1c). ``None`` if neither is present."""
+    if record.get("addr"):
+        return record["addr"]
+    circuits = record.get("circuit_addrs") or []
+    return circuits[0] if circuits else None
+
+
 def owner_eligible(record: dict) -> bool:
-    """May this (already-verified) peer record host modules?"""
+    """May this (already-verified) peer record host modules?
+
+    A ``public`` peer qualifies with a direct addr; a ``nat`` peer qualifies if
+    it advertises at least one relay circuit addr (so a NAT'd consumer machine
+    can serve as an owner, reached through a relay — the W1 goal)."""
     if not isinstance(record, dict) or record.get("kind") != "peer":
         return False
-    return (
-        record.get("reachability") == "public"
-        and OWNER_ROLE in (record.get("roles") or [])
-        and bool(record.get("addr"))
-        and isinstance(record.get("peer_id"), str)
-    )
+    if OWNER_ROLE not in (record.get("roles") or []) or not isinstance(
+            record.get("peer_id"), str):
+        return False
+    if record.get("reachability") == "public" and record.get("addr"):
+        return True
+    return record.get("reachability") == "nat" and bool(record.get("circuit_addrs"))
 
 
 def _score(salt: str, key: str, peer_id: str) -> bytes:
@@ -96,7 +110,7 @@ def make_epoch_record(identity: PeerIdentity, *, epoch: int, owner_records,
     for r in owner_records:
         if not owner_eligible(r):
             raise ValueError(f"record not owner-eligible: {r.get('peer_id')!r}")
-        owners.append({"peer_id": r["peer_id"], "addr": list(r["addr"])})
+        owners.append({"peer_id": r["peer_id"], "addr": owner_addr(r)})
     owners.sort(key=lambda o: o["peer_id"])
     return sign_record(identity, {
         "kind": "epoch",
@@ -144,7 +158,7 @@ def derive_epoch(owner_records, *, k: int = DEFAULT_REPLICATION, salt: str = "",
     owners = []
     for r in owner_records:
         if owner_eligible(r) and (is_eligible is None or is_eligible(r["peer_id"])):
-            owners.append({"peer_id": r["peer_id"], "addr": list(r["addr"])})
+            owners.append({"peer_id": r["peer_id"], "addr": owner_addr(r)})
     owners.sort(key=lambda o: o["peer_id"])
     sig = _members_sig(owners)
     if prev is not None and prev.get("members_sig") == sig and int(prev.get("k", k)) == int(k):
