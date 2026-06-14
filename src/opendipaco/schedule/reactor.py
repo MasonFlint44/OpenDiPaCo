@@ -117,6 +117,7 @@ class TransportMetrics:
     stale_rejected: int = 0
     invalid_rejected: int = 0   # non-finite gradient/weights/loss -> contribution dropped
     norm_clipped: int = 0       # pseudo-gradients scaled down to max_update_norm
+    handler_errors: int = 0     # a handler raised on a request -> connection dropped, thread kept
     staleness_sum: int = 0
     max_staleness: int = 0
     _wall: float = 0.0
@@ -152,6 +153,10 @@ class TransportMetrics:
     def record_norm_clip(self) -> None:
         with self._lock:
             self.norm_clipped += 1
+
+    def record_handler_error(self) -> None:
+        with self._lock:
+            self.handler_errors += 1
 
     def record_out(self, msg: dict, nbytes: int) -> None:
         with self._lock:
@@ -392,7 +397,16 @@ class _IOThread:
             except Exception:
                 self._close(conn)
                 return
-            self._dispatch(conn, msg, n + _HEADER.size)
+            try:
+                self._dispatch(conn, msg, n + _HEADER.size)
+            except Exception:  # noqa: BLE001 -- a handler must never kill the I/O thread
+                # Serving untrusted peers: a malformed/hostile request that slips
+                # past a handler's own validation drops just this connection (the
+                # peer reconnects), never the selector loop that serves everyone.
+                # Mirrors the libp2p _on_stream safety net.
+                self.server.metrics.record_handler_error()
+                self._close(conn)
+                return
 
     def _dispatch(self, conn: _Conn, msg: dict, nin: int) -> None:
         srv = self.server

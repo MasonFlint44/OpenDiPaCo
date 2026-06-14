@@ -374,8 +374,8 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None, identity=N
         staleness_weight=cfg.transport.staleness_weight,
         heartbeat_timeout=cfg.transport.heartbeat_timeout,
         ps_tls=build_tls_client(cfg), grant_key=cfg.transport.grant_key,
-        identity=ident, compress=cfg.transport.compress,
-        idle_backoff=cfg.transport.idle_backoff,
+        identity=ident, compress=cfg.transport.compress, down=cfg.transport.down,
+        up_density=cfg.transport.up_density, idle_backoff=cfg.transport.idle_backoff,
         **_scheduler_robustness_kw(cfg), **_server_kw(cfg, extra_admitted))
     scheduler.start()
     lp = _serve_libp2p(scheduler, cfg, ident) if _libp2p_routes(cfg) else None
@@ -433,7 +433,7 @@ def run_parameter_server(cfg: LaunchConfig, shard_id: int = 0, *, port=None,
         host=cfg.transport.host, device=cfg.run.device,
         grant_key=cfg.transport.grant_key,
         max_update_norm=cfg.transport.max_update_norm, compress=cfg.transport.compress,
-        resume_dir=resume_dir, **_ps_robustness_kw(cfg))
+        down=cfg.transport.down, resume_dir=resume_dir, **_ps_robustness_kw(cfg))
     node_ident = None
     if own.mode == "rendezvous":
         ident = node_ident = _node_identity(cfg, identity, generate=True)

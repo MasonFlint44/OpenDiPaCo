@@ -125,9 +125,22 @@ class TransportCfg:
     # Servers always reject non-finite contributions; this additionally clips a
     # pseudo-gradient whose L2 norm exceeds the cap (None = no cap).
     max_update_norm: float | None = None
-    # Wire compression: "none" (fp32, default), "bf16" (2x), or "int8"
-    # (bf16 weights + int8 pseudo-gradients with error feedback, ~4x up).
+    # Wire compression: "none" (fp32, default), "bf16" (2x), "int8" (bf16 weights
+    # + int8 pseudo-gradients with error feedback, ~4x up), or "int4" (int4
+    # per-group pseudo-gradients/deltas, ~8x up; bf16 weights). int8/int4 also set
+    # the down-delta precision (W2a/W2c). Off (none) is byte-identical.
     compress: str = "none"
+    # Downlink (weights) policy (W2; docs/w2-bandwidth-design.md): "full"
+    # (default, byte-identical) re-ships full weights; "delta" ships int8
+    # current-minus-keyframe when the worker holds a recent keyframe (the async
+    # cache the version churn defeats). Changes numerics -> off by default;
+    # validate with examples/validate_dynamics.py. Set on the scheduler AND owners.
+    down: str = "full"
+    # Up-path (pseudo-gradient) structured sparsification (W2b): the worker keeps
+    # each gradient's top `up_density` fraction (per output-row for 2-D weights)
+    # and error-feeds the dropped mass. 1.0 (default) = dense = byte-identical.
+    # Changes numerics -> validate with examples/validate_dynamics.py. Sharded only.
+    up_density: float = 1.0
     # When set, idle replies tell workers to wait this many seconds before
     # polling again (server-paced; otherwise workers use their own tight poll).
     idle_backoff: float | None = None
@@ -321,6 +334,21 @@ class LaunchConfig:
         if kw["transport"].kind not in ("tcp", "libp2p"):
             raise ValueError(
                 f"transport.kind must be 'tcp' or 'libp2p', got {kw['transport'].kind!r}")
+        if kw["transport"].down not in ("full", "delta"):
+            raise ValueError(
+                f"transport.down must be 'full' or 'delta', got {kw['transport'].down!r}")
+        # Delta-down lives on the sharded owner tier (the version ring + owner
+        # fetch). The single-node coordinator has no such path, so down="delta"
+        # there would silently do nothing -- fail fast instead.
+        if kw["transport"].down == "delta" and kw["mode"] != "sharded":
+            raise ValueError("transport.down: delta requires mode: sharded "
+                             "(delta-down is served by the owner tier)")
+        if not 0.0 < kw["transport"].up_density <= 1.0:
+            raise ValueError("transport.up_density must be in (0, 1], got "
+                             f"{kw['transport'].up_density!r}")
+        if kw["transport"].up_density < 1.0 and kw["mode"] != "sharded":
+            raise ValueError("transport.up_density < 1.0 requires mode: sharded "
+                             "(it is stamped on sharded tasks)")
         # Decentralized scheduling is built on the replicated owner tier, so it
         # requires rendezvous ownership (Phase 4 D9). Catch the mismatch at load
         # rather than half-wiring a run with no owners to mint grants.

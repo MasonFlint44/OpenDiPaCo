@@ -17,6 +17,14 @@ genuinely race and go stale), with two further deltas layered on:
 * robust aggregation (Phase 3, ``robustness: on``) — owner-side quorum buffering
   applies one aggregated outer step across sharing paths instead of one-at-a-time,
   which changes the outer step even with no adversaries.
+* ``delta-down`` (W2a, ``down: delta``) — the worker trains from a keyframe + int8
+  delta reconstruction of the weights instead of the exact (bf16) weights; does
+  the bounded reconstruction error still train?
+* ``sparse-up`` (W2b, ``up_density < 1``) — the worker sends only the top fraction
+  of each pseudo-gradient (error-feeding the rest); does sparsified communication
+  still train?
+* ``int4`` (W2c, ``compress: int4``) — int4 per-group pseudo-gradients/deltas; does
+  4-bit communication still train? (plus a ``W2 stacked`` arm with all three on.)
 
 All configs train the **same** corpus/sharding/seed and are evaluated by the same
 router-free metric (best-path perplexity on a held-out split), so the numbers are
@@ -119,24 +127,26 @@ def train_sync(config, diloco, corpus) -> dict:
     return eng.global_modules()
 
 
-def train_async(config, diloco, corpus, *, compress="none", robustness="off") -> dict:
+def train_async(config, diloco, corpus, *, compress="none", robustness="off",
+                down="full", up_density=1.0) -> dict:
     """The real in-process async sharded path (localhost TCP, worker oversupply
     so commits race + go stale). Returns the merged authoritative bank from the
     parameter servers -- no node held it whole."""
     keys = config.build_topology().module_keys()
     shards = [[k for k, s in assign_shards(keys, NUM_SHARDS).items() if s == i]
               for i in range(NUM_SHARDS)]
-    ps_kw = {}
+    ps_kw = {"down": down}
     if robustness == "on":
         # Small quorum/flush windows so partial buffers flush inside a short run.
-        ps_kw = dict(robustness="on", quorum_target=2, quorum_timeout=0.5,
-                     replicate_interval=0.2)
+        ps_kw |= dict(robustness="on", quorum_target=2, quorum_timeout=0.5,
+                      replicate_interval=0.2)
     pss = [ParameterServer(config, sk, diloco, host="127.0.0.1", port=0, **ps_kw)
            for sk in shards]
     for ps in pss:
         ps.start()
     sched = Scheduler(config, corpus, [("127.0.0.1", ps.port) for ps in pss], diloco,
-                      batch_size=BATCH, host="127.0.0.1", port=0, compress=compress)
+                      batch_size=BATCH, host="127.0.0.1", port=0, compress=compress,
+                      down=down, up_density=up_density)
     sched.start()
     n_workers = WORKERS or config.num_paths
     workers = [threading.Thread(
@@ -194,6 +204,10 @@ def main() -> None:
         ("async", dict(compress="none", robustness="off")),
         ("async + int8", dict(compress="int8", robustness="off")),
         ("async + robust agg", dict(compress="none", robustness="on")),
+        ("async + delta-down", dict(compress="int8", down="delta")),   # W2a
+        ("async + sparse-up", dict(compress="int8", up_density=0.25)),  # W2b
+        ("async + int4", dict(compress="int4")),                        # W2c
+        ("async + W2 stacked", dict(compress="int4", down="delta", up_density=0.25)),
     ]
     worst, all_learned = 1.0, True
     for name, kw in variants:

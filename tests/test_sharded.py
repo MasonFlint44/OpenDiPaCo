@@ -37,6 +37,42 @@ def _diloco():
     return DiLoCoConfig(inner_steps=4, inner_lr=1e-3)
 
 
+def test_reactor_survives_a_raising_handler():
+    """A handler that raises on a request must drop only that connection, not the
+    selector I/O thread that serves everyone (the reactor's safety net). A
+    malformed/hostile request that slips past a handler's own validation must not
+    take the server down."""
+    from opendipaco.schedule.sharded import DEFAULT_MAX_MSG_BYTES, _ps_connect, _rpc
+
+    cfg = _cfg()
+    ps = ParameterServer(cfg, sorted(cfg.build_topology().module_keys()), _diloco(),
+                         host="127.0.0.1", port=0)
+    ps.start()
+    orig = ps._handle
+
+    def boom(msg, n, peer_id=None):
+        if msg.get("type") == "boom":
+            raise RuntimeError("handler blew up")
+        return orig(msg, n, peer_id)
+
+    ps._handle = boom
+    addr = ("127.0.0.1", ps.port)
+    try:
+        s = _ps_connect(addr, None, DEFAULT_MAX_MSG_BYTES, 5.0)
+        try:
+            _rpc(s, {"type": "boom"}, DEFAULT_MAX_MSG_BYTES)   # drops the connection
+        except (OSError, ConnectionError, EOFError):
+            pass
+        s.close()
+        # The server survived: a fresh connection still gets a normal reply.
+        s2 = _ps_connect(addr, None, DEFAULT_MAX_MSG_BYTES, 5.0)
+        assert _rpc(s2, {"type": "status"}, DEFAULT_MAX_MSG_BYTES) is not None
+        s2.close()
+        assert ps.metrics.handler_errors >= 1
+    finally:
+        ps.shutdown()
+
+
 def _docs():
     g = torch.Generator().manual_seed(0)
     return [torch.randint(t * 12, t * 12 + 12, (48,), generator=g)

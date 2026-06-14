@@ -75,6 +75,31 @@ def test_transport_kind_parses_and_validates():
         LaunchConfig.from_dict({"transport": {"kind": "carrier-pigeon"}})
 
 
+def test_transport_down_parses_and_validates():
+    """W2a: transport.down selects the weights downlink policy (full default)."""
+    assert LaunchConfig.from_dict({}).transport.down == "full"
+    assert LaunchConfig.from_dict(
+        {"mode": "sharded", "transport": {"down": "delta"}}).transport.down == "delta"
+    with pytest.raises(ValueError):
+        LaunchConfig.from_dict({"transport": {"down": "gzip"}})
+    # delta-down is sharded-only -> fail fast instead of silently no-op'ing.
+    with pytest.raises(ValueError):
+        LaunchConfig.from_dict({"mode": "coordinator", "transport": {"down": "delta"}})
+
+
+def test_up_density_parses_and_validates():
+    """W2b: transport.up_density is the keep-fraction (1.0 default = dense)."""
+    assert LaunchConfig.from_dict({}).transport.up_density == 1.0
+    assert LaunchConfig.from_dict(
+        {"mode": "sharded", "transport": {"up_density": 0.1}}).transport.up_density == 0.1
+    for bad in (0.0, -0.1, 1.5):
+        with pytest.raises(ValueError):
+            LaunchConfig.from_dict({"mode": "sharded", "transport": {"up_density": bad}})
+    # sparsification is stamped on sharded tasks -> reject in coordinator mode.
+    with pytest.raises(ValueError):
+        LaunchConfig.from_dict({"mode": "coordinator", "transport": {"up_density": 0.5}})
+
+
 def test_libp2p_routes_gate():
     """W1d: libp2p routing is wired for static sharded mode; rendezvous keeps
     routing over TCP (epoch records carry TCP addrs) until multiaddr discovery
