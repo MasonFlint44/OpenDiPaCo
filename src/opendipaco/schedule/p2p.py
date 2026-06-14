@@ -446,6 +446,13 @@ class _Libp2pLink:
         except Exception:  # noqa: BLE001 -- a heartbeat is best-effort
             pass
 
+    def addr_key(self, a):
+        """Normalize a routing entry to this transport's dial target. libp2p
+        keeps it **as-is** -- a multiaddr string, or a *list* of a NAT owner's k
+        relay circuit addrs that ``rpc`` fails over across (a tuple would be
+        treated as one opaque target and lose the failover)."""
+        return a
+
     def connected(self, addr) -> bool:
         return False  # libp2p reuses connections itself; no preference to express
 

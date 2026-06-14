@@ -2159,7 +2159,11 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions,
         worker.seed = task["seed"]
         engine.total_rounds = task["total_rounds"]
         # Routing values are replica addr lists in rank order (primary first).
-        routing = {k: [_addr_key(a) for a in addrs] for k, addrs in task["routing"].items()}
+        # link.addr_key picks the per-transport dial target: a hashable (host,
+        # port) for TCP, the raw multiaddr / k-relay candidate *list* for libp2p
+        # (a NAT owner's relays, which rpc fails over across).
+        routing = {k: [link.addr_key(a) for a in addrs]
+                   for k, addrs in task["routing"].items()}
         check_only = bool(task.get("check_only"))
         audit = bool(task.get("audit"))
         # A check pins the audited primary's exact base; an audited primary (and
@@ -2238,11 +2242,14 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions,
             # distinct peers agree on the exact bytes (D5/3a).
             if (task.get("private_proposal") and contrib is not None
                     and contrib.private_state):
+                # Group by a hashable key but dial the raw target (a libp2p
+                # candidate *list* isn't hashable yet must stay a list to fail over).
                 by_owner: dict = {}
                 for k, sd in contrib.private_state.items():
                     if k in routing:
-                        by_owner.setdefault(routing[k][0], {})[k] = sd
-                for addr, states in by_owner.items():
+                        target = routing[k][0]
+                        by_owner.setdefault(_addr_key(target), (target, {}))[1][k] = sd
+                for addr, states in by_owner.values():
                     try:
                         link.ps_rpc(addr, {"type": "private_proposal", "private": states,
                                            "grant": task.get("grant")})
@@ -2308,7 +2315,7 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions,
                 if fresh is None:
                     raise OSError("scheduler disconnected during push retry")
                 fresh_routing = fresh.get("routing") or {}
-                retry = {k: [_addr_key(a) for a in fresh_routing[k]]
+                retry = {k: [link.addr_key(a) for a in fresh_routing[k]]
                          for k in failed if k in fresh_routing}
                 if retry:
                     _push_group(retry, grant, shared_payload, private_payload, link)
@@ -2329,11 +2336,13 @@ def _push_group(routing, grant, shared_payload, private_payload, link) -> set:
     an older epoch) or the primary was unreachable. Non-retryable refusals
     (bad grant, replay) return nothing -- a retry could never succeed.
     """
-    by_primary: dict = {}  # writes go to rank 0 only (design D3)
+    by_primary: dict = {}  # group_key -> (dial_target, [keys]); writes to rank 0 only (D3)
     for k, addrs in routing.items():
-        by_primary.setdefault(_addr_key(addrs[0]), []).append(k)
+        # Hashable group key, but dial the raw target -- a libp2p relay candidate
+        # list must stay a list so rpc fails over across the owner's k relays.
+        by_primary.setdefault(_addr_key(addrs[0]), (addrs[0], []))[1].append(k)
     failed: set = set()
-    for addr, keys in by_primary.items():
+    for addr, keys in by_primary.values():
         updates = {k: {"grad": shared_payload[k]}
                    for k in keys if not is_private_key(k) and k in shared_payload}
         private = {k: private_payload[k]
@@ -2415,6 +2424,11 @@ class _WorkerLink:
         with self._lock:                      # serialize writes; heartbeat waits its turn
             send_msg(self._sch, msg)
             return recv_msg(self._sch, self._max)
+
+    def addr_key(self, a):
+        """Normalize a routing entry to this transport's dial target. TCP keys its
+        socket cache by address, so an entry must be a hashable ``(host, port)``."""
+        return _addr_key(a)
 
     def connected(self, addr) -> bool:
         return addr in self._ps

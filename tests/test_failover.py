@@ -190,6 +190,31 @@ def test_zombie_fenced_and_lame_duck_lifecycle():
             ps.shutdown()
 
 
+def test_push_group_dials_relay_candidate_list_as_a_list():
+    """W1 review: a multi-relay NAT owner's routing entry is a candidate *list*;
+    _push_group must dial it as a list (so Libp2pTransport.rpc fails over across
+    the owner's k relays), not collapse it to one opaque target. A TCP owner's
+    single (host, port) target is dialed verbatim."""
+    from opendipaco.schedule.sharded import _push_group
+
+    seen = []
+
+    class _StubLink:
+        def ps_rpc(self, addr, msg):
+            seen.append(addr)
+            return {}                       # success: no not_primary refusal
+
+    grads = [torch.zeros(2)]
+    cands = ["/ip4/1/tcp/1/p2p/R1/p2p-circuit/p2p/S", "/ip4/2/tcp/2/p2p/R2/p2p-circuit/p2p/S"]
+    assert _push_group({"blk.0": [cands]}, {"g": 1}, {"blk.0": grads}, {}, _StubLink()) == set()
+    assert seen == [cands]                  # dialed the LIST, not tuple(cands)
+
+    seen.clear()
+    tcp = ("10.0.0.1", 29501)
+    assert _push_group({"blk.0": [tcp]}, {"g": 1}, {"blk.0": grads}, {}, _StubLink()) == set()
+    assert seen == [tcp]                    # TCP target dialed verbatim
+
+
 def test_stale_routing_push_retried_to_new_primary():
     """An epoch change mid-task must not silently drop an accepted update: the
     old primary refuses (``not_primary``) or is dead, the worker re-resolves
