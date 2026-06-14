@@ -327,16 +327,24 @@ class _Libp2pLink:
     owner). libp2p multiplexes streams over reused connections, so there is no
     socket cache to manage and no "prefer connected" preference to express."""
 
-    def __init__(self, transport: "Libp2pTransport", sched_addr: str):
+    def __init__(self, transport: "Libp2pTransport", sched_addr: str, *,
+                 rpc_timeout: float = 120.0, heartbeat_timeout: float = 15.0):
         self._t = transport
         self._sched = sched_addr
+        # Bounded waits: a peer that is alive but unresponsive (half-open NAT
+        # connection, network stall) must NOT hang the worker forever holding the
+        # rpc lock. A timeout surfaces as ConnectionError -> the worker's
+        # retry / next-replica paths absorb it. rpc covers large weight transfers,
+        # so it is generous; the heartbeat is short.
+        self._rpc_timeout = rpc_timeout
+        self._hb_timeout = heartbeat_timeout
 
     def sch_rpc(self, msg):
-        return self._t.rpc(self._sched, msg)
+        return self._t.rpc(self._sched, msg, timeout=self._rpc_timeout)
 
     def sch_send(self, msg) -> None:
         try:
-            self._t.rpc(self._sched, msg)  # heartbeat: handler returns None, reply is None
+            self._t.rpc(self._sched, msg, timeout=self._hb_timeout)  # reply is None
         except Exception:  # noqa: BLE001 -- a heartbeat is best-effort
             pass
 
@@ -344,7 +352,7 @@ class _Libp2pLink:
         return False  # libp2p reuses connections itself; no preference to express
 
     def ps_rpc(self, addr, msg):
-        return self._t.rpc(addr, msg)
+        return self._t.rpc(addr, msg, timeout=self._rpc_timeout)
 
     def close(self) -> None:
         self._t.close()

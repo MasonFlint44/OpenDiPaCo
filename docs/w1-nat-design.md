@@ -47,6 +47,26 @@ and **k≥2 relays** per NAT'd peer.
   so the worker's existing retry/next-replica paths absorb them (the libp2p
   worker retries while making progress, gives up only on sustained no-progress).
 
+**W1 checkpoint review (after W1a+W1b):**
+- *Fixed — libp2p rpcs had no timeout.* `_Libp2pLink` rpcs blocked forever if a
+  peer was alive but unresponsive (a half-open NAT connection / network stall),
+  hanging the worker while it held the rpc lock. Now bounded (rpc 120s, heartbeat
+  15s) and a timeout surfaces as `ConnectionError`, which the worker's
+  retry/next-replica paths already absorb.
+- *Gap, deferred to W1c — the authenticated peer identity is not threaded over
+  libp2p.* `serve_over_libp2p` calls `_handle(..., peer_id=None)`, so the
+  Phase 3/4 reputation, rate-limit, redundant-execution, and owner-eligibility
+  gates — and Phase 1 enrollment — are **bypassed on the libp2p path** (grant
+  verification still applies, so it isn't wide open). libp2p authenticates the
+  remote (Noise), so the fix is to map the stream's remote libp2p id → our
+  sha256 peer id via the D4 directory binding and pass it to `_handle`. This
+  needs the directory that carries both ids — W1c territory — so it lands there.
+- *Minor, noted:* the per-transport rpc lock serializes a server's *outbound*
+  rpcs (fine for the worker; W1c's owner replication will want per-peer locking);
+  the worker's `max_msg_bytes` isn't propagated to its libp2p transport (uses the
+  4 GiB default); and a relay's death doesn't yet trigger re-homing (W1c
+  failover). Teardown emits libp2p stderr noise during cleanup (cosmetic).
+
 **W1a amendments (discovered while building):**
 - *The trio↔threads bridge (the risk) is landed and proven* — `schedule/p2p.py`
   `Libp2pTransport` runs the host in a trio thread with a synchronous
