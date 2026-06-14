@@ -1,6 +1,21 @@
 # W3 design — fit one path in consumer VRAM
 
-Status: **design; no slices landed yet.** W3 (from [viability-roadmap.md](viability-roadmap.md))
+Status: **W3a landed; W3b/W3c/W3d pending.** W3 (from [viability-roadmap.md](viability-roadmap.md))
+
+**W3a status (VRAM profiler):** `src/opendipaco/train/memory.py` —
+`vram_breakdown(config, batch_size, seq_len, ...)` counts a path's real
+parameters on the **meta** device (so a model too big to allocate is still
+profiled) and returns the per-round peak by term (params / global / Adam(2×) /
+grads / activations + the `[tokens, vocab]` logits term), with flags modelling
+each lever (`autocast`, `checkpoint`, `chunked_logits`). Parameter/optimizer
+terms are exact; activations coarse. `measure_peak(...)` reports the **true**
+peak around a real round on CUDA (`max_memory_allocated`), `None` off CUDA.
+`examples/vram_budget.py` prints the breakdown, what each lever saves, and
+fit-vs-budget — e.g. a ~540M path goes 19 GB → 10.8 GB (checkpointing, fits
+12 GB) → 7.3 GB (8-bit Adam). The measured term shows the activation estimate is
+a planning aid, not the truth.
+
+
 removes the third practical wall to consumer-hardware training: a worker holds
 **one path**, not the whole model (DiPaCo's premise), but a *large* path can
 still exceed consumer VRAM. The dominant chunk for a real vocab is the **private
