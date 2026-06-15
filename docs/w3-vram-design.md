@@ -15,7 +15,17 @@ Status: **W3 complete (W3a–W3d).** W3 (from [viability-roadmap.md](viability-r
   the worker's private modules (deep-copies only shared, tie-safe) — saves ~the
   embed/head and lets private warm in-place across tasks. Off by default,
   §0f-gated (it changes warm-round private dynamics); `validate_dynamics` arm
-  converges.
+  converges. *Known characteristic (Codex review):* because training mutates the
+  aliased private in place, a warm task whose **shared** commit is rejected as
+  stale leaves its private training in place (seeding the next task) — unlike the
+  deep-copy path, which discards it. This is intended: private is local-
+  authoritative (only the shared pseudo-gradient is stale), and snapshotting to
+  restore would defeat the memory saving; it's part of the validated dynamics.
+- *8-bit step transient bounded (Codex review).* The step dequantizes moments to
+  fp32 per parameter; processing each parameter in **block-chunks**
+  (`_MAX_CHUNK_ELEMS`) keeps that a bounded transient instead of a full fp32 copy
+  of a huge embed/head — so the optimizer-step peak actually realizes the int8
+  storage win (the binding peak once checkpointing has shrunk activations).
 - *Deferred (D5 CPU-offloads):* optimizer CPU-offload (superseded by 8-bit Adam)
   and embedding row-gather (covered by tying) remain unbuilt PCIe-bound
   follow-ups, not needed to hit 12 GB.

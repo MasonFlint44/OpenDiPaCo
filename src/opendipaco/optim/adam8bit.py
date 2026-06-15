@@ -21,6 +21,10 @@ import torch
 from torch.optim import Optimizer
 
 _BLOCK = 256
+# Max elements dequantized to fp32 at once in step() -- bounds the transient
+# moment buffers so a huge embed/head doesn't materialize a full fp32 copy
+# (Codex review). Small params (< this) are one chunk, so no extra overhead.
+_MAX_CHUNK_ELEMS = 1 << 22
 
 
 def _to_blocks(t: torch.Tensor, block_size: int):
@@ -105,7 +109,6 @@ class Adam8bit(Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                g = p.grad
                 state = self.state[p]
                 if not state:
                     nblocks = (p.numel() + bs - 1) // bs
@@ -115,20 +118,39 @@ class Adam8bit(Optimizer):
                     state["v_q"] = torch.zeros((nblocks, bs), dtype=torch.uint8, device=p.device)
                     state["v_lo"] = torch.zeros(nblocks, device=p.device)
                     state["v_scale"] = torch.zeros(nblocks, device=p.device)
-                m = _dequantize_blockwise(state["m_q"], state["m_absmax"], p.numel(), p.shape)
-                # v is stored in the log domain, so a zero-init dequant would be
-                # exp(0)=1; on the first step v is exactly 0.
-                v = (_dequantize_v(state["v_q"], state["v_lo"], state["v_scale"], p.numel(),
-                                   p.shape) if state["step"] > 0 else torch.zeros_like(p))
+                first = state["step"] == 0
                 state["step"] += 1
                 t = state["step"]
-                m.mul_(b1).add_(g, alpha=1 - b1)
-                v.mul_(b2).addcmul_(g, g, value=1 - b2)
-                state["m_q"], state["m_absmax"] = _quantize_blockwise(m, bs)
-                state["v_q"], state["v_lo"], state["v_scale"] = _quantize_v(v, bs)
-                bc1 = 1 - b1 ** t
-                bc2 = 1 - b2 ** t
-                denom = (v.sqrt() / (bc2 ** 0.5)).add_(eps)
-                p.mul_(1 - lr * wd)                      # decoupled weight decay
-                p.addcdiv_(m, denom, value=-lr / bc1)
+                bc1, bc2_sqrt = 1 - b1 ** t, (1 - b2 ** t) ** 0.5
+                self._step_param(p, state, b1, b2, lr, eps, wd, bs, bc1, bc2_sqrt, first)
         return loss
+
+    @staticmethod
+    def _step_param(p, state, b1, b2, lr, eps, wd, bs, bc1, bc2_sqrt, first):
+        """Update one parameter in **block-chunks** so the dequantized fp32
+        moments (m, v, denom) are only ever a bounded transient -- never a full-
+        size copy of the (possibly huge) embed/head this lever is meant to fit.
+        The per-element AdamW is independent, so chunking is bit-identical to
+        processing the whole tensor at once."""
+        g, pflat = p.grad.reshape(-1), p.reshape(-1)
+        nblocks = state["m_q"].shape[0]
+        per_chunk = max(1, _MAX_CHUNK_ELEMS // bs)       # whole blocks per chunk
+        n = p.numel()
+        for c0 in range(0, nblocks, per_chunk):
+            c1 = min(c0 + per_chunk, nblocks)
+            e0, e1 = c0 * bs, min(c1 * bs, n)            # real elements in this chunk
+            gc = g[e0:e1]
+            if gc.numel() < (c1 - c0) * bs:              # pad the last block's tail
+                gc = torch.cat([gc, gc.new_zeros((c1 - c0) * bs - gc.numel())])
+            m = _dequantize_blockwise(state["m_q"][c0:c1], state["m_absmax"][c0:c1],
+                                      (c1 - c0) * bs, (-1,))
+            v = (torch.zeros_like(gc) if first else
+                 _dequantize_v(state["v_q"][c0:c1], state["v_lo"][c0:c1],
+                               state["v_scale"][c0:c1], (c1 - c0) * bs, (-1,)))
+            m.mul_(b1).add_(gc, alpha=1 - b1)
+            v.mul_(b2).addcmul_(gc, gc, value=1 - b2)
+            state["m_q"][c0:c1], state["m_absmax"][c0:c1] = _quantize_blockwise(m, bs)
+            state["v_q"][c0:c1], state["v_lo"][c0:c1], state["v_scale"][c0:c1] = _quantize_v(v, bs)
+            real = e1 - e0
+            denom = (v[:real].sqrt() / bc2_sqrt).add_(eps)
+            pflat[e0:e1].mul_(1 - lr * wd).addcdiv_(m[:real], denom, value=-lr / bc1)

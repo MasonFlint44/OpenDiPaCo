@@ -61,6 +61,28 @@ def test_adam8bit_tracks_fp32_adamw():
     assert (q8 - ref).abs().mean() < 0.02
 
 
+def test_chunked_step_matches_single_chunk(monkeypatch):
+    """step() processes a param in block-chunks so the dequantized fp32 moments
+    stay a bounded transient (not a full copy of a huge embed/head). Forcing many
+    small chunks must land bit-identically on a single big chunk."""
+    import opendipaco.optim.adam8bit as a8
+
+    def run(max_chunk):
+        monkeypatch.setattr(a8, "_MAX_CHUNK_ELEMS", max_chunk)
+        torch.manual_seed(0)
+        x = torch.randn(2000, requires_grad=True)
+        opt = a8.Adam8bit([x], lr=0.1)
+        for _ in range(5):
+            opt.zero_grad()
+            ((x - 1) ** 2).sum().backward()
+            opt.step()
+        return x.detach().clone()
+
+    one_chunk = run(1 << 22)        # whole param in one chunk
+    many_chunks = run(512)          # 512 elems/chunk -> several chunks
+    assert torch.equal(one_chunk, many_chunks)
+
+
 def test_adam8bit_state_is_small_and_serializable():
     """Moments are stored int8 (~2 B/param vs 8) and survive the CPU offload
     round-trip the worker does between tasks."""
