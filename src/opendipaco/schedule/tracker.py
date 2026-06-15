@@ -187,7 +187,8 @@ class Tracker(_ReactorServer):
             entry = self._peers.get(record["peer_id"])
             if entry is not None and record.get("issued_at", 0) <= entry["issued_at"]:
                 return {"type": "refused", "reason": "stale record"}
-            self._tombstone_locked(record["peer_id"], record.get("issued_at", time.time()))
+            self._tombstone_locked(record["peer_id"], record.get("issued_at", time.time()),
+                                   deregister=record)
         return {"type": "deregistered"}
 
     def _directory(self, msg: dict) -> dict:
@@ -198,9 +199,14 @@ class Tracker(_ReactorServer):
             records = [e["record"] for e in self._peers.values() if e["record"] is not None]
             # Tombstones (explicit signed deregistrations still within TTL): the
             # scheduler uses these to fail a graceful leave over *now*, skipping
-            # owner_grace (W4b). Only sent when asked, so existing callers are
-            # byte-unchanged. Atomic with ``records`` under the directory lock.
-            tombs = ([pid for pid, e in self._peers.items() if e["record"] is None]
+            # owner_grace (W4b). We surface the **signed deregister record**, not a
+            # bare peer id, so the consumer re-verifies it (a compromised/relayed
+            # tracker can't fabricate a fast-eviction -- the self-certifying
+            # principle). Tracker-initiated expel tombstones carry no signed
+            # record, so they are *not* surfaced and fall back to TTL+grace. Only
+            # sent when asked; atomic with ``records`` under the directory lock.
+            tombs = ([e["deregister"] for e in self._peers.values()
+                      if e["record"] is None and e.get("deregister")]
                      if msg.get("include_tombstones") else None)
         if roles:
             records = [r for r in records if roles & set(r.get("roles") or [])]
@@ -235,8 +241,13 @@ class Tracker(_ReactorServer):
             return False, "missing issued_at"
         return True, ""
 
-    def _tombstone_locked(self, peer_id: str, issued_at: float) -> None:
-        self._peers[peer_id] = {"record": None, "issued_at": issued_at,
+    def _tombstone_locked(self, peer_id: str, issued_at: float, deregister=None) -> None:
+        # ``deregister`` is the peer's own signed deregister record (None for a
+        # tracker-initiated expel). Retained so the directory can surface a
+        # *verifiable* tombstone for fast-eviction (W4b); expel tombstones carry
+        # none and so never trigger a grace-skipping eviction downstream.
+        self._peers[peer_id] = {"record": None, "deregister": deregister,
+                                "issued_at": issued_at,
                                 "expires": time.monotonic() + self.ttl}
 
     def _purge_locked(self) -> None:
@@ -315,9 +326,13 @@ def fetch_directory_and_tombstones(addr, *, roles=None, reachability=None, auth_
                                "reachability": reachability, "include_tombstones": True},
                         auth_key=auth_key, tls=tls, timeout=timeout) or {}
     records = reply.get("records") or []
+    tombs = reply.get("tombstones") or []
     if verify:
         records = [r for r in records if verify_record(r)]
-    return records, list(reply.get("tombstones") or [])
+        # Each tombstone is the peer's own signed deregister: verify it (signature
+        # + honest peer_id + kind) so a fabricated/relayed one can't fast-evict.
+        tombs = [t for t in tombs if verify_record(t) and t.get("kind") == "deregister"]
+    return records, [t["peer_id"] for t in tombs]
 
 
 def import_records(addr, records, *, auth_key=None, tls=None, timeout: float = 10.0) -> dict:

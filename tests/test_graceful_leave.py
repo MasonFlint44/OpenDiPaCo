@@ -123,6 +123,30 @@ def test_tracker_surfaces_tombstone_and_rejects_forgery():
         tracker.shutdown()
 
 
+def test_expel_tombstone_is_not_surfaced_for_fast_evict():
+    """A tracker-initiated expel tombstones the peer (drops it from the directory)
+    but carries no peer-signed deregister, so it is NOT surfaced as a fast-evict
+    tombstone -- a compromised tracker can't skip owner_grace. Only a peer's own
+    signed deregister fast-evicts; an expel falls back to TTL+grace."""
+    from opendipaco.schedule.tracker import fetch_directory_and_tombstones, tracker_rpc
+
+    ida, idb = PeerIdentity.generate(), PeerIdentity.generate()
+    tracker = Tracker(host="127.0.0.1", port=0, open_enrollment=True, ttl=30.0)
+    tracker.start()
+    taddr = ("127.0.0.1", tracker.port)
+    try:
+        for i, port in ((ida, 9001), (idb, 9002)):
+            tracker_rpc(taddr, {"type": "register", "record": _owner_record(i, port)})
+        tracker.expel(idb)                                 # tracker-forced, unsigned
+        assert idb.peer_id in tracker.tombstones()         # tombstoned (record None)
+        recs, tombs = fetch_directory_and_tombstones(taddr, roles=["owner"],
+                                                     reachability="public")
+        assert idb.peer_id not in {r["peer_id"] for r in recs}   # gone from directory
+        assert tombs == []                                 # but NOT a fast-evict signal
+    finally:
+        tracker.shutdown()
+
+
 # -- (3) worker lease return (nack) frees the path immediately -------------------
 
 
@@ -154,6 +178,32 @@ def test_scheduler_nack_frees_lease_and_fences_stale_token():
         # A second nack with the original (now stale) lease can't free the re-lease.
         assert sched._nack({"path": path, "lease": lease})["freed"] is False
         assert path in sched._inflight
+    finally:
+        sched.shutdown()
+
+
+def test_worker_stop_event_exits_cleanly_without_leasing():
+    """The graceful-leave plumbing through run_sharded_worker: a worker whose
+    stop_event is already set leaves at the loop top (after connecting) without
+    taking a task, and the call returns promptly instead of blocking."""
+    import threading
+
+    from opendipaco.schedule import run_sharded_worker
+
+    cfg = _cfg()
+    sched = Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1)], DiLoCoConfig(inner_steps=2),
+                      batch_size=BATCH, host="127.0.0.1", port=0)
+    sched.start()
+    stop = threading.Event()
+    stop.set()
+    try:
+        t = threading.Thread(
+            target=run_sharded_worker,
+            args=(cfg, DiLoCoConfig(inner_steps=2), ("127.0.0.1", sched.port)),
+            kwargs=dict(stop_event=stop), daemon=True)
+        t.start()
+        t.join(timeout=10)
+        assert not t.is_alive()                 # exited promptly, didn't block on tasks
     finally:
         sched.shutdown()
 

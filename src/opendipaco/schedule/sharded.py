@@ -1069,7 +1069,9 @@ class ParameterServer(_ReactorServer):
         if graceful and self.identity is not None and self._seed_addr is not None:
             try:
                 from .tracker import deregister_peer  # lazy: tracker imports this
-                deregister_peer(self._seed_addr, self.identity,
+                # Short timeout: a closing node (laptop lid) must not block on a
+                # slow/absent tracker -- past the budget, fall back to TTL+grace.
+                deregister_peer(self._seed_addr, self.identity, timeout=3.0,
                                 auth_key=self._tracker_auth, tls=self._tracker_tls)
             except (OSError, ConnectionError):
                 pass  # tracker away -> fall back to TTL+grace expiry
