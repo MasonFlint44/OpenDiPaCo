@@ -70,6 +70,18 @@ def test_churn_arm_abrupt_survives_and_fails_over():
     assert m["failover_s"] is not None         # backups served every key again
 
 
+def test_churn_arm_graceful_fails_over_skipping_grace():
+    """An owner leaving cleanly (shutdown(graceful=True)) tombstones itself, so
+    the scheduler fails it over immediately -- the latency is well under
+    owner_grace, unlike the abrupt arm which must wait out TTL + grace."""
+    from validate_churn import run_arm
+
+    grace = 2.0
+    m = run_arm("graceful", rounds=4, owner_grace=grace, verbose=False)
+    assert m["survived"] and m["epochs"] >= 1
+    assert m["failover_s"] is not None and m["failover_s"] < grace   # skipped grace
+
+
 def test_churn_arm_flap_is_absorbed():
     """An owner silent within owner_grace and back causes no epoch bump (the
     hysteresis the harness exists to size), and the run completes."""

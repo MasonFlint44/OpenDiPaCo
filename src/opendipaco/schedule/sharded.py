@@ -455,6 +455,8 @@ class ParameterServer(_ReactorServer):
         self._directory: dict = {}   # peer_id -> verified peer record (TTL-pruned)
         self._self_record = None     # this owner's own peer record, gossiped onward
         self._seed_addr = None       # bootstrap tracker (gossip survives its loss)
+        self._tracker_auth = None    # tracker creds, for a graceful deregister (W4b)
+        self._tracker_tls = None
         # path tuple -> [generation, opened_at] (the per-path clock + fence).
         self._gen: dict = {}
 
@@ -994,6 +996,9 @@ class ParameterServer(_ReactorServer):
         # is what this owner gossips onward so its membership propagates even
         # after the tracker is gone.
         self._seed_addr = addr
+        # Remembered so a graceful shutdown can deregister (W4b): the scheduler's
+        # epoch watcher then fails this owner over immediately, skipping grace.
+        self._tracker_auth, self._tracker_tls = auth_key, tls
 
         def beat():
             while not (self._stop or self._dead):
@@ -1054,7 +1059,20 @@ class ParameterServer(_ReactorServer):
                 pass
             raise
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, graceful: bool = False) -> None:
+        """Stop the owner. ``graceful=True`` first sends a signed deregister to
+        the tracker (W4b) so the scheduler's epoch watcher fails this owner over
+        **immediately**, skipping ``owner_grace`` -- a clean leave instead of a
+        timeout. Best-effort: if the tracker is unreachable, the TTL+grace path
+        still applies, so a graceful shutdown is never worse than an abrupt one.
+        The default (``graceful=False``) is byte-identical to before."""
+        if graceful and self.identity is not None and self._seed_addr is not None:
+            try:
+                from .tracker import deregister_peer  # lazy: tracker imports this
+                deregister_peer(self._seed_addr, self.identity,
+                                auth_key=self._tracker_auth, tls=self._tracker_tls)
+            except (OSError, ConnectionError):
+                pass  # tracker away -> fall back to TTL+grace expiry
         self._repl_stop.set()
         with self._lock:
             self._flush_all_buffers_locked()  # don't drop accepted-but-buffered work
@@ -1633,6 +1651,8 @@ class Scheduler(_ReactorServer):
             return self._commit(msg, peer_id)
         if kind == "routing":
             return self._fresh_routing(msg)
+        if kind == "nack":
+            return self._nack(msg)
         if kind == "heartbeat":
             self._heartbeat(msg)
             return None
@@ -1687,7 +1707,11 @@ class Scheduler(_ReactorServer):
         """
         if self.identity is None:
             raise RuntimeError("watch_tracker needs the scheduler's identity=")
-        from .tracker import fetch_directory, get_epoch, put_epoch  # lazy: tracker imports this
+        from .tracker import (  # lazy: tracker imports this
+            fetch_directory_and_tombstones,
+            get_epoch,
+            put_epoch,
+        )
 
         manager = EpochManager(
             owner_grace=owner_grace, min_epoch_interval=min_epoch_interval,
@@ -1712,9 +1736,10 @@ class Scheduler(_ReactorServer):
         def watch():
             while True:
                 try:
-                    records = fetch_directory(addr, roles=["owner"], reachability="public",
-                                              auth_key=tracker_auth, tls=tracker_tls)
-                    due = manager.observe(records)
+                    records, tombstoned = fetch_directory_and_tombstones(
+                        addr, roles=["owner"], reachability="public",
+                        auth_key=tracker_auth, tls=tracker_tls)
+                    due = manager.observe(records, tombstoned=tombstoned)
                     if due is not None:
                         record = self.publish_epoch(due, k=k, salt=salt)
                         if cache_on_tracker:
@@ -1999,6 +2024,20 @@ class Scheduler(_ReactorServer):
             elif rep is False:
                 self.reputation.debit(peer_id)
 
+    def _nack(self, msg: dict) -> dict:
+        """A worker voluntarily returning its lease (graceful leave, W4b): free
+        the in-flight lease **now** so the path is re-leasable immediately
+        instead of after the heartbeat timeout. Fenced by the lease token (a
+        stale/zombie nack can't free a path that's since been re-leased), and
+        reputation-neutral -- returning work cleanly is not a fault."""
+        path = msg.get("path")
+        with self._lock:
+            if path in self._inflight and msg.get("lease") == self._lease.get(path):
+                self._inflight.pop(path, None)
+                self._lease.pop(path, None)
+                return {"type": "nack_ack", "freed": True}
+        return {"type": "nack_ack", "freed": False}
+
     def _heartbeat(self, msg: dict) -> None:
         path = msg["path"]
         with self._lock:
@@ -2171,7 +2210,8 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
                        connect_timeout=10.0, reconnect=False, reconnect_timeout=30.0,
                        fault_hook=None, tls=None, tls_hostname=None,
                        data_dir=None, data_source=None, data_tokenizer=None,
-                       max_batch_size=None, transport="tcp", identity=None):
+                       max_batch_size=None, transport="tcp", identity=None,
+                       stop_event=None):
     """Train path-tasks for a sharded scheduler + parameter servers.
 
     Per task: lease from the scheduler, fetch the path's modules from the owning
@@ -2217,8 +2257,8 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
                     if _serve_sharded(link, engine, worker, wid, warm, shard_cache,
                                       versions, keyframes, residuals, data_ctx, caps, state,
                                       heartbeat_interval, poll_interval, max_tasks,
-                                      fault_hook):
-                        return  # clean finish (stop / budget)
+                                      fault_hook, stop_event):
+                        return  # clean finish (stop / budget / graceful leave)
                 except (OSError, ConnectionError):
                     pass  # transient libp2p fault (e.g. a raced dial) -> retry
                 if state["done"] > last_done:    # progress -> the fault was transient
@@ -2249,7 +2289,8 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
         try:
             clean = _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions,
                                    keyframes, residuals, data_ctx, caps, state,
-                                   heartbeat_interval, poll_interval, max_tasks, fault_hook)
+                                   heartbeat_interval, poll_interval, max_tasks, fault_hook,
+                                   stop_event)
         except (OSError, ConnectionError):
             clean = False  # disconnected -> reconnect (if enabled)
         finally:
@@ -2260,18 +2301,28 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
                 pass
         if clean or not reconnect:
             return
+        if stop_event is not None and stop_event.is_set():
+            return  # graceful leave during a disconnect: don't reconnect
         time.sleep(backoff)
         backoff = min(backoff * 2, 1.0)
 
 
 def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions, keyframes,
                    residuals, data_ctx, caps, state, heartbeat_interval, poll_interval,
-                   max_tasks, fault_hook) -> bool:
+                   max_tasks, fault_hook, stop_event=None) -> bool:
     """One scheduler connection: serve tasks. Returns True on a clean finish (stop /
     budget), raises ``OSError`` on a disconnect (so the caller can reconnect). All
     peer comms go through ``link`` (the transport seam), so TCP and libp2p share
-    this loop verbatim."""
+    this loop verbatim.
+
+    ``stop_event`` (W4b graceful leave): when set, the worker stops between tasks
+    and -- if it had *just* leased one -- nacks it, so the path is re-leasable
+    immediately instead of after the lease timeout. A worker already mid-train
+    (the expensive part, which can't be interrupted) finishes and commits that
+    task, then leaves at the next loop top -- no work lost, no nack needed."""
     while True:
+        if stop_event is not None and stop_event.is_set():
+            return True  # graceful leave between tasks
         task = link.sch_rpc({"type": "request", "worker_id": wid,
                              "warm_paths": list(warm), "cached_shards": list(shard_cache),
                              "capabilities": caps})
@@ -2285,6 +2336,12 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions, keyfr
 
         path = task["path"]
         lease = task.get("lease")
+        # Graceful leave raced the lease: return it now (fenced by the token) so
+        # the scheduler re-leases the path immediately, not after a timeout.
+        if stop_event is not None and stop_event.is_set():
+            if lease is not None and not task.get("check_only"):
+                link.sch_rpc({"type": "nack", "path": path, "lease": lease, "worker_id": wid})
+            return True
         worker.seed = task["seed"]
         engine.total_rounds = task["total_rounds"]
         # Routing values are replica addr lists in rank order (primary first).

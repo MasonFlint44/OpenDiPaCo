@@ -196,11 +196,20 @@ class Tracker(_ReactorServer):
         with self._dir_lock:
             self._purge_locked()
             records = [e["record"] for e in self._peers.values() if e["record"] is not None]
+            # Tombstones (explicit signed deregistrations still within TTL): the
+            # scheduler uses these to fail a graceful leave over *now*, skipping
+            # owner_grace (W4b). Only sent when asked, so existing callers are
+            # byte-unchanged. Atomic with ``records`` under the directory lock.
+            tombs = ([pid for pid, e in self._peers.items() if e["record"] is None]
+                     if msg.get("include_tombstones") else None)
         if roles:
             records = [r for r in records if roles & set(r.get("roles") or [])]
         if reachability:
             records = [r for r in records if r.get("reachability") == reachability]
-        return {"type": "directory", "records": records}
+        reply = {"type": "directory", "records": records}
+        if tombs is not None:
+            reply["tombstones"] = tombs
+        return reply
 
     def _import(self, records) -> dict:
         """Bulk-adopt relayed records (gossip / bootstrap-from-a-peer's-cache)."""
@@ -240,6 +249,12 @@ class Tracker(_ReactorServer):
         with self._dir_lock:
             self._purge_locked()
             return [e["record"] for e in self._peers.values() if e["record"] is not None]
+
+    def tombstones(self) -> list[str]:
+        """Peer ids with a live (within-TTL) explicit deregistration (W4b)."""
+        with self._dir_lock:
+            self._purge_locked()
+            return [pid for pid, e in self._peers.items() if e["record"] is None]
 
 
 # -- client side --------------------------------------------------------------------
@@ -288,6 +303,21 @@ def fetch_directory(addr, *, roles=None, reachability=None, auth_key=None, tls=N
                         auth_key=auth_key, tls=tls, timeout=timeout)
     records = (reply or {}).get("records") or []
     return [r for r in records if verify_record(r)] if verify else records
+
+
+def fetch_directory_and_tombstones(addr, *, roles=None, reachability=None, auth_key=None,
+                                   tls=None, timeout: float = 10.0, verify: bool = True):
+    """Like :func:`fetch_directory` but also returns the explicit-deregistration
+    tombstone peer ids (one atomic round trip). The scheduler's epoch watcher
+    uses the tombstones to fail a graceful leave over immediately, skipping
+    ``owner_grace`` (W4b). Returns ``(records, tombstone_peer_ids)``."""
+    reply = tracker_rpc(addr, {"type": "directory", "roles": list(roles or []),
+                               "reachability": reachability, "include_tombstones": True},
+                        auth_key=auth_key, tls=tls, timeout=timeout) or {}
+    records = reply.get("records") or []
+    if verify:
+        records = [r for r in records if verify_record(r)]
+    return records, list(reply.get("tombstones") or [])
 
 
 def import_records(addr, records, *, auth_key=None, tls=None, timeout: float = 10.0) -> dict:

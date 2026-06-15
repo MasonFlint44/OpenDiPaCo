@@ -272,6 +272,9 @@ class EpochManager:
     * an owner joins the desired set as soon as a valid eligible record is
       seen, but **leaves only after being unseen for** ``owner_grace`` seconds
       (a flapping owner -- gone and back within the grace -- causes no bump);
+    * an owner that has **explicitly, signed-deregistered** (a tracker
+      tombstone, passed as ``tombstoned=``) leaves **immediately**, skipping the
+      grace -- a graceful departure (W4b) shouldn't wait out the silence timer;
     * an owner re-registering with a *different address* counts as a change;
     * bumps are rate-limited to one per ``min_epoch_interval`` seconds, so a
       burst of churn batches into a single epoch;
@@ -293,12 +296,22 @@ class EpochManager:
         self._current: set | None = None                # (peer_id, addr) signature
         self._last_bump: float | None = None
 
-    def observe(self, records, *, now: float | None = None):
-        """One directory snapshot in; the next epoch's owner records out (or None)."""
+    def observe(self, records, *, tombstoned=(), now: float | None = None):
+        """One directory snapshot in; the next epoch's owner records out (or None).
+
+        ``tombstoned`` is the set of peer ids the tracker reports as explicitly
+        deregistered (signed-departed); they are dropped from the desired set
+        **now**, bypassing ``owner_grace`` -- a clean leave fails over fast.
+        """
         now = time.monotonic() if now is None else now
         for r in records:
             if owner_eligible(r) and (self.is_eligible is None or self.is_eligible(r["peer_id"])):
                 self._seen[r["peer_id"]] = (now, r)
+        # Explicit signed departures (W4b) skip the grace: treat them as gone now.
+        # Done after ingesting ``records`` so a tombstone wins over a stale record
+        # that still advertises the peer (e.g. relayed before the deregister).
+        for p in set(tombstoned):
+            self._seen.pop(p, None)
         expired = [p for p, (t, _) in self._seen.items() if now - t >= self.owner_grace]
         for p in expired:
             del self._seen[p]

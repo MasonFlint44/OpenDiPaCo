@@ -9,12 +9,15 @@ through a home-style churn process and measure what actually happens.
 It is a true in-process cluster -- a real ``Tracker`` + ``Scheduler`` +
 ``n_owners`` ``ParameterServer`` owners + ``run_sharded_worker`` workers over
 loopback (the ``test_failover.py`` marquee setup, generalized) -- so it exercises
-the genuine failover path, not a primitive. Five arms, each a churn pattern
+the genuine failover path, not a primitive. Six arms, each a churn pattern
 injected mid-run:
 
-  * ``none``    -- control: no churn (baseline epochs/reclaims/progress);
-  * ``abrupt``  -- an owner crashes (``simulate_crash``): TTL + grace -> epoch
-                   bump -> a backup is promoted -> workers fail over;
+  * ``none``     -- control: no churn (baseline epochs/reclaims/progress);
+  * ``abrupt``   -- an owner crashes (``simulate_crash``): TTL + grace -> epoch
+                    bump -> a backup is promoted -> workers fail over;
+  * ``graceful`` -- an owner leaves cleanly (``shutdown(graceful=True)``): a
+                    signed deregister tombstones it, so failover skips
+                    ``owner_grace`` and beats the abrupt latency (W4b);
   * ``suspend`` -- an owner stops heartbeating past ``owner_grace`` (a slept
                    laptop: ``pause_heartbeat``), is remapped out, then wakes
                    (``resume_heartbeat``) and rejoins;
@@ -207,10 +210,14 @@ def _inject(churn, sched, pss, metrics, *, owner_grace, spawn) -> None:
         return
     _await(lambda: sched._T >= max(1, sched._target // 3), 20)
     victim = pss[0]
-    if churn == "abrupt":
+    if churn in ("abrupt", "graceful"):
         t0 = time.monotonic()
-        victim.simulate_crash()                    # drop every conn; heartbeat dies
-        # Failover latency: crash -> the surviving owners serve every key active.
+        if churn == "abrupt":
+            victim.simulate_crash()                # drop every conn; heartbeat dies
+        else:
+            victim.shutdown(graceful=True)         # signed deregister -> skip grace
+        # Failover latency: departure -> the surviving owners serve every key
+        # active. The graceful tombstone should beat abrupt's TTL+grace wait.
         survivors = pss[1:]
         if _await(lambda: _covered(sched, survivors, victim), 25):
             metrics["failover_s"] = round(time.monotonic() - t0, 2)
@@ -256,7 +263,8 @@ def _settled(churn, sched, pss) -> bool:
     rec = sched._epoch_record
     if rec is None:
         return False
-    live = [ps for ps in pss if not ps._dead]
+    # A crashed (_dead) or gracefully-stopped (_stop) owner is no longer live.
+    live = [ps for ps in pss if not ps._dead and not getattr(ps, "_stop", False)]
     return all(ps._epoch_num == rec["epoch"] and ps._active >= ps.owned_keys
                for ps in live)
 
@@ -280,7 +288,7 @@ def _report(m) -> None:
 def main() -> None:
     rounds, k = _i("ROUNDS", 6), _i("K", 3)
     arm = os.environ.get("ARM")
-    arms = [arm] if arm else ["none", "abrupt", "suspend", "flap", "join"]
+    arms = [arm] if arm else ["none", "abrupt", "graceful", "suspend", "flap", "join"]
     print(f"churn validation (rounds={rounds}, k={k}, real in-process cluster)")
     results = [run_arm(a, rounds=rounds, k=k) for a in arms]
     # Verdicts: every arm survives; abrupt/suspend/join remap, flap does not.
