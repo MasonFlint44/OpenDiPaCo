@@ -374,6 +374,11 @@ class ParameterServer(_ReactorServer):
         self._repl_stop = threading.Event()
         self._repl_thread = None
         self._beat_thread = None
+        # Set => the tracker heartbeat skips re-registration (the server stays up
+        # but stops refreshing its TTL): a deterministic *suspend* injection for
+        # the churn harness (examples/validate_churn.py). Clear by default, so
+        # the normal path is unchanged; resume_heartbeat() clears it.
+        self._hb_paused = threading.Event()
         # With a scheduler address the replication loop also polls for newer
         # epoch records, so ownership changes reach owners without restarts.
         self._scheduler_addr = tuple(scheduler_addr) if scheduler_addr else None
@@ -992,21 +997,32 @@ class ParameterServer(_ReactorServer):
 
         def beat():
             while not (self._stop or self._dead):
-                try:
-                    self._self_record = make_peer_record(
-                        self.identity, reachability="public",
-                        addr=(advertise_host, self.port), roles=roles,
-                        capabilities=capabilities)
-                    register_peer(addr, self.identity, reachability="public",
-                                  peer_addr=(advertise_host, self.port), roles=roles,
-                                  capabilities=capabilities, auth_key=auth_key, tls=tls)
-                except (OSError, ConnectionError):
-                    pass  # tracker briefly away; the next beat retries
+                if not self._hb_paused.is_set():  # suspended: let the TTL lapse
+                    try:
+                        self._self_record = make_peer_record(
+                            self.identity, reachability="public",
+                            addr=(advertise_host, self.port), roles=roles,
+                            capabilities=capabilities)
+                        register_peer(addr, self.identity, reachability="public",
+                                      peer_addr=(advertise_host, self.port), roles=roles,
+                                      capabilities=capabilities, auth_key=auth_key, tls=tls)
+                    except (OSError, ConnectionError):
+                        pass  # tracker briefly away; the next beat retries
                 if self._repl_stop.wait(interval):
                     return
 
         self._beat_thread = threading.Thread(target=beat, daemon=True)
         self._beat_thread.start()
+
+    def pause_heartbeat(self) -> None:
+        """Stop refreshing the tracker TTL while the server keeps running -- a
+        deterministic *suspend* (sleep) injection for the churn harness. The
+        record lapses after the tracker's TTL exactly as a slept laptop would."""
+        self._hb_paused.set()
+
+    def resume_heartbeat(self) -> None:
+        """Resume tracker re-registration after :meth:`pause_heartbeat` (wake)."""
+        self._hb_paused.clear()
 
     def _owner_targets(self, owner):
         """Dial target(s) for an owner epoch entry: a candidate list of its relay
