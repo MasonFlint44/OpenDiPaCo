@@ -120,6 +120,18 @@ def test_make_inner_optimizer_selects_8bit():
     assert not isinstance(make_inner_optimizer(pm, DiLoCoConfig()), Adam8bit)
 
 
+def test_w3_launch_flags_reach_diloco_config():
+    """The W3 levers are off-by-default config flags; verify they actually flow
+    from the launch config into DiLoCoConfig (a missing mapping would silently
+    make them inert)."""
+    from opendipaco.launch.config import DiLoCoCfg, diloco_config
+
+    d = diloco_config(DiLoCoCfg(optim_8bit=True, dedup_private=True, loss_chunks=3))
+    assert d.optim_8bit and d.dedup_private and d.loss_chunks == 3
+    base = diloco_config(DiLoCoCfg())
+    assert not base.optim_8bit and not base.dedup_private and base.loss_chunks == 1
+
+
 def test_optim_8bit_trains():
     cfg = _cfg()
     pm = build_path_model(cfg, cfg.build_topology().path_from_index(0),
