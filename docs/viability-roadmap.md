@@ -137,14 +137,21 @@ cheapest complementary lever and costs no new code.
 
 ## Tier B1 — needed for "large model" + "consumer GPU" specifically
 
-### W3 · Fit one path in consumer VRAM · B1 · [eng]
+### W3 · Fit one path in consumer VRAM · B1 · [eng] · **landed (W3a–W3d)**
 
-DiPaCo's premise already helps enormously — a worker holds **one path**, not the
-whole model — but a single large path can still exceed 8–24 GB, and the
-embedding/head (vocab × hidden, per-path-private under the paper semantics) is
-often the dominant chunk. Needs activation checkpointing, CPU/disk **offload**
-of the path's non-resident modules, and/or quantized (int8/int4) training.
-`inner_autocast` (bf16 inner loop) is a start, not a finish.
+A worker holds **one path**, not the whole model, but a large path can still
+exceed consumer VRAM (the per-round peak ≈ `4P + activations`, with the private
+embed/head dominant). Design + per-slice status in
+[w3-vram-design.md](w3-vram-design.md). **Measure-first** with a VRAM profiler
+(`examples/vram_budget.py`), then **exact levers default-on** — activation
+checkpointing, chunked cross-entropy (avoids the `[tokens, vocab]` logits), and a
+fix so tied embed/head actually halve the dominant chunk — plus **§0f-gated lossy
+levers** (blockwise 8-bit AdamW moments; private-copy de-dup/warming), off by
+default with converging `validate_dynamics` arms. Per the profiler the exact
+levers alone fit a ~540M path well under 12 GB (19 → 10.8 GB). Deferred (not
+needed for 12 GB): the PCIe-bound CPU offloads (optimizer offload superseded by
+8-bit Adam; embedding gather covered by tying). `inner_autocast` composes with
+all of it.
 
 ### W4 · Churn robustness at consumer reality · B1 · [eng / tuning]
 

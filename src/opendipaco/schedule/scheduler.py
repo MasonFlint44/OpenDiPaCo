@@ -276,7 +276,16 @@ class AsyncScheduler:
         if shard.size(0) == 0:
             return Contribution(path, path_idx, float("nan"), {}, {}, {}, empty=True)
 
-        pm = build_path_model(e.config, path, e.bank, deepcopy=True).to(e.device)
+        # dedup_private (W3d, off by default) aliases the private modules from the
+        # bank to save the copy -- so inner training mutates the warm private
+        # cache in place. A warm task whose *shared* commit is later rejected as
+        # stale therefore leaves its private training in place (it seeds the next
+        # task), unlike the deep-copy path which discards it. This is intended:
+        # private is local-authoritative (only the shared pseudo-gradient is
+        # stale), and snapshotting to restore would defeat the memory saving. It
+        # is part of the §0f-gated warm-private dynamics the dedup arm validates.
+        pm = build_path_model(e.config, path, e.bank, deepcopy=True,
+                              dedup_private=getattr(e.diloco, "dedup_private", False)).to(e.device)
         opt = make_inner_optimizer(pm, e.diloco)
         prior = e._opt_state.get(path)
         if prior is not None:

@@ -158,6 +158,26 @@ class DiLoCoConfig:
     # Parameters, gradients, and the pseudo-gradient stay fp32 (master weights);
     # bf16 needs no loss scaling. ~2x throughput/memory on consumer GPUs.
     inner_autocast: bool = False
+    # Activation checkpointing (W3b): recompute each body block's activations in
+    # backward instead of storing them -- a large activation-memory cut (∝ depth)
+    # for ~one extra forward. Bit-exact (it only changes what's stored), so off
+    # here keeps the in-process anchor fast; real worker runs default it on.
+    activation_checkpoint: bool = False
+    # Chunked cross-entropy (W3c): compute the vocab logits + loss in this many
+    # token-chunks so the full [tokens, vocab] logit tensor never materializes --
+    # a large activation cut for a big vocab. 1 = off. Mathematically exact but
+    # the loss sum is in chunk order (~1e-7, far below the int8-digest noise),
+    # so off here keeps the in-process anchor bit-identical; opt in on the worker.
+    loss_chunks: int = 1
+    # Blockwise 8-bit AdamW moments (W3d): store the inner optimizer's m, v in
+    # int8 (~2 B/param vs 8), a ~4x cut of the often-dominant optimizer term.
+    # Lossy (a dynamics change) -> off by default, §0f-gated, on-box validated.
+    optim_8bit: bool = False
+    # Don't duplicate the worker's private modules (W3d): alias the dominant
+    # embed/head from the bank instead of deep-copying. Saves ~that memory but
+    # makes private accumulate in-place across warm tasks (a private-warming
+    # change), so it's a §0f-gated dynamics lever, off by default.
+    dedup_private: bool = False
 
     # Inner LR schedule over the *whole* run (paper: cosine, peak 4e-4). Needs the
     # total number of rounds, which ``DiPaCoEngine.fit`` supplies automatically;

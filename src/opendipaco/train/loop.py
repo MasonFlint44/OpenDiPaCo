@@ -123,6 +123,8 @@ def run_inner_steps(
     autocast_on = getattr(diloco, "inner_autocast", False)
     last_loss = 0.0
     pm.train()
+    pm.checkpoint = getattr(diloco, "activation_checkpoint", False)  # exact; W3b
+    pm.loss_chunks = getattr(diloco, "loss_chunks", 1)               # chunked CE; W3c
     for i, batch in enumerate(_iter_batches(shard, batch_size, inner_steps, gen)):
         for group in opt.param_groups:
             group["lr"] = inner_lr_at(base_step + i, total_steps, diloco)

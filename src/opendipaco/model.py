@@ -13,12 +13,13 @@ import copy
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 from transformers.masking_utils import create_causal_mask
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 
 from .config import DiPaCoConfig
 from .modules import BlockModule, EmbeddingModule, HeadModule, to_llama_config
-from .topology import Path, PathTopology, embed_key, head_key
+from .topology import Path, PathTopology, embed_key, head_key, is_private_key
 
 
 def _build_module(topo: PathTopology, bb, key: str) -> nn.Module:
@@ -96,6 +97,13 @@ class PathModel(nn.Module):
             raise ValueError("a path must contain an embedding and a head segment")
 
         self.rotary = LlamaRotaryEmbedding(to_llama_config(config.backbone))
+        # Activation checkpointing (W3b): when True, body blocks recompute their
+        # activations in backward instead of storing them. Set by the trainer
+        # (off for inference/encode). Bit-exact -- only changes what is stored.
+        self.checkpoint = False
+        # Chunked cross-entropy (W3c): >1 computes logits+loss in N token-chunks so
+        # the full [tokens, vocab] logits never materialize. Set by the trainer.
+        self.loss_chunks = 1
 
     def modules_by_key(self) -> dict[str, nn.Module]:
         """Map topology key -> the live submodule instance in this path."""
@@ -116,13 +124,24 @@ class PathModel(nn.Module):
             past_key_values=None,
             position_ids=position_ids,
         )
+        # Checkpoint only when it can help: training with grad on (under no_grad /
+        # eval it would be a wasteful no-op). use_reentrant=False preserves the
+        # autocast context on recompute, so it composes with inner_autocast.
+        ckpt = self.checkpoint and self.training and torch.is_grad_enabled()
         for block in self.body:
-            hidden = block(
-                hidden,
-                position_embeddings=cos_sin,
-                attention_mask=causal,
-                position_ids=position_ids,
-            )
+            if ckpt:
+                hidden = checkpoint(
+                    block, hidden, position_embeddings=cos_sin,
+                    attention_mask=causal, position_ids=position_ids,
+                    use_reentrant=False,
+                )
+            else:
+                hidden = block(
+                    hidden,
+                    position_embeddings=cos_sin,
+                    attention_mask=causal,
+                    position_ids=position_ids,
+                )
         return hidden
 
     @torch.no_grad()
@@ -135,6 +154,25 @@ class PathModel(nn.Module):
         norm = getattr(self.head, "norm", None)
         return norm(hidden) if norm is not None else hidden
 
+    def _chunked_loss(self, hidden: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Cross-entropy without materializing the full [tokens, vocab] logits:
+        norm the hidden states (per-token, so it's safe to do whole), then apply
+        the vocab projection + CE in token-chunks and accumulate. Mathematically
+        the same loss as the dense path (fp summation order differs ~1e-7)."""
+        norm = getattr(self.head, "norm", None)
+        normed = norm(hidden) if norm is not None else hidden
+        h = normed[:, :-1, :].reshape(-1, normed.size(-1))   # shifted, flattened tokens
+        y = labels[:, 1:].reshape(-1)
+        # Accumulate the loss sum in fp32 even under bf16 autocast (the dense path
+        # reduces in fp32 too) so chunking doesn't lose precision per chunk.
+        total = torch.zeros((), dtype=torch.float32, device=h.device)
+        count = 0
+        for hc, yc in zip(h.chunk(self.loss_chunks), y.chunk(self.loss_chunks)):
+            total = total + F.cross_entropy(self.head.lm_head(hc), yc,
+                                            ignore_index=-100, reduction="sum").float()
+            count += int((yc != -100).sum())
+        return total / max(count, 1)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -142,8 +180,12 @@ class PathModel(nn.Module):
         labels: torch.Tensor | None = None,
     ):
         hidden = self._backbone(input_ids, attention_mask)
-        logits = self.head(hidden)
+        # Chunked CE (W3c): when on and we only need the loss (training), skip the
+        # full logits tensor entirely. Callers that want logits pass labels=None.
+        if labels is not None and self.loss_chunks > 1:
+            return None, self._chunked_loss(hidden, labels)
 
+        logits = self.head(hidden)
         loss = None
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
@@ -157,13 +199,21 @@ class PathModel(nn.Module):
 
 
 def build_path_model(
-    config: DiPaCoConfig, path: Path, bank: dict[str, nn.Module], deepcopy: bool = True
+    config: DiPaCoConfig, path: Path, bank: dict[str, nn.Module], deepcopy: bool = True,
+    dedup_private: bool = False,
 ) -> PathModel:
     """Instantiate a :class:`PathModel` from the module bank.
 
     ``deepcopy=True`` (default) gives the worker independent weights so its inner
     steps don't mutate the shared bank; pass ``False`` to alias the bank
     directly (useful for a single-worker / inference setup).
+
+    ``dedup_private`` (W3d, off by default) aliases the **private** modules from
+    the bank instead of copying them -- only the *shared* modules need an
+    independent copy (the pseudo-gradient ``global − local`` is computed for them
+    against the bank). It saves ~the embed/head, but it changes the worker's
+    warm-round private trajectory (private accumulates in-place), so it is a
+    §0f-gated dynamics change, not an exact win.
     """
     topo = config.build_topology()
     keys = topo.path_module_keys(path)
@@ -177,5 +227,15 @@ def build_path_model(
         )
     selected = {k: bank[k] for k in keys}
     if deepcopy:
-        selected = {k: copy.deepcopy(v) for k, v in selected.items()}
+        # Deep-copy the whole selection in ONE call so cross-module shared tensors
+        # (tied embed/head weights, W3c/D6) stay shared in the copy -- per-module
+        # deepcopy would sever the tie, doubling memory and training the two copies
+        # apart. Identical to per-module copy when nothing is tied.
+        if dedup_private:
+            # Copy only shared modules (tie-safe single call); alias private from
+            # the bank -- private needs no independent global copy (W3d).
+            shared = copy.deepcopy({k: selected[k] for k in keys if not is_private_key(k)})
+            selected = {k: shared.get(k, selected[k]) for k in keys}
+        else:
+            selected = copy.deepcopy(selected)
     return PathModel(config, path, selected)
