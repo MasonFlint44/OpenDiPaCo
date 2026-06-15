@@ -81,6 +81,18 @@ class Adam8bit(Optimizer):
         super().__init__(params, dict(lr=lr, betas=betas, eps=eps,
                                       weight_decay=weight_decay, block_size=block_size))
 
+    def load_state_dict(self, state_dict):
+        # Optimizer.load_state_dict casts non-step state to the param's dtype
+        # (fp32), which would turn the quantized moments back into fp32 -- losing
+        # the int8 memory win at the first post-resume step (the warm-task peak).
+        # Re-cast them to their integer dtypes; the values are integer-valued, so
+        # the fp32 round-trip is lossless.
+        super().load_state_dict(state_dict)
+        for st in self.state.values():
+            if "m_q" in st:
+                st["m_q"] = st["m_q"].to(torch.int8)
+                st["v_q"] = st["v_q"].to(torch.uint8)
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None

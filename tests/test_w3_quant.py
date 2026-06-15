@@ -73,7 +73,43 @@ def test_adam8bit_state_is_small_and_serializable():
     sd = opt.state_dict()                                # offload/checkpoint path
     opt2 = Adam8bit([x], lr=0.1)
     opt2.load_state_dict(sd)
+    # int8 must survive the load (Optimizer.load_state_dict casts to the param's
+    # fp32; the override re-casts so the memory win isn't lost on resume).
+    assert opt2.state[x]["m_q"].dtype == torch.int8
     assert torch.equal(opt2.state[x]["m_q"], st["m_q"])
+
+
+def test_adam8bit_survives_worker_offload_cycle():
+    """The worker offloads optimizer state to CPU between tasks via
+    _optimizer_state_to_cpu and resumes it into a fresh optimizer each task. The
+    8-bit state must round-trip that exact cycle (stay int8/uint8, keep training)
+    -- the plain state_dict test doesn't exercise the worker's helper."""
+    from opendipaco.train.loop import _optimizer_state_to_cpu
+
+    def step(x, opt):
+        opt.zero_grad()
+        ((x - 1) ** 2).sum().backward()
+        opt.step()
+
+    # No-offload reference: 8 straight steps.
+    xs = torch.zeros(600, requires_grad=True)
+    os_ = Adam8bit([xs], lr=0.1)
+    for _ in range(8):
+        step(xs, os_)
+
+    # Offloaded: 3 steps, offload to CPU, resume into a fresh optimizer, 5 more.
+    xr = torch.zeros(600, requires_grad=True)
+    opt = Adam8bit([xr], lr=0.1)
+    for _ in range(3):
+        step(xr, opt)
+    opt2 = Adam8bit([xr], lr=0.1)
+    opt2.load_state_dict(_optimizer_state_to_cpu(opt.state_dict()))
+    assert opt2.state[xr]["m_q"].dtype == torch.int8 and opt2.state[xr]["v_q"].dtype == torch.uint8
+    assert int(opt2.state[xr]["step"]) == 3                 # step counter resumed
+    for _ in range(5):
+        step(xr, opt2)
+    # Resume is exact: 3+offload+5 lands bit-identically on 8 straight steps.
+    assert torch.equal(xr, xs)
 
 
 def test_make_inner_optimizer_selects_8bit():
