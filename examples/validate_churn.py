@@ -6,10 +6,11 @@ and tested for *cluster* churn. This harness is the **measure-first** half (the
 W3 discipline): before retuning any timing (W4d), drive the real control plane
 through a home-style churn process and measure what actually happens.
 
-It is a true in-process cluster -- a real ``Tracker`` + ``Scheduler`` + ``k``
-``ParameterServer`` owners + ``run_sharded_worker`` workers over loopback (the
-``test_failover.py`` marquee setup, generalized) -- so it exercises the genuine
-failover path, not a primitive. Four arms, each a churn pattern injected mid-run:
+It is a true in-process cluster -- a real ``Tracker`` + ``Scheduler`` +
+``n_owners`` ``ParameterServer`` owners + ``run_sharded_worker`` workers over
+loopback (the ``test_failover.py`` marquee setup, generalized) -- so it exercises
+the genuine failover path, not a primitive. Five arms, each a churn pattern
+injected mid-run:
 
   * ``none``    -- control: no churn (baseline epochs/reclaims/progress);
   * ``abrupt``  -- an owner crashes (``simulate_crash``): TTL + grace -> epoch
@@ -18,7 +19,10 @@ failover path, not a primitive. Four arms, each a churn pattern injected mid-run
                    laptop: ``pause_heartbeat``), is remapped out, then wakes
                    (``resume_heartbeat``) and rejoins;
   * ``flap``    -- an owner goes silent *within* grace and returns: the
-                   hysteresis must absorb it (zero epoch bumps).
+                   hysteresis must absorb it (zero epoch bumps);
+  * ``join``    -- a new volunteer owner appears mid-run: joins are immediate
+                   (no grace), the next epoch adds it via HRW, and it cold-syncs
+                   its assigned keys without disrupting the run.
 
 For each arm it reports survival (the run completes its target), epochs bumped,
 keys remapped, and -- for ``abrupt`` -- the failover latency (departure -> every
@@ -151,8 +155,29 @@ def run_arm(churn: str, *, rounds: int = 6, k: int = 3, n_owners: int = 4,
         for w in workers:
             w.start()
 
-        injector = threading.Thread(target=_inject, args=(churn, sched, pss, metrics),
-                                    daemon=True)
+        def spawn():
+            """Bring up a *new* owner mid-run (the join arm). Mutual runtime
+            admission (admit_peer) stands in for the tracker-enrollment flow so
+            the joiner and the incumbents accept each other's replication
+            handshake; the joiner polls the scheduler for the epoch that adds it
+            and cold-syncs its HRW-assigned keys."""
+            ident = PeerIdentity.generate()
+            for ps in pss:
+                ps.admit_peer(ident)          # incumbents accept the joiner's pulls
+            sched.admit_peer(ident)           # joiner may poll the scheduler
+            joiner = ParameterServer(cfg, [], dl, host="127.0.0.1", port=0,
+                                     identity=ident, auth_key="t",
+                                     scheduler_pub=sched_id.public_key_hex,
+                                     scheduler_addr=("127.0.0.1", sched.port),
+                                     replicate_interval=0.2, admitted_peers=ids)
+            joiner.start()
+            joiner.start_tracker_heartbeat(taddr, "127.0.0.1", interval=max(0.1, ttl / 3))
+            pss.append(joiner)                # tracked for teardown + _settled
+            return joiner
+
+        injector = threading.Thread(
+            target=_inject, args=(churn, sched, pss, metrics),
+            kwargs=dict(owner_grace=owner_grace, spawn=spawn), daemon=True)
         injector.start()
         completed = sched.fit(num_generations=rounds, total_generations=rounds)
         injector.join(timeout=30)
@@ -176,7 +201,7 @@ def run_arm(churn: str, *, rounds: int = 6, k: int = 3, n_owners: int = 4,
             w.join(timeout=15)
 
 
-def _inject(churn, sched, pss, metrics) -> None:
+def _inject(churn, sched, pss, metrics, *, owner_grace, spawn) -> None:
     """Drive the churn pattern once the run has made some progress."""
     if churn == "none":
         return
@@ -195,8 +220,14 @@ def _inject(churn, sched, pss, metrics) -> None:
         victim.resume_heartbeat()                   # wakes, re-registers, rejoins
     elif churn == "flap":
         victim.pause_heartbeat()
-        time.sleep(0.6)                             # < owner_grace (2.0): absorbed
+        time.sleep(owner_grace * 0.3)              # well within grace: absorbed
         victim.resume_heartbeat()
+    elif churn == "join":
+        joiner = spawn()                            # a new volunteer owner appears
+        # Joins are immediate (no grace): the next epoch adds it and it cold-syncs
+        # its HRW-assigned keys -- proving a newcomer integrates mid-run.
+        _await(lambda: joiner.peer_id in _epoch_ids(sched)
+               and bool(joiner.owned_keys) and joiner._active >= joiner.owned_keys, 25)
     else:
         raise SystemExit(f"unknown churn arm: {churn!r}")
 
@@ -249,14 +280,16 @@ def _report(m) -> None:
 def main() -> None:
     rounds, k = _i("ROUNDS", 6), _i("K", 3)
     arm = os.environ.get("ARM")
-    arms = [arm] if arm else ["none", "abrupt", "suspend", "flap"]
+    arms = [arm] if arm else ["none", "abrupt", "suspend", "flap", "join"]
     print(f"churn validation (rounds={rounds}, k={k}, real in-process cluster)")
     results = [run_arm(a, rounds=rounds, k=k) for a in arms]
-    # Verdicts: every arm survives; abrupt/suspend remap, flap does not.
+    # Verdicts: every arm survives; abrupt/suspend/join remap, flap does not.
     ok = all(r["survived"] for r in results)
     by = {r["arm"]: r for r in results}
     if "flap" in by:
         ok = ok and by["flap"]["epochs"] <= (by["none"]["epochs"] if "none" in by else 0)
+    if "join" in by:
+        ok = ok and by["join"]["remaps"] >= 1      # the newcomer took over some keys
     print("VERDICT:", "PASS -- control plane rode out the churn" if ok
           else "FAIL -- see arms above")
 
