@@ -169,6 +169,38 @@ def test_optim_8bit_trains():
 # -- private de-dup ------------------------------------------------------------
 
 
+def test_dedup_and_8bit_compose_on_private_modules():
+    """The two W3d levers together on a real private embed/head (the case dedup
+    targets): dedup aliases private so training mutates the worker's bank in place
+    (warming), and the 8-bit optimizer trains those aliased params -- finite, with
+    the private state pushed. The default config has shared embed/head, so this
+    needs an explicitly private one."""
+    import math
+
+    from opendipaco.backend import LocalBackend
+    from opendipaco.schedule import AsyncScheduler
+    from opendipaco.train.loop import DiPaCoEngine
+
+    bb = BackboneConfig(vocab_size=200, hidden_size=64, num_attention_heads=4,
+                        intermediate_size=128, layers_per_level=[1, 1],
+                        max_position_embeddings=128)
+    cfg = DiPaCoConfig(backbone=bb, level_sizes=[2, 2], sequence_length=32,
+                       embedding="private", head="private")
+    dl = DiLoCoConfig(inner_steps=3, inner_lr=1e-2, optim_8bit=True, dedup_private=True)
+    eng = DiPaCoEngine(cfg, dl, LocalBackend(cfg.build_topology()), device="cpu",
+                       seed=0, materialize="serial")
+    worker = AsyncScheduler(eng, num_workers=1)
+    path = cfg.build_topology().path_from_index(0)
+    priv = [k for k in cfg.build_topology().path_module_keys(path) if is_private_key(k)]
+    before = {k: next(eng.bank[k].parameters()).clone() for k in priv}
+    shard = torch.randint(0, 200, (8, 32))
+    contrib = worker._train_path(path, shard, 4, 0)
+    assert len(priv) == 2 and len(contrib.private_state) == 2
+    assert math.isfinite(contrib.loss)
+    # dedup => private trained in place in the worker's bank (warming).
+    assert any(not torch.equal(before[k], next(eng.bank[k].parameters())) for k in priv)
+
+
 def test_dedup_private_aliases_private_copies_shared():
     """dedup_private aliases the private modules from the bank (the memory win)
     but still deep-copies the shared ones (needed for the global−local delta)."""
