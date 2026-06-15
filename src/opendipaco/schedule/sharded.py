@@ -1066,7 +1066,17 @@ class ParameterServer(_ReactorServer):
         timeout. Best-effort: if the tracker is unreachable, the TTL+grace path
         still applies, so a graceful shutdown is never worse than an abrupt one.
         The default (``graceful=False``) is byte-identical to before."""
+        self._repl_stop.set()
         if graceful and self.identity is not None and self._seed_addr is not None:
+            # Stop the heartbeat *before* deregistering, else a re-registration
+            # racing the deregister could land after it (with a newer issued_at)
+            # and resurrect the record, undoing the tombstone. We set _repl_stop
+            # above (which ends the beat loop) and join the beat thread; any
+            # register already in flight carries an older issued_at, so the
+            # tracker refuses it as stale behind our (newer) tombstone.
+            self._hb_paused.set()
+            if self._beat_thread is not None:
+                self._beat_thread.join(timeout=2.0)
             try:
                 from .tracker import deregister_peer  # lazy: tracker imports this
                 # Short timeout: a closing node (laptop lid) must not block on a
@@ -1075,7 +1085,6 @@ class ParameterServer(_ReactorServer):
                                 auth_key=self._tracker_auth, tls=self._tracker_tls)
             except (OSError, ConnectionError):
                 pass  # tracker away -> fall back to TTL+grace expiry
-        self._repl_stop.set()
         with self._lock:
             self._flush_all_buffers_locked()  # don't drop accepted-but-buffered work
         for s in self._peer_conns.values():

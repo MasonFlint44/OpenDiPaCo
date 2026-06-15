@@ -211,9 +211,11 @@ def test_worker_stop_event_exits_cleanly_without_leasing():
 # -- owner graceful shutdown deregisters -----------------------------------------
 
 
-def test_owner_graceful_shutdown_deregisters():
+def test_owner_graceful_shutdown_deregisters_and_stays_tombstoned():
     """ParameterServer.shutdown(graceful=True) sends a signed deregister so the
-    tracker tombstones it (skipping grace downstream); graceful=False does not."""
+    tracker tombstones it. A *fast* heartbeat exercises the race fix: shutdown
+    stops + joins the beat thread before deregistering, so no re-registration can
+    land after (and resurrect) the tombstone -- it must stay tombstoned."""
     cfg = _cfg()
     ident = PeerIdentity.generate()
     tracker = Tracker(host="127.0.0.1", port=0, open_enrollment=True, ttl=30.0)
@@ -222,11 +224,15 @@ def test_owner_graceful_shutdown_deregisters():
                          identity=ident, replicate_interval=60.0)
     try:
         ps.start()
-        ps.start_tracker_heartbeat(("127.0.0.1", tracker.port), "127.0.0.1", interval=0.2)
+        ps.start_tracker_heartbeat(("127.0.0.1", tracker.port), "127.0.0.1", interval=0.05)
         assert _await(lambda: ident.peer_id in {r["peer_id"] for r in tracker.records()}, 3)
         ps.shutdown(graceful=True)
         # Tombstoned: out of records, surfaced as a tombstone.
         assert _await(lambda: ident.peer_id in tracker.tombstones(), 3)
+        # ...and it *stays* tombstoned: a beat racing the deregister (interval
+        # 0.05 << this window) would have resurrected the record without the fix.
+        time.sleep(0.5)
+        assert ident.peer_id in tracker.tombstones()
         assert ident.peer_id not in {r["peer_id"] for r in tracker.records()}
     finally:
         tracker.shutdown()
