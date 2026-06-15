@@ -21,8 +21,12 @@ failover path, not a primitive. Four arms, each a churn pattern injected mid-run
                    hysteresis must absorb it (zero epoch bumps).
 
 For each arm it reports survival (the run completes its target), epochs bumped,
-keys remapped, lease reclaims (the churn-driven disruption signal), and -- for
-``abrupt`` -- the failover latency (departure -> every key served active again).
+keys remapped, and -- for ``abrupt`` -- the failover latency (departure -> every
+key served active again). It also reports lease ``reclaims``, which is the
+*worker*-churn disruption signal (a dead worker's lease times out and re-queues)
+and so stays 0 under these owner-churn arms -- workers survive and just retry
+their push to the promoted primary. The worker-churn arms that move it land with
+the graceful worker-leave path (W4b).
 
     python examples/validate_churn.py
     ROUNDS=6 K=3 python examples/validate_churn.py
@@ -92,16 +96,28 @@ def _remapped_keys(before, after) -> int:
     return sum(1 for k in before if before[k] != after.get(k))
 
 
-def run_arm(churn: str, *, rounds: int = 6, k: int = 3, n_owners: int = 3,
-            n_workers: int = 2, verbose: bool = True) -> dict:
+def run_arm(churn: str, *, rounds: int = 6, k: int = 3, n_owners: int = 4,
+            n_workers: int = 2, ttl: float = 1.0, owner_grace: float = 2.0,
+            min_epoch_interval: float = 0.5, verbose: bool = True) -> dict:
     """Bring up a real in-process cluster, run ``rounds`` generations while
     injecting the ``churn`` pattern, and return a metrics dict. Survival is
-    ``completed >= target``; the rest are churn observables."""
+    ``completed >= target``; the rest are churn observables.
+
+    ``n_owners > k`` (default 4 > 3) on purpose: a failover then forces at least
+    one key onto an owner that wasn't holding it, exercising the **cold-sync**
+    path, not just trivial promotion among owners that already had the bytes.
+
+    The detection timings (``ttl``/``owner_grace``/``min_epoch_interval``) are
+    deliberately aggressive demo values, *not* the production defaults — so the
+    reported failover latency is the floor these timings allow. W4d sweeps them
+    against this harness to choose home-grade defaults; that's why they're
+    parameters here.
+    """
     cfg, dl = _cfg(), DiLoCoConfig(inner_steps=4, inner_lr=1e-3)
     sched_id = PeerIdentity.generate()
     ids = [PeerIdentity.generate() for _ in range(n_owners)]
 
-    tracker = Tracker(host="127.0.0.1", port=0, open_enrollment=True, ttl=1.0)
+    tracker = Tracker(host="127.0.0.1", port=0, open_enrollment=True, ttl=ttl)
     tracker.start()
     taddr = ("127.0.0.1", tracker.port)
     sched = Scheduler(cfg, _corpus(cfg), [], dl, batch_size=BATCH,
@@ -120,10 +136,10 @@ def run_arm(churn: str, *, rounds: int = 6, k: int = 3, n_owners: int = 3,
     try:
         for ps in pss:
             ps.start()
-            ps.start_tracker_heartbeat(taddr, "127.0.0.1", interval=0.3)
+            ps.start_tracker_heartbeat(taddr, "127.0.0.1", interval=max(0.1, ttl / 3))
         _await(lambda: len(tracker.records()) >= n_owners, 5)
-        sched.watch_tracker(taddr, k=k, owner_grace=2.0, min_epoch_interval=0.5,
-                            poll_interval=0.2)
+        sched.watch_tracker(taddr, k=k, owner_grace=owner_grace,
+                            min_epoch_interval=min_epoch_interval, poll_interval=0.2)
         _await(lambda: all(ps._epoch is not None for ps in pss), 5)
         epoch0 = _owner_set(sched._epoch_record)
 
