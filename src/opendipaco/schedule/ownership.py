@@ -83,6 +83,13 @@ def owner_eligible(record: dict) -> bool:
     return record.get("reachability") == "nat" and bool(record.get("circuit_addrs"))
 
 
+def _issued_at(record: dict) -> float:
+    """A record's ``issued_at`` as a float, or 0.0 if missing/malformed (so a
+    tombstone freshness comparison never crashes on a bad record)."""
+    ts = record.get("issued_at") if isinstance(record, dict) else None
+    return float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else 0.0
+
+
 def _score(salt: str, key: str, peer_id: str) -> bytes:
     # NUL separators so ("ab","c") and ("a","bc") can't collide.
     return hashlib.sha256(f"{salt}\x00{key}\x00{peer_id}".encode("utf-8")).digest()
@@ -296,22 +303,28 @@ class EpochManager:
         self._current: set | None = None                # (peer_id, addr) signature
         self._last_bump: float | None = None
 
-    def observe(self, records, *, tombstoned=(), now: float | None = None):
+    def observe(self, records, *, tombstoned=None, now: float | None = None):
         """One directory snapshot in; the next epoch's owner records out (or None).
 
-        ``tombstoned`` is the set of peer ids the tracker reports as explicitly
-        deregistered (signed-departed); they are dropped from the desired set
-        **now**, bypassing ``owner_grace`` -- a clean leave fails over fast.
+        ``tombstoned`` maps peer id -> the ``issued_at`` of that peer's signed
+        deregister. A tombstoned peer is dropped from the desired set **now**,
+        bypassing ``owner_grace`` (a clean leave fails over fast) -- but **only
+        when the deregister supersedes the registration we hold**. A replayed
+        *stale* tombstone (issued before the peer's current record -- e.g. an
+        owner that gracefully left and later rejoined) must not fast-evict the
+        live peer, so we compare ``issued_at`` rather than trusting the bare id.
         """
         now = time.monotonic() if now is None else now
         for r in records:
             if owner_eligible(r) and (self.is_eligible is None or self.is_eligible(r["peer_id"])):
                 self._seen[r["peer_id"]] = (now, r)
-        # Explicit signed departures (W4b) skip the grace: treat them as gone now.
-        # Done after ingesting ``records`` so a tombstone wins over a stale record
-        # that still advertises the peer (e.g. relayed before the deregister).
-        for p in set(tombstoned):
-            self._seen.pop(p, None)
+        # Done after ingesting ``records`` so a fresh tombstone wins over a stale
+        # record that still advertises the peer (relayed before the deregister),
+        # while a stale tombstone loses to the fresher registration we just saw.
+        for p, ts in dict(tombstoned or {}).items():
+            seen = self._seen.get(p)
+            if seen is not None and (ts is None or ts > _issued_at(seen[1])):
+                del self._seen[p]
         expired = [p for p, (t, _) in self._seen.items() if now - t >= self.owner_grace]
         for p in expired:
             del self._seen[p]

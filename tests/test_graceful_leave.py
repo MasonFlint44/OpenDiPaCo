@@ -70,7 +70,8 @@ def test_tombstone_drops_owner_immediately_skipping_grace():
     # b is silent but within the (huge) grace -> normally retained, no bump.
     assert mgr.observe([a], now=1.0) is None
     # Now b is tombstoned (even though a stale record still lists it): dropped now.
-    due = mgr.observe([a, b], tombstoned={b_id}, now=2.0)
+    # The tombstone's issued_at supersedes b's registration, so it counts.
+    due = mgr.observe([a, b], tombstoned={b_id: b["issued_at"] + 1}, now=2.0)
     assert {r["peer_id"] for r in due} == {a_id}      # b gone despite grace=1000
 
 
@@ -83,11 +84,30 @@ def test_tombstone_removal_persists_through_rate_limit():
     mgr = EpochManager(owner_grace=1000.0, min_epoch_interval=100.0)
 
     mgr.observe([a, b], now=0.0)                       # first bump: {a, b}
-    # b tombstoned, but within min_epoch_interval -> deferred (None) ...
-    assert mgr.observe([a, b], tombstoned={ids[1].peer_id}, now=1.0) is None
+    # b tombstoned (fresh deregister), but within min_epoch_interval -> deferred ...
+    assert mgr.observe([a, b], tombstoned={ids[1].peer_id: b["issued_at"] + 1}, now=1.0) is None
     # ... and when the rate limit clears, the due set excludes b.
     due = mgr.observe([a], now=200.0)
     assert due is not None and {r["peer_id"] for r in due} == {a_id}
+
+
+def test_stale_tombstone_does_not_evict_reregistered_owner():
+    """Codex P2: a peer gracefully left (tombstone T1) then rejoined with a newer
+    record (T2 > T1). A replayed *stale* tombstone (T1) surfaced alongside the
+    fresh record must NOT fast-evict the live peer -- the deregister has to
+    supersede the registration to count, else any owner that ever left and came
+    back could be evicted by replaying its old (validly signed) deregister."""
+    ids = [PeerIdentity.generate() for _ in range(2)]
+    a, b = (_owner_record(i, 9000 + n) for n, i in enumerate(ids))
+    a_id, b_id = ids[0].peer_id, ids[1].peer_id
+    mgr = EpochManager(owner_grace=1000.0, min_epoch_interval=0.0)
+    mgr.observe([a, b], now=0.0)                        # both live (b record at b["issued_at"])
+    # Stale tombstone (issued *before* b's current record) replayed with the fresh
+    # record: no change -> b retained.
+    assert mgr.observe([a, b], tombstoned={b_id: b["issued_at"] - 1}, now=1.0) is None
+    # A genuinely newer tombstone *does* evict (sanity that the gate isn't inert).
+    due = mgr.observe([a, b], tombstoned={b_id: b["issued_at"] + 1}, now=2.0)
+    assert {r["peer_id"] for r in due} == {a_id}
 
 
 # -- (2) tracker: tombstone surfaced; forged tombstone rejected ------------------
@@ -111,7 +131,8 @@ def test_tracker_surfaces_tombstone_and_rejects_forgery():
         assert tracker.tombstones() == [idb.peer_id]
         recs, tombs = fetch_directory_and_tombstones(taddr, roles=["owner"],
                                                      reachability="public")
-        assert {r["peer_id"] for r in recs} == {ida.peer_id} and tombs == [idb.peer_id]
+        assert {r["peer_id"] for r in recs} == {ida.peer_id}
+        assert set(tombs) == {idb.peer_id} and tombs[idb.peer_id] > 0   # {peer_id: issued_at}
 
         # Forged tombstone for the *live* peer a: claim a's peer_id but sign with
         # b's key. verify_record rejects (peer_id != hash(b.pub)); a stays.
@@ -142,7 +163,7 @@ def test_expel_tombstone_is_not_surfaced_for_fast_evict():
         recs, tombs = fetch_directory_and_tombstones(taddr, roles=["owner"],
                                                      reachability="public")
         assert idb.peer_id not in {r["peer_id"] for r in recs}   # gone from directory
-        assert tombs == []                                 # but NOT a fast-evict signal
+        assert tombs == {}                                 # but NOT a fast-evict signal
     finally:
         tracker.shutdown()
 

@@ -319,9 +319,15 @@ def fetch_directory(addr, *, roles=None, reachability=None, auth_key=None, tls=N
 def fetch_directory_and_tombstones(addr, *, roles=None, reachability=None, auth_key=None,
                                    tls=None, timeout: float = 10.0, verify: bool = True):
     """Like :func:`fetch_directory` but also returns the explicit-deregistration
-    tombstone peer ids (one atomic round trip). The scheduler's epoch watcher
-    uses the tombstones to fail a graceful leave over immediately, skipping
-    ``owner_grace`` (W4b). Returns ``(records, tombstone_peer_ids)``."""
+    tombstones (one atomic round trip). The scheduler's epoch watcher uses them
+    to fail a graceful leave over immediately, skipping ``owner_grace`` (W4b).
+
+    Returns ``(records, {peer_id: deregister_issued_at})``. Each tombstone is the
+    peer's own signed deregister, verified here (signature + honest peer_id +
+    kind) so a fabricated/relayed one can't fast-evict; its ``issued_at`` is
+    carried so the consumer can ignore a **stale** replay (a tombstone older
+    than the peer's current registration -- e.g. an owner that left and rejoined)
+    rather than evicting a live peer."""
     reply = tracker_rpc(addr, {"type": "directory", "roles": list(roles or []),
                                "reachability": reachability, "include_tombstones": True},
                         auth_key=auth_key, tls=tls, timeout=timeout) or {}
@@ -329,10 +335,13 @@ def fetch_directory_and_tombstones(addr, *, roles=None, reachability=None, auth_
     tombs = reply.get("tombstones") or []
     if verify:
         records = [r for r in records if verify_record(r)]
-        # Each tombstone is the peer's own signed deregister: verify it (signature
-        # + honest peer_id + kind) so a fabricated/relayed one can't fast-evict.
         tombs = [t for t in tombs if verify_record(t) and t.get("kind") == "deregister"]
-    return records, [t["peer_id"] for t in tombs]
+    out = {}
+    for t in tombs:
+        ts = t.get("issued_at")
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+            out[t["peer_id"]] = float(ts)
+    return records, out
 
 
 def import_records(addr, records, *, auth_key=None, tls=None, timeout: float = 10.0) -> dict:
