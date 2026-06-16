@@ -1941,18 +1941,23 @@ class Scheduler(_ReactorServer):
             batch_cap = (max(1, min(self.batch_size, int(caps["max_batch"])))
                          if caps.get("max_batch") else self.batch_size)
             inner = self.diloco.inner_steps
+            # W5b: size (batch, inner) for this worker toward task_seconds (shrink
+            # only; the full configured task when off / fast / no estimate). Done
+            # before parking so the park cadence uses the task it would *actually*
+            # get. The check branch overrides these with the audited primary's pin.
+            batch, inner = self._size_task_locked(wid, batch_cap)
             # W5c: park a worker too slow even for the minimum task so it holds no
             # path (or check). Re-measure one task per `park_factor` of *this
-            # worker's own* (long) min-task-times -- a fixed wall cooldown would be
-            # shorter than a parked worker's task time (it overshoots by definition)
-            # and so would never actually idle it; scaling by its min-task-time
-            # idles it ~(park_factor-1)/park_factor of the time, freeing the path
-            # for faster workers, while still re-measuring so a recovered one rejoins.
+            # worker's own* sized-task time -- a fixed wall cooldown would be shorter
+            # than a parked worker's task time and so never actually idle it.
+            # Using the sized-task time (not seq/rate) means a worker parked by the
+            # absolute min_task_rate floor -- whose task isn't shrunk by
+            # task_seconds -- is idled too, not just one whose task overshoots.
             if self._too_slow_locked(wid):
                 now = time.monotonic()
                 last = self._parked.get(wid)
-                recheck = self.park_factor * self.config.sequence_length / self._worker_rate[wid]
-                if last is not None and now - last < recheck:
+                task_time = batch * inner * self.config.sequence_length / self._worker_rate[wid]
+                if last is not None and now - last < self.park_factor * task_time:
                     return self._idle()
                 self._parked[wid] = now   # let this one through to re-measure
             else:
@@ -1969,11 +1974,11 @@ class Scheduler(_ReactorServer):
                  pin_batch, pin_inner) = self._reserve_check_locked(cand, member)
                 check_only = True
                 # Reproduce the audited primary's exact computation (design D8):
-                # a check must use the *primary's* batch/inner, not the checker's
-                # own ceiling -- else the digest diverges (and a heterogeneous
+                # a check must use the *primary's* batch/inner, not this checker's
+                # own (sized) values -- else the digest diverges (and a heterogeneous
                 # max_batch would falsely flag every audit).
                 batch = pin_batch or batch_cap
-                inner = pin_inner or inner
+                inner = pin_inner or self.diloco.inner_steps
             else:
                 # Rate limit only the *expensive* path (issuing a task with a
                 # weight/shard payload): a throttled peer gets a cheap backoff
@@ -1982,9 +1987,7 @@ class Scheduler(_ReactorServer):
                     return self._idle()
                 path = min(eligible, key=lambda p: (self._completed[p], p not in warm, p))
                 lease = uuid.uuid4().hex  # unique per lease; fences commit/heartbeat
-                # W5b: size (batch, inner) for this worker toward task_seconds
-                # (shrink-only; the full configured task when off / fast / no rate).
-                batch, inner = self._size_task_locked(wid, batch_cap)
+                # batch, inner already sized above (before the parking check).
                 self._owner[path] = wid
                 self._inflight[path] = time.monotonic() + self.heartbeat_timeout
                 self._issued[path] = self._T

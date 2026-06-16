@@ -309,6 +309,28 @@ def test_min_task_rate_absolute_floor():
         sched.shutdown()
 
 
+def test_min_task_rate_worker_is_parked_via_full_task_cadence():
+    """A worker below the absolute min_task_rate floor, but fast enough that
+    task_seconds doesn't shrink its task, must still be parked. The recheck has to
+    use its *full* sized-task time, not seq/rate -- otherwise the floor never
+    actually parks it (the seq/rate cooldown is far shorter than its full task)."""
+    import time
+
+    cfg = _cfg()
+    sched = _serving(cfg, task_seconds=5.0, min_task_rate=1000.0, park_factor=3.0)
+    try:
+        _set_rate(sched, "floor", 900)                       # < 1000 floor
+        assert sched._size_task_locked("floor", BATCH) == (BATCH, INNER)   # not shrunk
+        assert _lease(sched, "floor")["type"] == "task"      # 1st: let through
+        # Re-request ~0.3s later (after its ~0.28s full task): recheck ~0.85s > 0.3
+        # -> parked. The old seq/rate recheck (~0.05s) would have leased it again.
+        sched._parked["floor"] = time.monotonic() - 0.3
+        assert sched._next_task({"worker_id": "floor", "warm_paths": [],
+                                 "cached_shards": []})["type"] == "idle"
+    finally:
+        sched.shutdown()
+
+
 def test_parking_off_when_sizing_off():
     """No task_seconds -> no parking, even for a very slow worker (the lever is
     part of the sizing feature)."""

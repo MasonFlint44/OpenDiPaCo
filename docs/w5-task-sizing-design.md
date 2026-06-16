@@ -69,10 +69,17 @@ computation, so an audited task pins its size (D8).
 The scheduler already records a lease's issue time and sees its commit; it knows
 the task's work (`batch_size × inner_steps × seq_len` tokens, since it sized it).
 So it computes an **effective rate** = work ÷ (commit − lease) and keeps a per-
-worker EMA. This deliberately measures the *whole* lease — fetch + train + push —
-so it captures a slow **link** as well as slow **compute**, which is exactly what
-bounds the lease. No new wire field; bootstrap = the first task (no estimate yet)
-uses the configured default size.
+worker EMA. This measures **fetch (downlink) + train** — precisely the
+**lease-hold window** (the lease is freed at commit), which is both what
+straggles the path *and* what sizing can shrink. It captures a slow **download
+link** as well as slow **compute**. The post-commit **push** (uplink) is
+deliberately *not* in the window: the lease is already freed when it happens, so
+it doesn't straggle the path, and the pseudo-gradient it ships is a fixed-size
+per-module delta (independent of `batch`/`inner_steps`) that sizing can't shrink
+anyway — so a push-bound worker correctly keeps full tasks (its slow uplink is a
+staleness concern, damped by the existing inverse-staleness weighting, not a
+sizing one). No new wire field; bootstrap = the first task (no estimate yet) uses
+the configured default size.
 
 Rejected: worker-advertised tokens/sec in the capability profile (what plan §1.10
 literally suggests). Simpler and available before the first commit, but spoofable
