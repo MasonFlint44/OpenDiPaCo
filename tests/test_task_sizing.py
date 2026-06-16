@@ -274,15 +274,27 @@ def test_parking_off_when_sizing_off():
 
 
 def test_too_slow_worker_is_parked_then_re_measured():
-    """A too-slow worker is parked (idle) within the cooldown, but one request
-    per cooldown is let through so it can re-measure and rejoin if it speeds up."""
+    """A too-slow worker is parked (idle) between re-measures. The re-measure
+    interval must exceed the worker's own (long) task time -- here rate 4 over
+    seq 16 means a ~4s min task, so re-requesting 5s after the last let-through
+    (i.e. *after* finishing that task) must still be parked, not leased again."""
+    import time
+
     cfg = _cfg()
     sched = _serving(cfg, task_seconds=1.0, park_factor=3.0)
     try:
-        _set_rate(sched, "slow", 4)                          # too slow
+        _set_rate(sched, "slow", 4)                          # min task ~4s; recheck ~12s
         assert _lease(sched, "slow")["type"] == "task"       # 1st: let through to re-measure
+        # Simulate the worker having finished that ~4s task and re-requesting: a
+        # fixed cooldown < task time would (wrongly) lease again -- the adaptive
+        # recheck keeps it parked.
+        sched._parked["slow"] = time.monotonic() - 5.0
         t2 = sched._next_task({"worker_id": "slow", "warm_paths": [], "cached_shards": []})
-        assert t2["type"] == "idle"                          # parked within the cooldown
+        assert t2["type"] == "idle"                          # still parked 5s later
+        # Long enough after the last let-through -> one re-measure task.
+        sched._parked["slow"] = time.monotonic() - 1000.0
+        assert sched._next_task({"worker_id": "slow", "warm_paths": [],
+                                 "cached_shards": []})["type"] == "task"
     finally:
         sched.shutdown()
 

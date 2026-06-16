@@ -1942,11 +1942,17 @@ class Scheduler(_ReactorServer):
                          if caps.get("max_batch") else self.batch_size)
             inner = self.diloco.inner_steps
             # W5c: park a worker too slow even for the minimum task so it holds no
-            # path (or check). Re-measure one request per cooldown so it can rejoin.
+            # path (or check). Re-measure one task per `park_factor` of *this
+            # worker's own* (long) min-task-times -- a fixed wall cooldown would be
+            # shorter than a parked worker's task time (it overshoots by definition)
+            # and so would never actually idle it; scaling by its min-task-time
+            # idles it ~(park_factor-1)/park_factor of the time, freeing the path
+            # for faster workers, while still re-measuring so a recovered one rejoins.
             if self._too_slow_locked(wid):
                 now = time.monotonic()
                 last = self._parked.get(wid)
-                if last is not None and now - last < self.task_seconds * self.park_factor:
+                recheck = self.park_factor * self.config.sequence_length / self._worker_rate[wid]
+                if last is not None and now - last < recheck:
                     return self._idle()
                 self._parked[wid] = now   # let this one through to re-measure
             else:
