@@ -140,6 +140,28 @@ Reuses the exact primitives the owner replication loop already uses.
   owner (the epoch moved entirely under the task) re-routes once after a local
   epoch re-derive; the bounded-loss window is unchanged.
 
+  **Convergence scope (validated vs. owed).** Independent application reaches
+  byte-identical replicas only when every owner applies the **same ordered
+  sequence** of pushes from the **same epoch**. The slice-c arm validates this for
+  a **single writer** (one worker pushes one contribution to all `k` before the
+  next, so the order is global) on a **stable epoch** with **reliable delivery** —
+  it converges to ~0.98× the anchor. Three cases are **not** yet covered and ride
+  the §0f *systems* run (multi-node), because the on-box harness can't settle
+  them: (1) **multi-writer** pushes to a *shared* module interleave differently at
+  each owner, and the SGD+Nesterov outer step is order-dependent → divergence; the
+  intended fix is order-free, **generation-keyed** aggregation (the
+  `robustness.mode: on` buffer generalized so all owners aggregate the same set per
+  generation regardless of arrival order — today its flush is a local count, not a
+  cross-owner-deterministic set). (2) **Epoch-skew version stamping**:
+  `_bump_version_locked` stamps the owner's *local* `_epoch_num`, so two owners
+  applying the same write during a gossip-lagged epoch transition stamp different
+  versions → quorum can't confirm until epochs converge. (3) **Partial-push
+  repair**: an *active* owner that misses a push (RPC failure) does not re-pull a
+  quorum-confirmed higher version in `_replicate_once` (an active primary pulls
+  nothing), so it can stay diverged under churn. None of these is a regression
+  (the path deadlocked entirely before this fix); they are the multi-writer/WAN
+  frontier the systems run must close.
+
 ### D7. `run_local` for decentralized
 
 Stand up, in one process: a `Tracker` (seed), `k`+ owner `ParameterServer`s
@@ -189,8 +211,11 @@ plan, in order of importance:
   The slice-c `validate_dynamics` arm caught that the original "primary applies,
   co-owners replicate" plan deadlocks (quorum-gated replication can't propagate a
   single-replica version) — staleness grew unbounded and commits stalled after
-  ~8 generations. With independent application the arm converges to **~0.98× the
-  synchronous anchor** on one box.
+  ~8 generations. With independent application the **single-writer** arm converges
+  to **~0.98× the synchronous anchor** on one box. Multi-writer convergence on a
+  shared module (order-free aggregation), epoch-skew versioning, and partial-push
+  repair remain owed to the §0f systems run — see the *convergence scope* note in
+  D6.
 - **Fair scan rotation** (`_pick_assigned_path` start cursor) so a worker
   responsible for several paths round-robins them rather than monopolizing path 0
   (else the per-path target never completes).

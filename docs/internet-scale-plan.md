@@ -388,10 +388,12 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
   (`run_decentralized_worker`/`_serve_decentralized`, `_run_local_decentralized`;
   [decentralized-worker-loop-design.md](decentralized-worker-loop-design.md)), and
   `examples/validate_dynamics.py` now trains the scheduler-less write path vs. the
-  synchronous anchor on one box (the read-side quorum primitive alone is in
-  `examples/validate_decentralized.py`). **Still 0f-gated:** the at-scale
-  *convergence* verdict under real WAN latency/NAT/bandwidth/churn — the systems
-  half — exactly as Phase 3's end-to-end verdict.
+  synchronous anchor on one box for a **single writer** (~0.98× the anchor; the
+  read-side quorum primitive alone is in `examples/validate_decentralized.py`).
+  **Still 0f-gated (systems half):** **multi-writer** convergence on a shared module
+  (order-dependent outer step → needs order-free generation-keyed aggregation),
+  epoch-skew version stamping, and partial-push repair, all under real WAN
+  latency/NAT/bandwidth/churn — exactly as Phase 3's end-to-end verdict.
 - Only worth completing if tracker/scheduler availability actually becomes the
   limiting factor; Phases 0–3 already deliver the goal without it.
 

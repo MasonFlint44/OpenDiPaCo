@@ -28,10 +28,14 @@ against a Byzantine *primary* needs that push-to-all-`k` path so each owner
 recomputes rather than trusts the primary's bytes. Everything the defense *is
 built on* (assignment, grants, fence, digests, quorum reads, divergence
 detection, eviction, deterministic epochs, gossip import) is landed and
-unit/integration-tested; the swarm now converges on one box. What still rides the
-0f **WAN** run: whether `k` independent aggregations converge comparably at scale
-under real latency/NAT/bandwidth/churn — the **systems** half — like Phase 3's
-end-to-end verdict.
+unit/integration-tested; the swarm converges on one box for a **single writer**
+(`validate_dynamics` decentralized arm, ~0.98× the anchor). What still rides the
+0f **WAN** run: **multi-writer** convergence on a shared module — concurrent
+pushes interleave per-owner and the outer step is order-dependent, so it needs
+order-free generation-keyed aggregation — plus epoch-skew version stamping and
+partial-push repair under real latency/NAT/bandwidth/churn (the **systems** half,
+like Phase 3's end-to-end verdict). See the *convergence scope* note in
+`docs/decentralized-worker-loop-design.md`.
 
 **4d amendments (discovered while building):**
 - *No per-owner `EpochManager` in decentralized mode — directory TTL provides

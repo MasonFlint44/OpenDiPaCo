@@ -35,10 +35,12 @@ genuinely race and go stale), with two further deltas layered on:
   has no real *speed* heterogeneity, so the batch mix is injected directly; the
   straggler/wall-time benefit of sizing rides the WAN run.)
 * ``decentralized`` (Phase 4, ``schedule: decentralized``) — the **scheduler-less**
-  write path: workers self-assign from a gossiped directory, quorum-read bases,
-  commit to each path's owner-coordinator (which mints the grant), and **push to
-  all k owners** (primary applies, co-owners converge by replication). Does the
-  decentralized control + write path converge comparably to the central anchor?
+  write path with a **single** self-assigning worker: it quorum-reads bases,
+  commits to each path's owner-coordinator (which mints the grant), and **pushes
+  to all k owners**, each of which applies the granted step independently. Does
+  that control + write path converge comparably to the central anchor? (Single
+  writer only — see ``DEC_WORKERS``: multi-writer agreement on a shared module
+  needs order-free aggregation and is the §0f *systems* half.)
 
 All configs train the **same** corpus/sharding/seed and are evaluated by the same
 router-free metric (best-path perplexity on a held-out split), so the numbers are
@@ -49,12 +51,15 @@ directly comparable. Env-overridable:
 
 HONEST CAVEAT — what this does and does NOT cover:
   • COVERS, end-to-end, on one box: async staleness dynamics, int8 compression,
-    robust-aggregation dynamics, and Phase 4's **decentralized push-to-all-k write
-    path** (self-assign + quorum reads + owner-minted grants), each vs. the
-    synchronous anchor.
+    robust-aggregation dynamics, and Phase 4's **single-writer decentralized
+    push-to-all-k write path** (self-assign + quorum reads + owner-minted grants +
+    independent per-owner application), each vs. the synchronous anchor.
   • Does NOT cover: real-WAN *systems* behavior (latency / NAT / bandwidth / real
-    churn) — that still needs the multi-node run. The decentralized arm here is the
-    *dynamics* half of §0f; the systems half rides the WAN run.
+    churn) — that still needs the multi-node run — and, specifically for the
+    decentralized arm, **multi-writer convergence on a shared module** (concurrent
+    pushes interleave per-owner and the outer step is order-dependent, so it needs
+    order-free generation-keyed aggregation), epoch-transition version skew, and
+    partial-push repair. Those are the §0f *systems* half, still owed.
   • This is a SMALL-SCALE check: read the gap-to-anchor *trend*, not absolute
     perplexity. A green run is evidence the deltas converge, not a scale proof.
 """
@@ -105,12 +110,19 @@ NUM_DOCS = _i("NUM_DOCS", 240)
 NUM_SHARDS = _i("NUM_SHARDS", 2)
 DEC_OWNERS = _i("DEC_OWNERS", 3)         # decentralized owner nodes (k-way replicated)
 DEC_K = _i("DEC_K", 3)                   # replication factor for the decentralized arm
-# Decentralized workers default to 1: with several workers the per-generation HRW
-# re-roll hands paths off constantly, so workers spend most of their time
-# "assignee of nothing" and back off -- that thrash is a *systems*/throughput
-# property (the WAN half), not the convergence question this arm measures. One
-# self-assigning worker still sees replication-lag staleness on its quorum reads,
-# so the decentralized *write*-path dynamics are exercised without the thrash.
+# Decentralized workers default to 1 -- and this is a real boundary, not just a
+# throughput convenience. A single self-assigning worker produces a *globally
+# ordered* push stream (it pushes one contribution to all k owners before the
+# next), so every owner applies the same ordered sequence and the k independent
+# outer steps stay byte-identical -- the convergence this arm verifies. With
+# SEVERAL workers pushing to the *same shared module* concurrently, their pushes
+# interleave differently at each owner, and the outer optimizer (SGD+Nesterov) is
+# order-dependent, so the owners would diverge unless the writes are made
+# order-free (the robust-aggregation buffer generalized to a generation-keyed,
+# arrival-order-independent aggregate). That multi-writer agreement -- together
+# with epoch-skew version stamping, partial-push repair, and real churn -- is the
+# §0f *systems* half (WAN run), still owed. So this arm validates the single-writer
+# decentralized write-path dynamics; it does NOT claim multi-writer convergence.
 DEC_WORKERS = _i("DEC_WORKERS", 1)
 DEC_TIMEOUT = float(os.environ.get("DEC_TIMEOUT", "300"))  # per-path target safety bound
 WORKERS = _i("WORKERS", 0)               # 0 -> default to num_paths (full concurrency)
@@ -230,18 +242,27 @@ def _path_generation(owner_by_id, topo, epoch, path) -> int:
 
 
 def train_decentralized(config, diloco, corpus, *, n_owners=DEC_OWNERS, k=DEC_K) -> dict:
-    """The real in-process **decentralized** path (Phase 4): no scheduler. Workers
-    self-assign from a gossiped directory, quorum-read each path's bases, commit to
-    the path's owner-coordinator (which version-fences the generation and mints the
-    grant), and push to all ``k`` owners -- each path's primary applies, co-owners
-    converge by replication. Owners cold-start from a bootstrap epoch and run to a
-    per-path generation target. Returns the merged authoritative bank (each key
-    from its primary).
+    """The real in-process **decentralized** path (Phase 4): no scheduler. A
+    ``DEC_WORKERS`` worker self-assigns from a gossiped directory, quorum-reads each
+    path's bases, commits to the path's owner-coordinator (which version-fences the
+    generation and mints the grant), and pushes to all ``k`` owners -- **each owner
+    applies the granted step independently** (``_may_write_locked``), so the k
+    replicas converge to the same bytes and a quorum read can confirm them. Owners
+    cold-start from a bootstrap epoch and run to a per-path generation target.
+    Returns the merged authoritative bank (each key from its primary).
 
-    This exercises the push-to-all-``k`` WRITE path + quorum reads + owner-minted
-    grants + owner-coordinated generations end to end on one box -- the dynamics
-    half of §0f for decentralized mode. The WAN *systems* half still needs hardware,
-    and the read-side quorum primitive alone is in ``validate_decentralized.py``."""
+    Defaults to **one** worker (see ``DEC_WORKERS``): with one writer the push
+    stream is globally ordered, so the k order-dependent outer steps stay
+    byte-identical. This exercises the push-to-all-``k`` WRITE path + quorum reads +
+    owner-minted grants + owner-coordinated generations end to end on one box -- the
+    *single-writer* dynamics half of §0f. Multi-writer agreement on a shared module
+    (order-free aggregation), epoch-skew versioning, and partial-push repair are the
+    WAN *systems* half; the read-side quorum primitive alone is in
+    ``validate_decentralized.py``."""
+    if k < 2 or n_owners < 2:
+        raise ValueError(f"decentralized arm needs DEC_K>=2 and DEC_OWNERS>=2 "
+                         f"(quorum reads + replication need co-owners); got "
+                         f"k={k}, owners={n_owners}")
     auth = os.urandom(8).hex()
     ids = [PeerIdentity.generate() for _ in range(n_owners)]
     pubs = [i.public_key_hex for i in ids]
@@ -287,6 +308,15 @@ def train_decentralized(config, diloco, corpus, *, n_owners=DEC_OWNERS, k=DEC_K)
                    for p in topo.paths()):
                 break
             time.sleep(0.05)
+        else:
+            # Timed out before every path hit the target: the bank is undertrained,
+            # so the ppl below reflects a *systems* stall (a stuck worker / no
+            # quorum), NOT a dynamics regression. Flag it loudly so the WEAK verdict
+            # isn't misread -- raise DEC_TIMEOUT or check the swarm.
+            gens = [_path_generation(owner_by_id, topo, epoch0, p) for p in topo.paths()]
+            print(f"  WARNING: decentralized arm TIMED OUT after {DEC_TIMEOUT:.0f}s at "
+                  f"generations {gens} (target {ROUNDS}); the ppl below is undertrained "
+                  f"(a systems stall, not a dynamics verdict).", flush=True)
     finally:
         stop.set()
         for w in workers:

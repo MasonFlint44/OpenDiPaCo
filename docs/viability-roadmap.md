@@ -52,9 +52,13 @@ than a vacuous pass when the anchor itself doesn't train at the chosen scale.
 This **de-risks the dynamics deltas** that the DiPaCo paper (synchronous) does
 not cover. The harness now also includes a **decentralized arm** (Phase 4's
 scheduler-less **push-to-all-`k`** write path: self-assign + quorum reads +
-owner-minted grants), driven by the now-landed worker loop below — so the last
-dynamics delta it couldn't previously reach is covered on-box. *Still owed:* the
-same comparisons at real scale (the systems half, below).
+owner-minted grants + independent per-owner application), driven by the
+now-landed worker loop below — it converges to ~0.98× the anchor for a **single
+writer** on one box. *Still owed (the systems half, below):* the same comparison
+at real scale, and specifically **multi-writer** convergence on a shared module
+(concurrent pushes interleave per-owner and the SGD+Nesterov step is
+order-dependent → needs order-free, generation-keyed aggregation), epoch-skew
+version stamping, and partial-push repair under churn.
 
 ### 0f-systems · *does it work over real consumer links?* · B0 · [research + eng]
 
