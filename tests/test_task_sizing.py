@@ -155,6 +155,35 @@ def test_audit_record_pins_sized_batch_and_inner():
         sched.shutdown()
 
 
+def test_train_path_honors_per_task_inner_steps():
+    """The worker half of D6: _train_path's inner_steps override actually changes
+    the local-step count (it isn't ignored) and trains finitely under the cosine
+    LR schedule with the reduced count -- the path the scheduler-side sizing tests
+    don't exercise."""
+    import math
+
+    from opendipaco.backend import LocalBackend
+    from opendipaco.schedule import AsyncScheduler
+    from opendipaco.train.loop import DiPaCoEngine
+
+    cfg = _cfg()
+    eng = DiPaCoEngine(cfg, DiLoCoConfig(inner_steps=4, inner_lr=1e-2),
+                       LocalBackend(cfg.build_topology()), device="cpu", seed=0,
+                       materialize="serial")
+    eng.total_rounds = 1
+    worker = AsyncScheduler(eng, num_workers=1)
+    path = cfg.build_topology().path_from_index(0)
+    shard = torch.randint(0, 48, (32, cfg.sequence_length))
+
+    sized = worker._train_path(path, shard, 4, 0, inner_steps=1)   # sized down
+    eng._opt_state.pop(path, None)                                 # clean base for the default run
+    default = worker._train_path(path, shard, 4, 0)                # configured 4
+    assert not sized.empty and not default.empty
+    assert math.isfinite(sized.loss) and math.isfinite(default.loss)
+    # The override is honored: 1 step vs 4 steps from the same base -> different result.
+    assert sized.loss != default.loss
+
+
 def test_check_task_uses_pinned_size_not_checker_ceiling():
     """End to end: with all paths leased so only checks remain, a fast checker
     with a big cap still gets the audited primary's small batch/inner."""
