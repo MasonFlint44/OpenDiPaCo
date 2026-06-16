@@ -795,8 +795,8 @@ def _run_local_decentralized(cfg: LaunchConfig):
         ps = ParameterServer(
             model, [], diloco, port=0, identity=owner_ids[i],
             replicate_interval=own.replicate_interval, bank_seed=own.bank_seed,
-            corpus_weights=weights, **_decentralized_owner_kw(cfg),
-            **common, **_server_kw(cfg, extra))
+            corpus_weights=weights, peer_tls=build_tls_client(cfg),
+            **_decentralized_owner_kw(cfg), **common, **_server_kw(cfg, extra))
         ps.start()
         owners.append(ps)
     owner_by_id = {ps.peer_id: ps for ps in owners}
@@ -837,6 +837,9 @@ def _run_local_decentralized(cfg: LaunchConfig):
             for path in topo.paths():
                 prim = path_primary(topo.path_module_keys(path), epoch0)
                 ps = owner_by_id.get(prim["peer_id"]) if prim else None
+                if ps is None:        # primary remapped off the bootstrap epoch
+                    done = False
+                    continue
                 with ps._lock:
                     g = ps._gen.get(path, [0])[0]
                 completed[topo.path_index(path)] = g
@@ -853,6 +856,12 @@ def _run_local_decentralized(cfg: LaunchConfig):
         for ps in owners:
             ps.shutdown(graceful=True)
         tracker.shutdown()
+    if any(completed.get(p, 0) < target for p in range(model.num_paths)):
+        # Don't pretend a stalled run succeeded: a partial result here means an
+        # owner/worker wedged (the safety timeout fired) -- surface it loudly.
+        print(f"WARNING: decentralized run_local hit the {_DECENTRALIZED_RUN_TIMEOUT:.0f}s "
+              f"timeout before every path reached generation {target}: {completed}",
+              flush=True)
     return _DecentralizedCluster(owners[0].metrics, merged), completed
 
 

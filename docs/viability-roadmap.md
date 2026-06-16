@@ -59,8 +59,10 @@ path, which needs the worker loop below.
 The half that genuinely needs **distributed hardware**: a real WAN run (e.g.
 three homes + a VPS) measuring convergence and behavior under real latency, NAT,
 asymmetric bandwidth, and real churn — and exercising the **decentralized worker
-loop** (self-assign → quorum-read bases → commit → **push to all `k` owners**,
-plus a single-process `run_local` for it; today it refuses decentralized mode).
+loop** (self-assign → quorum-read bases → commit → **push to all `k` owners**).
+The loop and a single-process `run_local` for it are **landed** (it trains on-box;
+`run_local` no longer refuses decentralized mode); only the at-scale convergence
+verdict and real-WAN behavior still need this hardware.
 Closing this also lands the three Phase 4 residuals in
 [phase4-design.md](phase4-design.md): convergent/Byzantine-robust **epoch
 numbering** across joins, **owner-side α shard-size weighting** (uniform today),
