@@ -228,6 +228,12 @@ def _route_target(owner):
     return addrs if len(addrs) > 1 else owner["addr"]
 
 
+# W5a: EMA weight for the per-worker effective-rate estimate. ~0.3 adapts over a
+# handful of tasks -- fast enough to follow a worker that throttles, slow enough
+# to ignore a one-off cold fetch or GC pause (design open-Q 2).
+_RATE_EMA_ALPHA = 0.3
+
+
 def _safe_version(v):
     """A *wire* version coerced to an (epoch, counter) pair, or None if
     malformed. Decentralized sources may be Byzantine (Phase 4), so a bad
@@ -1751,6 +1757,11 @@ class Scheduler(_ReactorServer):
         self._issued: dict = {}
         self._lease: dict = {}  # path -> current lease token (fences commits)
         self._owner: dict = {}
+        # W5a: per-worker effective rate (tokens / lease-second), measured from
+        # lease->commit timing. dynamics-neutral; W5b sizes tasks from it.
+        self._lease_at: dict = {}    # path -> monotonic lease time (current lease)
+        self._lease_work: dict = {}  # path -> tokens issued in the leased task
+        self._worker_rate: dict = {}  # worker_id -> EMA effective rate
 
     def _handle(self, msg: dict, nbytes: int, peer_id: str | None = None):
         kind = msg.get("type")
@@ -1910,6 +1921,10 @@ class Scheduler(_ReactorServer):
             check_only, base, audit, check_private, check_grant = (
                 False, None, False, False, None)
             rep = self.reputation.get(peer_id)
+            # Per-worker batch, clamped to its advertised memory cap (W5b will
+            # also size it down from the measured rate; here it is the ceiling).
+            batch = (max(1, min(self.batch_size, int(caps["max_batch"])))
+                     if caps.get("max_batch") else self.batch_size)
             if not eligible:
                 # No primary work: absorb the surplus as a redundant check for an
                 # open audit (§1.9), if one needs this distinct worker.
@@ -1933,6 +1948,11 @@ class Scheduler(_ReactorServer):
                 self._inflight[path] = time.monotonic() + self.heartbeat_timeout
                 self._issued[path] = self._T
                 self._lease[path] = lease
+                # W5a: remember when this lease opened and how much work it carries,
+                # so its commit yields an effective-rate sample for this worker.
+                self._lease_at[path] = time.monotonic()
+                self._lease_work[path] = batch * self.diloco.inner_steps * \
+                    self.config.sequence_length
                 generation = self._completed[path]
                 # Sample this task for an audit: the primary will report a pinned
                 # base + digest, and checkers re-run it from that base. A
@@ -1976,8 +1996,7 @@ class Scheduler(_ReactorServer):
             "down": self.down,          # downlink policy: keep keyframes for deltas (W2a)
             "shard": compress_shard(shard, self.compress),
             "shard_spec": shard_spec,
-            "batch_size": (max(1, min(self.batch_size, int(caps["max_batch"])))
-                           if caps.get("max_batch") else self.batch_size),
+            "batch_size": batch,
             "total_rounds": self.total_rounds,
             "seed": self.seed,
         }
@@ -2088,11 +2107,17 @@ class Scheduler(_ReactorServer):
             with self._lock:
                 lease = self._lease.get(path)
                 if path not in self._inflight or msg.get("lease") != lease:
-                    # stale / already freed / not the current lease holder
+                    # stale / already freed / not the current lease holder. Don't
+                    # touch the rate timing -- it belongs to the *current* lease.
                     return {"type": "commit_ack", "accepted": False}
                 staleness = self._T - self._issued.get(path, self._T)
                 self._inflight.pop(path, None)
                 self._lease.pop(path, None)
+                # W5a: claim this lease's rate sample now (only *recorded* on an
+                # accepted, non-empty commit below; rejects just drop it).
+                rate_wid = self._owner.get(path)
+                lease_t0 = self._lease_at.pop(path, None)
+                lease_work = self._lease_work.pop(path, None)
                 if staleness > self.staleness_bound:
                     self.metrics.record_stale_reject()
                     return {"type": "commit_ack", "accepted": False}
@@ -2106,6 +2131,10 @@ class Scheduler(_ReactorServer):
                 gen = self._completed.get(path, 0)
                 self._T += 1
                 self._completed[path] = gen + 1
+                # W5a: a real, accepted unit of work -> an effective-rate sample.
+                if lease_t0 is not None and not msg.get("empty"):
+                    self._record_rate_locked(rate_wid, lease_work,
+                                             time.monotonic() - lease_t0)
                 damp = 1.0 / (1.0 + staleness) if self.staleness_weight == "inverse" else 1.0
                 push_weight = self.corpus.shard_weight(self.topology.path_index(path)) * damp
                 self.metrics.record_update(staleness)
@@ -2144,8 +2173,28 @@ class Scheduler(_ReactorServer):
             if path in self._inflight and msg.get("lease") == self._lease.get(path):
                 self._inflight.pop(path, None)
                 self._lease.pop(path, None)
+                self._lease_at.pop(path, None)    # returned, not committed: no rate sample
+                self._lease_work.pop(path, None)
                 return {"type": "nack_ack", "freed": True}
         return {"type": "nack_ack", "freed": False}
+
+    def _record_rate_locked(self, wid, work, elapsed) -> None:
+        """Fold one (work, lease-duration) sample into a worker's EMA effective
+        rate (tokens / second). Caller holds the lock. Guards against a zero/
+        negative duration (instant in-process commit) so the EMA can't blow up."""
+        if wid is None or work is None or work <= 0 or elapsed <= 0:
+            return
+        rate = work / elapsed
+        prev = self._worker_rate.get(wid)
+        self._worker_rate[wid] = rate if prev is None else (
+            (1 - _RATE_EMA_ALPHA) * prev + _RATE_EMA_ALPHA * rate)
+
+    def worker_rate(self, wid):
+        """A worker's measured effective rate (tokens per lease-second) as an EMA,
+        or ``None`` if it hasn't completed a task yet (W5a). W5b sizes the next
+        task from this so the lease lands in ~``task_seconds``."""
+        with self._lock:
+            return self._worker_rate.get(wid)
 
     def _heartbeat(self, msg: dict) -> None:
         path = msg["path"]
@@ -2160,6 +2209,8 @@ class Scheduler(_ReactorServer):
                 del self._inflight[path]
                 self._lease.pop(path, None)  # invalidate the token: zombies can't commit
                 self._owner[path] = None
+                self._lease_at.pop(path, None)    # reclaimed, not committed: no rate sample
+                self._lease_work.pop(path, None)
                 self.metrics.reclaims += 1
         self._resolve_audits_locked(now)  # close out timed-out / complete audits
 
