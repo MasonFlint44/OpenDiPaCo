@@ -184,6 +184,31 @@ def test_train_path_honors_per_task_inner_steps():
     assert sized.loss != default.loss
 
 
+def test_audit_pins_size_even_with_sizing_off_heterogeneous_caps():
+    """D8 also fixes a latent pre-existing bug, independent of sizing: with
+    sizing OFF but heterogeneous max_batch caps, a checker must re-run the
+    *primary's* batch, not its own larger cap -- else the digest diverges and the
+    audit falsely flags. Here the primary caps at 2; a cap-8 checker must check
+    at batch 2."""
+    cfg = _cfg()
+    sched = _serving(cfg, redundancy=2, redundancy_rate=1.0)   # task_seconds None -> sizing off
+    try:
+        prim = sched._next_task({"worker_id": "p", "warm_paths": [], "cached_shards": [],
+                                 "capabilities": {"max_batch": 2}})
+        assert prim["batch_size"] == 2 and "inner_steps" not in prim   # off: no size field
+        key = (prim["path"], prim["gen_id"])
+        assert sched._audits[key]["batch"] == 2                        # pinned the primary's batch
+        sched._commit({"type": "commit", "path": prim["path"], "worker_id": "p",
+                       "lease": prim["lease"], "loss": 1.0, "base": {"k": [0]}, "digest": "D"})
+        for i, _p in enumerate(sched.paths):
+            sched._next_task({"worker_id": f"f{i}", "warm_paths": [], "cached_shards": []})
+        chk = sched._next_task({"worker_id": "big", "warm_paths": [], "cached_shards": [],
+                                "capabilities": {"max_batch": 8}})
+        assert chk.get("check_only") and chk["batch_size"] == 2        # pinned, not the cap-8
+    finally:
+        sched.shutdown()
+
+
 def test_check_task_uses_pinned_size_not_checker_ceiling():
     """End to end: with all paths leased so only checks remain, a fast checker
     with a big cap still gets the audited primary's small batch/inner."""
