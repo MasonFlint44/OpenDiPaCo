@@ -1,6 +1,6 @@
 # W4 design — churn robustness at consumer reality
 
-Status: **W4a + W4b landed.** Phase 2 built dynamic ownership, k-replication,
+Status: **W4a + W4b + W4c landed.** Phase 2 built dynamic ownership, k-replication,
 pull replication, epoch-bump failover, per-key checkpoints, and a signed recovery
 manifest — but timed and tested for **cluster** churn. W4 is the roadmap's
 *"eng / tuning"* item (`docs/viability-roadmap.md` §W4): make those mechanisms
@@ -21,8 +21,15 @@ immediate-removal (`observe(tombstoned=)`, fed by the tracker's new
 `run_sharded_worker` + the sharded scheduler's new `nack` handler, lease-fenced
 and reputation-neutral). Measured payoff: a graceful leave fails over in ~0.3 s
 vs ~2.9 s abrupt at the harness's demo timings — it skips `owner_grace`. The
-non-graceful path stays byte-identical. **Remaining: W4c** (primary drain on
-departure) **+ W4d** (home-grade launch defaults + signal handlers + docs).
+non-graceful path stays byte-identical. **W4c** (D3 part 2): a departing primary
+**drains** — pushes its exact latest state (weights + outer momentum + version)
+to each key's rank-1 successor before leaving (`shutdown(graceful=True)` →
+`_drain_to_backups` → the receiver's `drain` handler, the push-direction inverse
+of the `include_state` pull: version-gated, owner-session gated, exact bytes,
+best-effort). A promoted backup then holds the *last* accepted push, collapsing
+the failover loss window from ≤ `replicate_interval` to ~0. Refused in
+decentralized mode (a pushed version isn't quorum-confirmable). **Remaining:
+W4d** (home-grade launch defaults + signal handlers + docs).
 
 W4 builds **no new subsystem.** Every decision below either tightens an existing
 timing, adds a clean-departure fast path beside the existing TTL-expiry slow
@@ -263,7 +270,7 @@ it justifies.
 |---|---|---|
 | **W4a** ✅ | `examples/validate_churn.py`: in-process churn injector (abrupt/graceful/suspend/join) + churn metrics (epochs, remaps, time-to-failover, dropped contributions); minimal test hooks on the owner/worker loops to drive churn deterministically. No behavior change. | Harness runs a job through injected churn and reports metrics; abrupt-kill failover completes with bounded loss (today's behavior, now measured); suspend-within-grace causes 0 bumps. |
 | **W4b** ✅ | Graceful departure mechanics (D3 parts 1+3): signed fast-deregister → `EpochManager` immediate-removal predicate; worker nack-on-leave; `shutdown(graceful=True)` seam (D5 library half). | Tombstone → next bump removes the peer skipping `owner_grace`, still rate-limited; forged tombstone for a live peer rejected (wrong signer); graceful worker leave re-leases its path immediately; non-graceful path bit-identical to today. *(All landed; harness's graceful arm fails over ~10× faster than abrupt.)* |
-| **W4c** | Primary drain on departure (D3 part 2): a leaving primary flushes highest-version state to rank-1 over the exact-bytes replication path before exit. | Drain → promoted rank-1 serves the *last* accepted push (loss window ~0) vs ≤`replicate_interval` without; drain payload is exact bytes (version identifies identical content); drain failure degrades to the window (no wedge). |
+| **W4c** ✅ | Primary drain on departure (D3 part 2): a leaving primary flushes highest-version state to rank-1 over the exact-bytes replication path before exit. | Drain → promoted rank-1 serves the *last* accepted push (loss window ~0) vs ≤`replicate_interval` without; drain payload is exact bytes (version identifies identical content); drain failure degrades to the window (no wedge). *(All landed; also version-gated, owner-session gated, refused in decentralized mode.)* |
 | **W4d** | Home-grade launch defaults (D2), validated by the W4a harness across the D1 model; `SIGTERM`/`SIGINT` → `shutdown(graceful=True)` launch handlers (D5 launch half); docs + roadmap/plan status. | Retuned defaults survive + converge in the harness across the churn sweep; launch signal handler runs the handoff within its deadline then exits; `viability-roadmap.md`/`internet-scale-plan.md` W4 status honest. |
 
 Rough sizing: W4a M (the harness is the work), W4b M, W4c S–M, W4d S + tuning.

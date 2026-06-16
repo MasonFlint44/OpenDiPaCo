@@ -468,6 +468,8 @@ class ParameterServer(_ReactorServer):
         kind = msg.get("type")
         if kind == "fetch":
             return self._fetch(msg, peer_id)
+        if kind == "drain":
+            return self._drain_recv(msg, peer_id)
         if kind == "push":
             return self._push(msg, peer_id)
         if kind == "commit":  # decentralized: this owner coordinates the path
@@ -755,6 +757,81 @@ class ParameterServer(_ReactorServer):
         if missing:
             out["missing"] = missing
         return out
+
+    def _drain_recv(self, msg: dict, peer_id: str | None = None) -> dict:
+        """Receive a departing primary's pushed state for keys it owns (W4c
+        graceful-leave drain — the push-direction inverse of the include_state
+        pull). Applied **version-gated** (only strictly-newer bytes, idempotent /
+        last-writer-wins) and only from a session authenticated as a current
+        owner of the key (same gate as the pull). Exact bytes + outer momentum,
+        never compressed. Returns the keys adopted.
+
+        Refused in decentralized mode: a pushed version isn't quorum-confirmable,
+        so a Byzantine primary could poison a backup that then reaches false
+        read-quorum (the same hazard `_replicate_once` guards). There, the normal
+        pull + quorum path applies; the drain is a central/rendezvous optimization.
+        """
+        if self.schedule_mode == "decentralized":
+            return {"type": "drained", "adopted": []}
+        adopted = []
+        with self._lock:
+            for k, payload in (msg.get("states") or {}).items():
+                if k not in self.bank or not isinstance(payload, dict):
+                    continue
+                if not self._state_allowed_locked(k, peer_id):  # sender must own k
+                    continue
+                v = _safe_version(payload.get("version"))
+                sd = payload.get("weights")
+                if v is None or sd is None or v <= self._versions[k]:
+                    continue  # not newer (or malformed) -> ignore
+                self.bank[k].load_state_dict({n: t.to(self.device) for n, t in sd.items()})
+                osd = payload.get("state")
+                if osd is not None and k in self._outer_opts:
+                    self._outer_opts[k].load_state_dict(_opt_from_wire(osd))
+                self._versions[k] = v
+                adopted.append(k)
+        return {"type": "drained", "adopted": adopted}
+
+    def _drain_to_backups(self) -> dict:
+        """Graceful-leave drain (W4c): for each key this owner is the **active
+        primary** of, push its exact current state (weights + outer momentum +
+        version) to **rank-1**, the successor that promotion will make primary.
+        Rank-1 then holds the *last* accepted push, collapsing the failover loss
+        window from <= replicate_interval to ~0 for a clean leave.
+
+        Best-effort: any send failure falls back to the normal pull window, so a
+        drain is never worse than an abrupt leave. No-op in static/decentralized
+        mode (no successor concept / pushed state isn't quorum-safe)."""
+        if self.schedule_mode == "decentralized":
+            return {}
+        with self._lock:
+            epoch = self._epoch
+            if epoch is None or self.peer_id is None:
+                return {}
+            by_peer: dict = {}  # successor peer_id -> (dial target, {key: payload})
+            for k in sorted(self.owned_keys):
+                if k not in self._active or k not in self.bank:
+                    continue
+                owners = owners_for(k, epoch)
+                if len(owners) < 2 or owners[0]["peer_id"] != self.peer_id:
+                    continue  # only the primary drains, and only if a successor exists
+                rank1 = owners[1]
+                payload = {"version": self._versions[k],
+                           "weights": _state_to_cpu(self.bank[k].state_dict())}
+                if k in self._outer_opts:
+                    payload["state"] = _opt_to_wire(
+                        _optimizer_state_to_cpu(self._outer_opts[k].state_dict()))
+                by_peer.setdefault(rank1["peer_id"],
+                                   (self._owner_targets(rank1), {}))[1][k] = payload
+        results: dict = {}
+        for target, states in by_peer.values():       # sent outside the lock
+            try:
+                reply = self._peer_rpc(target, {"type": "drain", "states": states})
+                for k in (reply or {}).get("adopted", []):
+                    results[k] = "drained"
+            except (OSError, ConnectionError):
+                pass  # best-effort -> fall back to the replicate_interval pull window
+        return results
 
     def apply_epoch(self, record, *, bootstrap: bool | None = None) -> None:
         """Adopt a newer owner-set epoch.
@@ -1067,7 +1144,7 @@ class ParameterServer(_ReactorServer):
         still applies, so a graceful shutdown is never worse than an abrupt one.
         The default (``graceful=False``) is byte-identical to before."""
         self._repl_stop.set()
-        if graceful and self.identity is not None and self._seed_addr is not None:
+        if graceful and self.peer_id is not None:
             # Stop the heartbeat *before* deregistering, else a re-registration
             # racing the deregister could land after it (with a newer issued_at)
             # and resurrect the record, undoing the tombstone. We set _repl_stop
@@ -1077,14 +1154,19 @@ class ParameterServer(_ReactorServer):
             self._hb_paused.set()
             if self._beat_thread is not None:
                 self._beat_thread.join(timeout=2.0)
-            try:
-                from .tracker import deregister_peer  # lazy: tracker imports this
-                # Short timeout: a closing node (laptop lid) must not block on a
-                # slow/absent tracker -- past the budget, fall back to TTL+grace.
-                deregister_peer(self._seed_addr, self.identity, timeout=3.0,
-                                auth_key=self._tracker_auth, tls=self._tracker_tls)
-            except (OSError, ConnectionError):
-                pass  # tracker away -> fall back to TTL+grace expiry
+            # Drain *before* deregistering: while we're still the valid primary
+            # (epoch not yet bumped), push our latest state to each key's rank-1
+            # successor, so a promoted backup holds the last accepted push (W4c).
+            self._drain_to_backups()
+            if self.identity is not None and self._seed_addr is not None:
+                try:
+                    from .tracker import deregister_peer  # lazy: tracker imports this
+                    # Short timeout: a closing node (laptop lid) must not block on
+                    # a slow/absent tracker -- past the budget, fall back to grace.
+                    deregister_peer(self._seed_addr, self.identity, timeout=3.0,
+                                    auth_key=self._tracker_auth, tls=self._tracker_tls)
+                except (OSError, ConnectionError):
+                    pass  # tracker away -> fall back to TTL+grace expiry
         with self._lock:
             self._flush_all_buffers_locked()  # don't drop accepted-but-buffered work
         for s in self._peer_conns.values():
