@@ -10,6 +10,7 @@ transport seam TCP/libp2p use -- so no sockets are needed.
 Design: docs/decentralized-worker-loop-design.md.
 """
 
+import os
 import time
 
 import pytest
@@ -21,6 +22,8 @@ from opendipaco.schedule import (
     AsyncScheduler,
     ParameterServer,
     PeerIdentity,
+    Reputation,
+    derive_epoch,
     make_epoch_record,
     make_peer_record,
     owners_for,
@@ -335,14 +338,21 @@ def test_one_iteration_commits_and_advances_the_generation():
         _shutdown(owners)
 
 
-def test_generation_advances_monotonically_across_iterations():
+def test_generations_advance_fairly_across_paths():
+    """A single worker is assignee of every path; scan rotation must round-robin
+    them (not monopolize path 0). After N iterations the generations sum to N (the
+    fence prevents double-counts) and are spread one-per-path, not piled on one."""
     epoch, recs, owners = _cluster()
+    topo = _cfg().build_topology()
     try:
-        state, clean, topo = _run_iters(epoch, recs, owners, 3)
-        assert state["done"] == 3                             # no stale double-counts
-        first = topo.path_from_index(0)
-        coord = owners[path_primary(topo.path_module_keys(first), epoch)["peer_id"]]
-        assert coord._gen[first][0] == 3                      # fenced, one advance per commit
+        state, clean, _ = _run_iters(epoch, recs, owners, 3)
+        assert state["done"] == 3
+        gens = {}
+        for path in topo.paths():
+            coord = owners[path_primary(topo.path_module_keys(path), epoch)["peer_id"]]
+            gens[path] = coord._gen.get(path, [0])[0]
+        assert sum(gens.values()) == 3                        # no stale double-counts
+        assert max(gens.values()) == 1                        # spread, not monopolized
     finally:
         _shutdown(owners)
 
@@ -354,3 +364,57 @@ def test_max_tasks_stops_the_loop_cleanly():
         assert clean is True and state["done"] == 2
     finally:
         _shutdown(owners)
+
+
+# -- Byzantine owner eviction (liveness) ---------------------------------------
+
+
+def test_byzantine_owner_is_flagged_and_evicted():
+    """k=3=n, so every owner co-owns every key. Start three decentralized owners
+    on a bootstrap epoch, corrupt one owner's copy of a shared key (same version),
+    and run the cross-owner digest audit: the liar is flagged, its reputation
+    drops below the eligibility floor, and the next epoch an honest owner derives
+    evicts it -- the decentralized eviction liveness path end to end (RPC + audit
+    + re-derive), no scheduler involved."""
+    auth = os.urandom(8).hex()
+    model, diloco = _cfg(), _diloco()
+    ids = [PeerIdentity.generate() for _ in range(3)]
+    pubs = [i.public_key_hex for i in ids]
+    owners = []
+    for i in range(3):
+        ps = ParameterServer(
+            model, [], diloco, host="127.0.0.1", port=0, identity=ids[i],
+            schedule_mode="decentralized", k=3, read_quorum=2,
+            replicate_interval=100.0,                       # drive the audit manually
+            reputation=Reputation(floor=0.5, debit=0.5, credit=0.01),
+            min_owner_reputation=0.3, auth_key=auth,
+            admitted_peers=[p for j, p in enumerate(pubs) if j != i])
+        ps.start()
+        owners.append(ps)
+    try:
+        recs = [make_peer_record(ids[i], reachability="public",
+                                 addr=("127.0.0.1", owners[i].port), roles=("owner",))
+                for i in range(3)]
+        epoch0 = derive_epoch(recs, k=3, salt="", prev=None)
+        for i, ps in enumerate(owners):
+            ps.apply_epoch(epoch0, bootstrap=True)
+            ps._self_record = recs[i]                       # so it doesn't drop itself
+            ps.import_directory(recs)
+        byz, honest = owners[0], owners[1]
+        # Poison the liar's bytes for a shared key it co-owns, leaving the version
+        # untouched (a same-version digest mismatch is what the audit can prove).
+        shared = next(k for k in model.build_topology().module_keys()
+                      if not is_private_key(k) and k in byz.bank)
+        with byz._lock:
+            for p in byz.bank[shared].parameters():
+                p.data.add_(7.0)
+        flagged = honest._audit_digests_once()
+        assert ids[0].peer_id in {pid for s in flagged.values() for pid in s}
+        new_epoch = honest.derive_and_apply_epoch()
+        owner_ids = {o["peer_id"] for o in new_epoch["owners"]}
+        assert ids[0].peer_id not in owner_ids              # liar evicted
+        assert ids[1].peer_id in owner_ids and ids[2].peer_id in owner_ids
+        assert new_epoch["epoch"] > epoch0["epoch"]         # membership changed -> bump
+    finally:
+        for ps in owners:
+            ps.shutdown()

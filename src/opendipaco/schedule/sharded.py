@@ -1214,6 +1214,15 @@ class ParameterServer(_ReactorServer):
                 pass
         self._peer_conns.clear()
         super().shutdown()
+        # Join the background threads (``_repl_stop`` set at the top ends both
+        # loops on their next wait). Without this they linger as daemons past
+        # shutdown -- harmless when idle (static mode), but a decentralized owner's
+        # replicate/gossip/audit loop runs torch ops, and a daemon mid-op at
+        # interpreter teardown can trip a C++ ``terminate``. Bounded so a peer RPC
+        # that's mid-flight can't hang shutdown.
+        for t in (self._repl_thread, self._beat_thread):
+            if t is not None and t is not threading.current_thread():
+                t.join(timeout=5.0)
 
     # -- decentralized coordination (Phase 4 D2/D3/D5) -------------------------
 
@@ -3014,16 +3023,21 @@ def _decentralized_routing(topology, path, epoch, link) -> dict:
     return routing
 
 
-def _pick_assigned_path(link, topology, epoch, workers, peer_id, *, salt, lease_ttl):
+def _pick_assigned_path(link, topology, epoch, workers, peer_id, *, salt, lease_ttl,
+                        start=0):
     """The first ``(path, generation, routing)`` this worker is the current HRW
     assignee for (rank 0, or a successor once the generation has stayed open past
     ``lease_ttl`` -- takeover-on-expiry), or ``None`` if assignee of nothing.
 
-    Reads each path's ``(generation, age)`` from its coordinator (the primary
-    owner of the path's coordinator key, ``generation`` RPC); a coordinator that
-    doesn't answer (down, or not this epoch's primary) skips that path this pass.
+    ``start`` rotates the scan origin so a worker responsible for several paths
+    serves them round-robin instead of monopolizing the lowest-indexed one (the
+    central scheduler's ``_completed`` fairness; design Q2). Reads each path's
+    ``(generation, age)`` from its coordinator (the primary owner of the path's
+    coordinator key, ``generation`` RPC); a coordinator that doesn't answer
+    (down, or not this epoch's primary) skips that path this pass.
     """
-    for path in topology.paths():
+    paths = list(topology.paths())
+    for path in paths[start:] + paths[:start] if paths else paths:
         prim = path_primary(topology.path_module_keys(path), epoch)
         if prim is None or owner_addr(prim) is None:
             continue
@@ -3141,9 +3155,11 @@ def _serve_decentralized(link, engine, worker, peer_id, corpus, directory_fn, *,
     ``max_iters`` bounds the loop for tests (one assigned task per iteration)."""
     topology = engine.topology
     engine.total_rounds = total_rounds
+    n_paths = len(list(topology.paths()))
     epoch_prev = None
     backoff = poll_interval
     iters = 0
+    cursor = 0  # rotates the scan origin so a multi-path worker serves all fairly
     while True:
         if stop_event is not None and stop_event.is_set():
             return True
@@ -3158,7 +3174,7 @@ def _serve_decentralized(link, engine, worker, peer_id, corpus, directory_fn, *,
         workers = _worker_directory_ids(records)
         picked = (None if not epoch["owners"] or peer_id not in workers
                   else _pick_assigned_path(link, topology, epoch, workers, peer_id,
-                                           salt=salt, lease_ttl=lease_ttl))
+                                           salt=salt, lease_ttl=lease_ttl, start=cursor))
         if picked is None:
             time.sleep(backoff)
             backoff = min(backoff * 2, 1.0)
@@ -3210,6 +3226,10 @@ def _serve_decentralized(link, engine, worker, peer_id, corpus, directory_fn, *,
         _load_private(engine, contrib.private_state)
         warm.add(path)
         state["done"] += 1
+        # Advance past the path just served so the next scan starts at the next
+        # one -- round-robins a worker's assigned paths instead of re-picking this.
+        if n_paths:
+            cursor = (topology.path_index(path) + 1) % n_paths
 
 
 def run_decentralized_worker(config, diloco, tracker_addr, corpus, *, identity,

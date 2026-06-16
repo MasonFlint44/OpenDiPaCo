@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import signal
 import threading
+import time
 
 import torch
 
@@ -39,6 +40,11 @@ from ..schedule import (
     Tracker,
     assign_shards,
     client_context,
+    derive_epoch,
+    make_peer_record,
+    owners_for,
+    path_primary,
+    run_decentralized_worker,
     run_sharded_worker,
     run_worker,
     server_context,
@@ -539,6 +545,21 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             transport="libp2p", identity=_node_identity(cfg, generate=True),
             stop_event=stop_event or _wait_for_signal())
         return
+    if cfg.schedule.mode == "decentralized":
+        # No scheduler: self-assign from the gossiped directory. The worker builds
+        # the corpus locally (the shard source) and needs an identity (it is
+        # HRW-scored by peer_id and derives epochs).
+        own = cfg.ownership
+        corpus = build_corpus(cfg, model, build_documents(cfg))
+        run_decentralized_worker(
+            model, diloco, tuple(cfg.tracker_connect_addr()), corpus,
+            identity=_node_identity(cfg, generate=True), device=cfg.run.device,
+            seed=cfg.run.seed, auth_key=cfg.transport.auth_key, k=own.k, salt=own.salt,
+            read_quorum=cfg.schedule.read_quorum, lease_ttl=cfg.schedule.lease_ttl,
+            batch_size=cfg.run.batch_size, total_rounds=cfg.run.generations,
+            max_tasks=mt, heartbeat_interval=own.heartbeat_interval,
+            tls=build_tls_client(cfg), stop_event=stop_event or _wait_for_signal())
+        return
     if cfg.mode == "sharded":
         target = scheduler_addr or cfg.connect_addr()
         run_sharded_worker(
@@ -566,14 +587,7 @@ def run_local(cfg: LaunchConfig):
     wired automatically. Returns ``(server, completed)`` for the driving server.
     """
     if cfg.schedule.mode == "decentralized":
-        # Decentralized scheduling has no scheduler node and self-assigning
-        # workers; the single-process all-in-one driver (and the worker-loop
-        # rewire it needs) is the 0f integration step. Launch the owner / worker
-        # roles individually, or use examples/validate_decentralized.py.
-        raise ValueError(
-            "run_local does not yet drive schedule.mode: decentralized in one "
-            "process; launch owner/worker roles separately (see "
-            "examples/validate_decentralized.py and docs/phase4-design.md)")
+        return _run_local_decentralized(cfg)
     return _run_local_sharded(cfg) if cfg.mode == "sharded" else _run_local_coordinator(cfg)
 
 
@@ -710,6 +724,136 @@ def _run_local_rendezvous(cfg: LaunchConfig):
     for w in workers:
         w.join(timeout=5)
     return sresult["r"]
+
+
+_DECENTRALIZED_RUN_TIMEOUT = 120.0  # safety: a stalled owner mustn't hang the harness
+
+
+class _DecentralizedCluster:
+    """Return handle for a local decentralized run: a representative ``metrics``
+    (so the CLI ``_report`` works like the other roles) plus the merged bank
+    snapshotted from the owners before shutdown."""
+
+    def __init__(self, metrics, bank):
+        self.metrics = metrics
+        self._bank = bank
+
+    def merged_bank(self) -> dict:
+        """``{key: cpu state_dict}`` gathered across the owners' primaries."""
+        return self._bank
+
+
+def _gather_merged_bank(owner_by_id, epoch, topology) -> dict:
+    bank = {}
+    for key in topology.module_keys():
+        owners = owners_for(key, epoch)
+        ps = owner_by_id.get(owners[0]["peer_id"]) if owners else None
+        if ps is None or key not in ps.bank:
+            continue
+        with ps._lock:
+            bank[key] = {n: v.detach().cpu().clone()
+                         for n, v in ps.bank[key].state_dict().items()}
+    return bank
+
+
+def _run_local_decentralized(cfg: LaunchConfig):
+    """Whole decentralized swarm in one process (design D7): tracker (seed) +
+    ``sharded.num_shards`` gossip-derived owners (no scheduler) + self-assigning
+    workers, trained to a per-path generation target.
+
+    The owners cold-start from a **bootstrap epoch** built from their own started
+    addresses, so every owner boot-serves its seeded ``(0, 0)`` bank immediately
+    (a fresh decentralized cluster has nobody to sync from). ``derive_epoch`` sets
+    a ``members_sig`` so each owner's gossip loop re-derives the *same* record and
+    membership stays stable until a real change (e.g. a Byzantine eviction)."""
+    n = cfg.sharded.num_shards
+    own = cfg.ownership
+    if cfg.transport.auth_key is None:
+        # Owners challenge by identity; a shared secret lets the (HMAC) workers
+        # answer too -- same bootstrap as the rendezvous path.
+        cfg.transport.auth_key = os.urandom(16).hex()
+    auth = cfg.transport.auth_key
+    model, diloco = dipaco_config(cfg.model), diloco_config(cfg.diloco)
+    corpus = build_corpus(cfg, model, build_documents(cfg))
+    topo = model.build_topology()
+
+    owner_ids = [PeerIdentity.generate() for _ in range(n)]
+    owner_pubs = [i.public_key_hex for i in owner_ids]
+    tracker = Tracker(host="127.0.0.1", port=0, open_enrollment=True,
+                      ttl=cfg.tracker.ttl, auth_key=auth)
+    tracker.start()
+    taddr = ("127.0.0.1", tracker.port)
+
+    weights = {p: corpus.shard_weight(p) for p in range(model.num_paths)}
+    common = dict(host="127.0.0.1", device=cfg.run.device, grant_key=cfg.transport.grant_key,
+                  max_update_norm=cfg.transport.max_update_norm,
+                  compress=cfg.transport.compress, down=cfg.transport.down,
+                  **_ps_robustness_kw(cfg))
+    owners = []
+    for i in range(n):
+        extra = [p for j, p in enumerate(owner_pubs) if j != i]
+        ps = ParameterServer(
+            model, [], diloco, port=0, identity=owner_ids[i],
+            replicate_interval=own.replicate_interval, bank_seed=own.bank_seed,
+            corpus_weights=weights, **_decentralized_owner_kw(cfg),
+            **common, **_server_kw(cfg, extra))
+        ps.start()
+        owners.append(ps)
+    owner_by_id = {ps.peer_id: ps for ps in owners}
+
+    # Bootstrap epoch from the started owners' real addresses; every owner serves
+    # its (0, 0) bank at once. members_sig makes the gossip re-derive idempotent.
+    recs = [make_peer_record(owner_ids[i], reachability="public",
+                             addr=("127.0.0.1", owners[i].port), roles=("owner",))
+            for i in range(n)]
+    epoch0 = derive_epoch(recs, k=own.k, salt=own.salt, prev=None)
+    for ps in owners:
+        ps.apply_epoch(epoch0, bootstrap=True)
+        ps.start_tracker_heartbeat(taddr, "127.0.0.1",
+                                   interval=own.heartbeat_interval, auth_key=auth)
+
+    stop = threading.Event()
+
+    def worker_target():
+        run_decentralized_worker(
+            model, diloco, taddr, corpus, identity=PeerIdentity.generate(),
+            device=cfg.run.device, seed=cfg.run.seed, auth_key=auth,
+            k=own.k, salt=own.salt, read_quorum=cfg.schedule.read_quorum,
+            lease_ttl=cfg.schedule.lease_ttl, batch_size=cfg.run.batch_size,
+            total_rounds=cfg.run.generations,
+            heartbeat_interval=own.heartbeat_interval, stop_event=stop)
+
+    workers = [threading.Thread(target=worker_target, daemon=True)
+               for _ in range(cfg.run.local_workers)]
+    for w in workers:
+        w.start()
+
+    target = cfg.run.generations
+    deadline = time.monotonic() + _DECENTRALIZED_RUN_TIMEOUT
+    completed: dict = {}
+    try:
+        while time.monotonic() < deadline:
+            done = True
+            for path in topo.paths():
+                prim = path_primary(topo.path_module_keys(path), epoch0)
+                ps = owner_by_id.get(prim["peer_id"]) if prim else None
+                with ps._lock:
+                    g = ps._gen.get(path, [0])[0]
+                completed[topo.path_index(path)] = g
+                if g < target:
+                    done = False
+            if done:
+                break
+            time.sleep(0.05)
+    finally:
+        stop.set()
+        for w in workers:
+            w.join(timeout=10)
+        merged = _gather_merged_bank(owner_by_id, epoch0, topo)  # before shutdown
+        for ps in owners:
+            ps.shutdown(graceful=True)
+        tracker.shutdown()
+    return _DecentralizedCluster(owners[0].metrics, merged), completed
 
 
 def run_relay(cfg: LaunchConfig, *, on_start=None, stop_event=None):

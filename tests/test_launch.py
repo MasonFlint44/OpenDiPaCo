@@ -228,6 +228,41 @@ def test_run_local_sharded_trains():
     assert not hasattr(scheduler, "bank")  # the scheduler holds no weights
 
 
+def _decentralized_dict():
+    d = _tiny_dict("sharded")
+    d["sharded"] = {"num_shards": 3}                 # k=3 + read_quorum=2 need >=3 owners
+    d["ownership"] = {"mode": "rendezvous", "k": 3, "replicate_interval": 0.1,
+                      "heartbeat_interval": 1.0}
+    d["schedule"] = {"mode": "decentralized", "read_quorum": 2, "lease_ttl": 30.0}
+    d["tracker"] = {"ttl": 30.0}
+    d["run"] = {"generations": 2, "batch_size": 8, "local_workers": 1, "seed": 0}
+    return d
+
+
+def test_run_local_decentralized_trains():
+    """The whole decentralized swarm in-process (no scheduler): owners cold-start
+    from a bootstrap epoch, a self-assigning worker trains every path to the
+    per-path generation target, and the merged bank moves off its seeded init."""
+    cfg = LaunchConfig.from_dict(_decentralized_dict())
+    cluster, completed = run_local(cfg)
+    num_paths = dipaco_config(cfg.model).num_paths
+    assert len(completed) == num_paths
+    assert all(g >= cfg.run.generations for g in completed.values())  # every path hit target
+    # The merged bank moved off the seeded (0, 0) init.
+    from opendipaco.model import build_module_bank
+    seeded = build_module_bank(dipaco_config(cfg.model), seed=cfg.ownership.bank_seed)
+    merged = cluster.merged_bank()
+    assert merged and any(
+        not torch.allclose(merged[k][n], seeded[k].state_dict()[n].cpu())
+        for k in merged for n in merged[k])
+    assert cluster.metrics is not None
+
+
+def test_decentralized_rejects_lossy_compression_at_config_load():
+    with pytest.raises(ValueError, match="compress: none"):
+        LaunchConfig.from_dict({**_decentralized_dict(), "transport": {"compress": "int8"}})
+
+
 def test_robustness_config_parses_and_defaults_off():
     cfg = LaunchConfig.from_dict(_tiny_dict())
     assert cfg.robustness.mode == "off"          # default: no behavior change
@@ -297,15 +332,6 @@ def test_decentralized_owner_kw_built_only_in_decentralized_mode():
     kw = _decentralized_owner_kw(cfg)
     assert kw["schedule_mode"] == "decentralized" and kw["k"] == 3 and kw["read_quorum"] == 2
     assert kw["reputation"] is not None and kw["rate_limiter"] is not None
-
-
-def test_run_local_rejects_decentralized_with_a_pointer():
-    from opendipaco.launch import run_local
-    cfg = LaunchConfig.from_dict({**_tiny_dict("sharded"),
-                                  "ownership": {"mode": "rendezvous"},
-                                  "schedule": {"mode": "decentralized"}})
-    with pytest.raises(ValueError, match="decentralized"):
-        run_local(cfg)
 
 
 def test_advertise_host_defaults_to_bind_host():
