@@ -12,6 +12,7 @@ Design: docs/decentralized-worker-loop-design.md.
 
 import time
 
+import pytest
 import torch
 
 from opendipaco import BackboneConfig, DiLoCoConfig, DiPaCoConfig
@@ -142,6 +143,43 @@ def test_assignee_claims_its_slot_and_a_non_member_skips():
                                    salt="", lease_ttl=LEASE_TTL) is None
     finally:
         _shutdown(owners)
+
+
+def test_lease_ttl_zero_disables_takeover():
+    """A coordinator reporting lease_ttl=0 means 'never hand the slot to a
+    successor' (responsible_rank -> rank 0 forever). The worker must honor the
+    reported 0, not silently fall back to its own default (the falsy-zero trap)."""
+    epoch, recs, owners = _cluster(lease_ttl=0.0)
+    topo = _cfg().build_topology()
+    try:
+        wids = [PeerIdentity.generate().peer_id for _ in range(4)]
+        first = topo.path_from_index(0)
+        r0 = rank_workers(first, 0, wids)[0]
+        coord_id = path_primary(topo.path_module_keys(first), epoch)["peer_id"]
+        with owners[coord_id]._lock:                     # generation open "forever"
+            owners[coord_id]._gen[first] = [0, time.monotonic() - 1e6]
+        link = _FakeLink(epoch, owners)
+        # Despite the huge age, takeover is disabled -> rank 0 still owns it. The
+        # 999.0 fallback must NOT be used (it would hand the slot to a successor).
+        got = _pick_assigned_path(link, topo, epoch, wids, r0, salt="", lease_ttl=999.0)
+        assert got is not None and got[0] == first
+    finally:
+        _shutdown(owners)
+
+
+def test_decentralized_owner_rejects_lossy_compression():
+    """Quorum reads confirm weights by cross-replica byte-digest agreement, which
+    lossy downlink compression breaks -> reject it at construction (loud) rather
+    than livelock every worker on a digest that can never match."""
+    sched = PeerIdentity.generate()
+    idn = PeerIdentity.generate()
+    rec = make_peer_record(idn, reachability="public", addr=("127.0.0.1", 9000),
+                           roles=("owner",))
+    ep = make_epoch_record(sched, epoch=0, owner_records=[rec], k=1)
+    with pytest.raises(ValueError, match="compress='none'"):
+        ParameterServer(_cfg(), [], _diloco(), host="127.0.0.1", port=0, identity=idn,
+                        epoch_record=ep, schedule_mode="decentralized", k=1,
+                        compress="int8")
 
 
 def test_takeover_on_expiry_hands_a_stalled_slot_to_the_successor():
@@ -276,7 +314,7 @@ def _run_iters(epoch, recs, owners, n_iters, *, max_tasks=None):
         link, engine, worker, wident.peer_id, _corpus(cfg), lambda: directory,
         k=3, salt="", read_quorum=2, lease_ttl=LEASE_TTL, batch_size=8,
         total_rounds=n_iters, max_tasks=max_tasks, poll_interval=0.0, state=state,
-        residuals={}, warm=set(), max_iters=n_iters)
+        warm=set(), max_iters=n_iters)
     return state, clean, topo
 
 

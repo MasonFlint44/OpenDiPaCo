@@ -440,6 +440,21 @@ class ParameterServer(_ReactorServer):
         if schedule_mode not in ("central", "decentralized"):
             raise ValueError(f"schedule_mode must be 'central' or 'decentralized', "
                              f"got {schedule_mode!r}")
+        # Decentralized reads confirm a key by **byte-digest agreement** across its
+        # k replicas (quorum reads, Phase 4c): a worker trusts only weights whose
+        # digest matches the confirmed one. Lossy downlink compression breaks that
+        # -- the digest is computed over the raw fp32 state (``_digests``) but the
+        # fetch would ship a bf16/int8 reconstruction, whose re-quantized digest
+        # differs, so *every* replica is rejected and the worker stalls. Same
+        # invariant as "never bf16 a replication payload"; reject it loudly at
+        # construction rather than livelock silently. (``down="delta"`` is fine:
+        # the quorum fetch sends no ``have``, so the owner ships a full payload.)
+        if schedule_mode == "decentralized" and self.compress != "none":
+            raise ValueError(
+                "schedule_mode='decentralized' requires compress='none': quorum "
+                "reads confirm weights by cross-replica byte-digest agreement, "
+                "which lossy downlink compression breaks. Disable transport.compress "
+                "for a decentralized run.")
         self.schedule_mode = schedule_mode
         self.salt = salt
         self.lease_ttl = float(lease_ttl)
@@ -3020,9 +3035,14 @@ def _pick_assigned_path(link, topology, epoch, workers, peer_id, *, salt, lease_
         if not (rep and rep.get("ok")):
             continue
         g = int(rep["generation"])
+        # Use the coordinator's reported lease_ttl when present -- an explicit None
+        # check, not ``or``, so a legitimate 0.0 ("no successor takeover", which
+        # responsible_rank honors as rank-0-forever) isn't silently replaced by the
+        # worker's default and made to disagree with the coordinator's commit gate.
+        rep_ttl = rep.get("lease_ttl")
         if is_assignee(peer_id, path, g, workers, salt=salt,
                        elapsed=float(rep.get("age") or 0.0),
-                       lease_ttl=float(rep.get("lease_ttl") or lease_ttl)):
+                       lease_ttl=float(rep_ttl if rep_ttl is not None else lease_ttl)):
             return path, g, _decentralized_routing(topology, path, epoch, link)
     return None
 
@@ -3113,7 +3133,7 @@ def _push_all_owners(routing, grant, shared_payload, private_payload, link) -> s
 
 def _serve_decentralized(link, engine, worker, peer_id, corpus, directory_fn, *,
                          k, salt, read_quorum, lease_ttl, batch_size, total_rounds,
-                         max_tasks, poll_interval, state, residuals, warm,
+                         max_tasks, poll_interval, state, warm,
                          stop_event=None, fault_hook=None, max_iters=None):
     """The decentralized worker loop. Returns ``True`` on a clean finish (task
     budget / graceful leave). ``directory_fn()`` returns the current directory
@@ -3152,7 +3172,6 @@ def _serve_decentralized(link, engine, worker, peer_id, corpus, directory_fn, *,
             continue  # replicas mid-sync / unreachable -> re-scan
         if cold:
             engine._opt_state.pop(path, None)  # reset Adam on a cold start
-            residuals.pop(path, None)
         if fault_hook is not None:
             fault_hook(path, 1)
         contrib = worker._train_path(path, corpus.shard(topology.path_index(path)),
@@ -3168,9 +3187,11 @@ def _serve_decentralized(link, engine, worker, peer_id, corpus, directory_fn, *,
         if not (ack and ack.get("accepted")):
             continue  # version-fenced / stale / throttled -> re-scan
         grant = ack["grant"]
-        shared_payload, private_payload, pending = _compress_contribution(
-            contrib, "none", residuals, path, density=1.0)
-        _commit_residuals(residuals, path, pending)
+        # Uncompressed pseudo-gradient: decentralized mode disallows lossy
+        # compression (the quorum byte-agreement invariant; rejected at owner
+        # construction), so the contribution's deltas ship as-is -- no
+        # error-feedback residual to carry.
+        shared_payload, private_payload = contrib.shared_delta, contrib.private_state
         failed = _push_all_owners(routing, grant, shared_payload, private_payload, link)
         if failed:
             # The epoch moved under this task: re-derive and retry the failed keys
@@ -3210,20 +3231,27 @@ def run_decentralized_worker(config, diloco, tracker_addr, corpus, *, identity,
     worker = AsyncScheduler(engine, num_workers=1)
     worker.seed = seed  # run-level constant: (path, generation) -> identical compute
     state = {"done": 0}
-    residuals: dict = {}
     warm: set = set()
 
-    register_peer(tracker_addr, identity, reachability=reachability, roles=("worker",),
-                  auth_key=auth_key, tls=tls)
+    def _register():
+        register_peer(tracker_addr, identity, reachability=reachability,
+                      roles=("worker",), auth_key=auth_key, tls=tls)
+
     stop_beat = threading.Event()
 
     def _beat():
-        while not stop_beat.wait(heartbeat_interval):
+        # Register once up front, then refresh the TTL. Tolerate a tracker that is
+        # briefly unreachable at launch (coordinated bring-up / tracker failover):
+        # until it answers, the worker just isn't in the directory yet, so it
+        # self-assigns nothing -- it must not crash the worker, which would forfeit
+        # the steady-state resilience the loop otherwise has.
+        first = True
+        while first or not stop_beat.wait(heartbeat_interval):
+            first = False
             try:
-                register_peer(tracker_addr, identity, reachability=reachability,
-                              roles=("worker",), auth_key=auth_key, tls=tls)
+                _register()
             except (OSError, ConnectionError):
-                pass  # tracker blip: the directory survives via owner gossip
+                pass
     beat = threading.Thread(target=_beat, daemon=True)
     beat.start()
 
@@ -3240,7 +3268,7 @@ def run_decentralized_worker(config, diloco, tracker_addr, corpus, *, identity,
             link, engine, worker, identity.peer_id, corpus, directory_fn,
             k=k, salt=salt, read_quorum=read_quorum, lease_ttl=lease_ttl,
             batch_size=batch_size, total_rounds=total_rounds, max_tasks=max_tasks,
-            poll_interval=poll_interval, state=state, residuals=residuals, warm=warm,
+            poll_interval=poll_interval, state=state, warm=warm,
             stop_event=stop_event, fault_hook=fault_hook)
     finally:
         stop_beat.set()
