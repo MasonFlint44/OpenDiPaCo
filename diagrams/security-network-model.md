@@ -277,4 +277,3 @@ flowchart TB
 | Bank integrity | non-finite reject (always) + optional norm clip | faulty-hardware poisoning, oversized contributions |
 | Adversarial | robust aggregation + reputation + rate limit + proposal-gating | Byzantine wrong-direction gradients, Sybil influence |
 | Secret hygiene | optimizer state never shipped; PEM key 0600; `grant_key` secret from workers | state leakage, key theft |
-```
