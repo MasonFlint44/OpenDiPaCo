@@ -323,7 +323,11 @@ class EpochManager:
         # while a stale tombstone loses to the fresher registration we just saw.
         for p, ts in dict(tombstoned or {}).items():
             seen = self._seen.get(p)
-            if seen is not None and (ts is None or ts > _issued_at(seen[1])):
+            # Fail safe: a tombstone fast-evicts only with a timestamp that proves
+            # it is newer than the registration we hold. No/invalid timestamp ->
+            # can't prove freshness -> don't fast-evict (fall back to grace).
+            if (seen is not None and isinstance(ts, (int, float)) and not isinstance(ts, bool)
+                    and ts > _issued_at(seen[1])):
                 del self._seen[p]
         expired = [p for p, (t, _) in self._seen.items() if now - t >= self.owner_grace]
         for p in expired:

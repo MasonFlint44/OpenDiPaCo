@@ -105,6 +105,9 @@ def test_stale_tombstone_does_not_evict_reregistered_owner():
     # Stale tombstone (issued *before* b's current record) replayed with the fresh
     # record: no change -> b retained.
     assert mgr.observe([a, b], tombstoned={b_id: b["issued_at"] - 1}, now=1.0) is None
+    # Fail safe: a tombstone with no/invalid timestamp can't prove freshness, so
+    # it must not fast-evict either.
+    assert mgr.observe([a, b], tombstoned={b_id: None}, now=1.5) is None
     # A genuinely newer tombstone *does* evict (sanity that the gate isn't inert).
     due = mgr.observe([a, b], tombstoned={b_id: b["issued_at"] + 1}, now=2.0)
     assert {r["peer_id"] for r in due} == {a_id}
