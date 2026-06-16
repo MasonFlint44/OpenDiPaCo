@@ -74,6 +74,7 @@ from .ownership import (
     derive_epoch,
     epoch_newer,
     make_epoch_record,
+    owner_addr,
     owners_for,
     verify_epoch_record,
 )
@@ -1220,8 +1221,13 @@ class ParameterServer(_ReactorServer):
         with self._lock:
             if not self._coordinates_locked(path):
                 return {"type": "generation", "ok": False, "epoch": self._epoch_num}
-            g, _ = self._gen.setdefault(path, [0, time.monotonic()])
+            g, opened = self._gen.setdefault(path, [0, time.monotonic()])
+            # ``age`` (seconds the current generation has been open) lets a
+            # self-assigning worker compute takeover-on-expiry without sharing a
+            # clock with the owner: it feeds ``responsible_rank(elapsed=age, ...)``,
+            # the same value the coordinator uses at commit (``now - opened``).
             return {"type": "generation", "ok": True, "generation": g,
+                    "age": max(0.0, time.monotonic() - opened),
                     "epoch": self._epoch_num, "lease_ttl": self.lease_ttl,
                     "staleness_bound": self.staleness_bound}
 
@@ -2948,3 +2954,296 @@ def _sch_heartbeat(sch_send, stop_beat, interval, wid, lease, path):
             sch_send({"type": "heartbeat", "lease": lease, "path": path, "worker_id": wid})
         except OSError:
             return
+
+
+# -- decentralized worker loop (Phase 4 worker runtime) -----------------------
+#
+# The central worker leases from a scheduler; the decentralized worker has none.
+# It derives the epoch locally from the gossiped/seed directory (the signer-less
+# ``derive_epoch``, D2/D6), self-assigns a ``(path, generation)`` it is the HRW
+# rank for (D3), quorum-fetches that path's bases from the keys' k replicas (D4),
+# trains, commits to the path's coordinator -- the primary owner of its
+# coordinator key, which version-fences the slot and mints the Ed25519 grant
+# (D5) -- and pushes the pseudo-gradient to all k owners of each key (D6:
+# whichever is the true primary applies; co-owners replicate the result). Every
+# peer comm goes through ``link`` (the transport seam), so a fake in-process link
+# drives this loop in tests exactly as TCP/libp2p does in a run.
+# Design: docs/decentralized-worker-loop-design.md.
+
+
+def _verified_peers(records) -> list:
+    """Self-certifying peer records from a (possibly hostile) directory snapshot.
+    A malicious tracker/owner can serve arbitrary frames, so every record is
+    signature-verified before it can influence epoch derivation or HRW choice."""
+    return [r for r in records if isinstance(r, dict)
+            and verify_record(r) and r.get("kind") == "peer"]
+
+
+def _worker_directory_ids(records) -> list[str]:
+    """Peer-ids of the worker-role records in a verified directory -- the HRW
+    candidate set for self-assignment (the set the owner's worker_set also sees)."""
+    return [r["peer_id"] for r in records
+            if "worker" in (r.get("roles") or []) and isinstance(r.get("peer_id"), str)]
+
+
+def _decentralized_routing(topology, path, epoch, link) -> dict:
+    """``{key: [dial target per replica, primary first]}`` for a path under an
+    epoch -- the read/push fan-out targets in HRW rank order. A NAT owner with no
+    dialable address (no relay yet) is skipped for that key."""
+    routing = {}
+    for key in topology.path_module_keys(path):
+        targets = [link.addr_key(owner_addr(o)) for o in owners_for(key, epoch)
+                   if owner_addr(o) is not None]
+        if targets:
+            routing[key] = targets
+    return routing
+
+
+def _pick_assigned_path(link, topology, epoch, workers, peer_id, *, salt, lease_ttl):
+    """The first ``(path, generation, routing)`` this worker is the current HRW
+    assignee for (rank 0, or a successor once the generation has stayed open past
+    ``lease_ttl`` -- takeover-on-expiry), or ``None`` if assignee of nothing.
+
+    Reads each path's ``(generation, age)`` from its coordinator (the primary
+    owner of the path's coordinator key, ``generation`` RPC); a coordinator that
+    doesn't answer (down, or not this epoch's primary) skips that path this pass.
+    """
+    for path in topology.paths():
+        prim = path_primary(topology.path_module_keys(path), epoch)
+        if prim is None or owner_addr(prim) is None:
+            continue
+        try:
+            rep = link.ps_rpc(link.addr_key(owner_addr(prim)),
+                              {"type": "generation", "path": list(path)})
+        except (OSError, ConnectionError):
+            continue
+        if not (rep and rep.get("ok")):
+            continue
+        g = int(rep["generation"])
+        if is_assignee(peer_id, path, g, workers, salt=salt,
+                       elapsed=float(rep.get("age") or 0.0),
+                       lease_ttl=float(rep.get("lease_ttl") or lease_ttl)):
+            return path, g, _decentralized_routing(topology, path, epoch, link)
+    return None
+
+
+def _fetch_quorum_bases(engine, link, routing, read_quorum, *, cold) -> dict:
+    """Quorum-read each shared key's base across its replicas, load the confirmed
+    bytes into the engine bank, and return ``{key: (epoch, counter)}`` the worker
+    trained against (reported at commit for version-lag staleness, D4).
+
+    Shared keys: gather ``(version, digest)`` from every replica, ``confirm_version``
+    (the highest version a ``read_quorum`` majority agree on), then download the
+    weights from a replica whose digest matches -- a lone Byzantine owner serving
+    poisoned bytes is in the minority, so its bytes are never loaded. Private keys
+    (path-local, no quorum) are fetched from the primary, and only on a **cold**
+    start (a warm worker keeps its own private state, like the central loop).
+    Raises ``OSError`` if a shared key can't be confirmed or no matching replica
+    serves it (the caller skips the task: replicas mid-sync, liveness over a
+    forced read)."""
+    shared = {k: a for k, a in routing.items() if not is_private_key(k)}
+    confirmed = read_quorum_versions(
+        sorted({a for addrs in shared.values() for a in addrs}, key=repr),
+        list(shared), read_quorum, lambda addr, msg: link.ps_rpc(addr, msg))
+    fetched: dict = {}
+    for key, addrs in shared.items():
+        c = confirmed.get(key)
+        if c is None:
+            raise OSError(f"no read quorum for {key}")
+        cv, cd = c
+        for addr in addrs:
+            try:
+                reply = link.ps_rpc(addr, {"type": "fetch", "keys": [key], "cold": cold})
+            except (OSError, ConnectionError):
+                continue
+            sd = (reply or {}).get("weights", {}).get(key)
+            if sd is None or state_digest(sd) != cd:  # absent, or not the confirmed bytes
+                continue
+            _load_into(engine, key, sd)
+            fetched[key] = tuple(cv)
+            break
+        else:
+            raise OSError(f"no replica served the confirmed base for {key}")
+    if cold:  # private base from the primary (cold fetch ships it)
+        for key, addrs in routing.items():
+            if not is_private_key(key):
+                continue
+            try:
+                reply = link.ps_rpc(addrs[0], {"type": "fetch", "keys": [key], "cold": True})
+            except (OSError, ConnectionError):
+                continue
+            sd = (reply or {}).get("weights", {}).get(key)
+            if sd is not None:
+                _load_into(engine, key, sd)
+                v = (reply.get("versions") or {}).get(key)
+                if v is not None:
+                    fetched[key] = tuple(v)
+    return fetched
+
+
+def _push_all_owners(routing, grant, shared_payload, private_payload, link) -> set:
+    """Push the pseudo-gradient to **all k owners** of each key (D6). Whichever
+    owner is the true primary applies it; co-owners refuse it as ``not_primary``
+    (harmless -- they receive the result by replication), so one minted grant --
+    single-use *per server* -- authorizes the push at every replica and a stale
+    view of which owner is primary still lands. Returns the keys that applied at
+    **no** owner (retryable: the epoch moved, so re-derive and retry once)."""
+    by_owner: dict = {}  # dial target -> [keys this owner replicates]
+    for key, addrs in routing.items():
+        for addr in addrs:
+            by_owner.setdefault(addr, []).append(key)
+    pushed = (set(shared_payload) | set(private_payload)) & set(routing)
+    applied: set = set()
+    for addr, keys in by_owner.items():
+        updates = {k: {"grad": shared_payload[k]} for k in keys
+                   if not is_private_key(k) and k in shared_payload}
+        private = {k: private_payload[k] for k in keys
+                   if is_private_key(k) and k in private_payload}
+        if not updates and not private:
+            continue
+        try:
+            reply = link.ps_rpc(addr, {"type": "push", "grant": grant,
+                                       "updates": updates, "private": private})
+        except (OSError, ConnectionError):
+            continue
+        if reply and reply.get("applied"):
+            applied |= (set(updates) | set(private)) - set(reply.get("skipped") or [])
+    return pushed - applied
+
+
+def _serve_decentralized(link, engine, worker, peer_id, corpus, directory_fn, *,
+                         k, salt, read_quorum, lease_ttl, batch_size, total_rounds,
+                         max_tasks, poll_interval, state, residuals, warm,
+                         stop_event=None, fault_hook=None, max_iters=None):
+    """The decentralized worker loop. Returns ``True`` on a clean finish (task
+    budget / graceful leave). ``directory_fn()`` returns the current directory
+    snapshot (tracker seed + owner gossip); the epoch is derived locally from it.
+    ``max_iters`` bounds the loop for tests (one assigned task per iteration)."""
+    topology = engine.topology
+    engine.total_rounds = total_rounds
+    epoch_prev = None
+    backoff = poll_interval
+    iters = 0
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return True
+        if max_tasks is not None and state["done"] >= max_tasks:
+            return True
+        if max_iters is not None and iters >= max_iters:
+            return False
+        iters += 1
+        records = _verified_peers(directory_fn())
+        epoch = derive_epoch(records, k=k, salt=salt, prev=epoch_prev)
+        epoch_prev = epoch
+        workers = _worker_directory_ids(records)
+        picked = (None if not epoch["owners"] or peer_id not in workers
+                  else _pick_assigned_path(link, topology, epoch, workers, peer_id,
+                                           salt=salt, lease_ttl=lease_ttl))
+        if picked is None:
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 1.0)
+            continue
+        backoff = poll_interval
+        path, g, routing = picked
+        cold = path not in warm
+        try:
+            fetched = _fetch_quorum_bases(engine, link, routing, read_quorum, cold=cold)
+        except (OSError, ConnectionError):
+            continue  # replicas mid-sync / unreachable -> re-scan
+        if cold:
+            engine._opt_state.pop(path, None)  # reset Adam on a cold start
+            residuals.pop(path, None)
+        if fault_hook is not None:
+            fault_hook(path, 1)
+        contrib = worker._train_path(path, corpus.shard(topology.path_index(path)),
+                                     batch_size, g)
+        prim = path_primary(topology.path_module_keys(path), epoch)
+        commit = {"type": "commit", "path": list(path), "generation": g,
+                  "worker_id": peer_id, "loss": contrib.loss, "empty": contrib.empty,
+                  "base_versions": {kk: list(v) for kk, v in fetched.items()}}
+        try:
+            ack = link.ps_rpc(link.addr_key(owner_addr(prim)), commit)
+        except (OSError, ConnectionError):
+            continue
+        if not (ack and ack.get("accepted")):
+            continue  # version-fenced / stale / throttled -> re-scan
+        grant = ack["grant"]
+        shared_payload, private_payload, pending = _compress_contribution(
+            contrib, "none", residuals, path, density=1.0)
+        _commit_residuals(residuals, path, pending)
+        failed = _push_all_owners(routing, grant, shared_payload, private_payload, link)
+        if failed:
+            # The epoch moved under this task: re-derive and retry the failed keys
+            # once against the current owners (the grant is single-use per server,
+            # so a fresh primary accepts it). A second miss drops the update -- the
+            # documented bounded-loss window, same as the central retry.
+            epoch2 = derive_epoch(_verified_peers(directory_fn()), k=k, salt=salt,
+                                  prev=epoch_prev)
+            epoch_prev = epoch2
+            retry = {kk: rr for kk, rr in
+                     _decentralized_routing(topology, path, epoch2, link).items()
+                     if kk in failed}
+            if retry:
+                _push_all_owners(retry, grant, shared_payload, private_payload, link)
+        engine._opt_state[path] = contrib.opt_state  # warm-back (reused if we re-pick it)
+        _load_private(engine, contrib.private_state)
+        warm.add(path)
+        state["done"] += 1
+
+
+def run_decentralized_worker(config, diloco, tracker_addr, corpus, *, identity,
+                             device="cpu", seed=0, auth_key=None, k=3, salt="",
+                             read_quorum=2, lease_ttl=30.0, batch_size=8,
+                             total_rounds=0, max_tasks=None, reachability="nat",
+                             heartbeat_interval=3.0, poll_interval=0.05,
+                             max_msg_bytes=DEFAULT_MAX_MSG_BYTES, connect_timeout=10.0,
+                             tls=None, stop_event=None, fault_hook=None):
+    """Self-assigning worker for a decentralized swarm (``schedule.mode:
+    decentralized``): no scheduler, no central grant signer. It registers with
+    the rendezvous tracker (role ``worker``), then loops :func:`_serve_decentralized`
+    -- derive the epoch locally, self-assign a path, quorum-fetch, train, commit
+    to the path's coordinator, push to all k owners. Needs an ``identity`` (it is
+    HRW-scored by ``peer_id`` and derives epochs)."""
+    from .tracker import fetch_directory, register_peer
+
+    engine = _build_worker_engine(config, diloco, device, seed)
+    worker = AsyncScheduler(engine, num_workers=1)
+    worker.seed = seed  # run-level constant: (path, generation) -> identical compute
+    state = {"done": 0}
+    residuals: dict = {}
+    warm: set = set()
+
+    register_peer(tracker_addr, identity, reachability=reachability, roles=("worker",),
+                  auth_key=auth_key, tls=tls)
+    stop_beat = threading.Event()
+
+    def _beat():
+        while not stop_beat.wait(heartbeat_interval):
+            try:
+                register_peer(tracker_addr, identity, reachability=reachability,
+                              roles=("worker",), auth_key=auth_key, tls=tls)
+            except (OSError, ConnectionError):
+                pass  # tracker blip: the directory survives via owner gossip
+    beat = threading.Thread(target=_beat, daemon=True)
+    beat.start()
+
+    def directory_fn():
+        try:
+            return fetch_directory(tracker_addr, auth_key=auth_key, tls=tls)
+        except (OSError, ConnectionError):
+            return []  # tracker blip: a previous epoch persists until it answers
+
+    link = _WorkerLink(None, auth_key=auth_key, max_msg_bytes=max_msg_bytes,
+                       connect_timeout=connect_timeout, tls=tls)
+    try:
+        _serve_decentralized(
+            link, engine, worker, identity.peer_id, corpus, directory_fn,
+            k=k, salt=salt, read_quorum=read_quorum, lease_ttl=lease_ttl,
+            batch_size=batch_size, total_rounds=total_rounds, max_tasks=max_tasks,
+            poll_interval=poll_interval, state=state, residuals=residuals, warm=warm,
+            stop_event=stop_event, fault_hook=fault_hook)
+    finally:
+        stop_beat.set()
+        beat.join(timeout=1)
+        link.close()
+    return state["done"]

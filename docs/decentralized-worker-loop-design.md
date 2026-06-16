@@ -117,13 +117,20 @@ Reuses the exact primitives the owner replication loop already uses.
   rate-limits, computes `push_weight`, and **mints** the grant. The worker gets
   the grant or a drop (treated like a rejected central commit — re-scan).
 - **Push to all `k`.** With the grant, the worker pushes the pseudo-gradient to
-  **every** owner of each key (not just the primary), so each owner buffers to
-  quorum `c` and applies the *same deterministic* robust step → the same bytes →
-  agreeing digests (phase4 D4 write-side). The grant is single-use **per server**
-  (each owner consumes its own token, verifying it against the minting owner's
-  pubkey from the epoch — `grant_signed_by`), so one minted grant authorizes the
-  push at all `k`. A failed push to a co-owner mid-remap re-routes like the
-  central stale-routing retry; the bounded-loss window is unchanged.
+  **every** owner of each key (not just the worker's rank-0 view). The owner write
+  path is unchanged: whichever owner is the **true primary** applies it (buffering
+  to quorum `c` under `robustness.mode: on`, else one outer step), and the
+  co-owners refuse it as `not_primary` — harmless, since they converge to the same
+  bytes by the existing decentralized **replication pull** + the digest audit
+  (phase4 D4), not by re-applying the write. Pushing to all `k` (rather than only
+  the worker's believed primary) is what makes a stale primary view self-heal: if
+  the worker's epoch lags, the *actual* current primary among the `k` still
+  applies. The grant is single-use **per server** (each owner consumes its own
+  token, verifying it against the minting owner's pubkey from the epoch —
+  `grant_signed_by`), so one minted grant authorizes the push at all `k`. A key
+  that lands at **no** owner (the epoch moved entirely under the task) re-routes
+  once after a local epoch re-derive, like the central stale-routing retry; the
+  bounded-loss window is unchanged.
 
 ### D7. `run_local` for decentralized
 
@@ -169,7 +176,7 @@ in-process synchronous engine remains the anchor the new arm is measured against
 
 | Slice | Contents | Key tests |
 |---|---|---|
-| **a** | `run_decentralized_worker` / `_serve_decentralized`: directory-pull + `derive_epoch`, self-assign (D3), quorum-fetch (D4), commit-to-coordinator (D5), push-to-all-`k` (D6). Reuses link/`_train_path`/compression. | An assignee claims its `(p, g)` and a non-assignee skips; quorum-fetch confirms the majority base; the coordinator mints a grant on commit and version-fences a stale `g`; a push lands at **all** `k` owners and their digests agree; takeover-on-expiry reassigns a stalled slot. |
+| **a** | `run_decentralized_worker` / `_serve_decentralized`: directory-pull + `derive_epoch`, self-assign (D3), quorum-fetch (D4), commit-to-coordinator (D5), push-to-all-`k` (D6). Reuses link/`_train_path`/compression. Driven in tests through a fake in-process link (`addr → owner._handle`), the same transport seam. | An assignee claims its `(p, g)` and a non-member skips; takeover-on-expiry hands a stalled slot to the successor; quorum-fetch loads the majority base (a Byzantine replica is outvoted) and raises when no quorum is reachable; a push lands at the **true primary** of each key while co-owners refuse as `not_primary` (the grant is single-use per server, so a replay lands nowhere); a full iteration commits and advances the generation, and generations advance monotonically across iterations. |
 | **b** | `run_local` decentralized driver (D7): tracker + owners (gossip/derive) + worker threads, bootstrap first epoch, per-path generation target; drop the `run_local` refusal; launch `worker` role routes to the decentralized loop. | `run_local(schedule: decentralized)` trains to the per-path target and returns the merged bank; the bank moved; a Byzantine owner injected mid-run is divergence-flagged and evicted at the next epoch (liveness). |
 | **c** | `validate_dynamics.py` decentralized arm (D8) + docs: close the §0f on-box half in `phase4-design.md`, `viability-roadmap.md`, `internet-scale-plan.md`, `CLAUDE.md`. | The decentralized arm learns and lands within the same tolerance as the async arms vs the anchor; status docs honest (on-box dynamics ✅, WAN systems still owed). |
 
