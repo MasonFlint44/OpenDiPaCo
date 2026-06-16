@@ -44,7 +44,6 @@ from dataclasses import dataclass, field
 
 import torch
 
-from ..data.sharding import ShardedCorpus
 from ..model import build_path_model
 from ..optim.diloco import apply_outer_grads, make_inner_optimizer, module_delta
 from ..topology import Path, is_private_key
@@ -261,7 +260,8 @@ class AsyncScheduler:
         self.errors: dict[Path, str] = {}  # last exception per failing path (debugging)
 
     # -- map: train one path on a worker ------------------------------------
-    def _train_path(self, path: Path, shard: torch.Tensor, batch_size: int, generation: int):
+    def _train_path(self, path: Path, shard: torch.Tensor, batch_size: int, generation: int,
+                    inner_steps: int | None = None):
         """Train ``path`` on ``shard`` and return its :class:`Contribution`.
 
         Takes the shard tensor directly (rather than a corpus) so the same
@@ -295,7 +295,9 @@ class AsyncScheduler:
         seed = (self.seed * 0x9E3779B1) ^ (path_idx * 0x85EBCA77) ^ (generation * 0xC2B2AE35)
         gen = torch.Generator().manual_seed(seed & 0x7FFFFFFFFFFFFFFF)
 
-        inner_steps = e.diloco.inner_steps
+        # Per-task inner_steps (W5b sizing) overrides the configured default; the
+        # LR-schedule position still tracks generations via base_step below.
+        inner_steps = inner_steps or e.diloco.inner_steps
         total_steps = e.total_rounds * inner_steps if e.total_rounds else None
         loss = run_inner_steps(
             pm, opt, shard, batch_size, gen,

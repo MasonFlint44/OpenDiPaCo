@@ -1673,8 +1673,13 @@ class Scheduler(_ReactorServer):
                  identity=None, compress="none", idle_backoff=None,
                  reputation=None, rate_limiter=None, min_owner_reputation=0.25,
                  redundancy=3, redundancy_rate=0.0, audit_timeout=60.0,
-                 private_policy="overwrite", down="full", up_density=1.0, **reactor_kw):
+                 private_policy="overwrite", down="full", up_density=1.0,
+                 task_seconds=None, **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
+        # W5b: target wall-time per task. None (default) -> no sizing, every task
+        # is the configured (batch_size, inner_steps) -> byte-identical anchor.
+        # When set, slow workers get smaller tasks so their lease lands in ~this.
+        self.task_seconds = task_seconds
         self.ps_tls = ps_tls  # client context for the scheduler's checkpoint RPCs to PSs
         self.grant_key = grant_key  # shared with the PSs (not workers) to sign grants
         # Reputation (Phase 3b): scores authenticated peers from commit outcomes,
@@ -1921,10 +1926,12 @@ class Scheduler(_ReactorServer):
             check_only, base, audit, check_private, check_grant = (
                 False, None, False, False, None)
             rep = self.reputation.get(peer_id)
-            # Per-worker batch, clamped to its advertised memory cap (W5b will
-            # also size it down from the measured rate; here it is the ceiling).
-            batch = (max(1, min(self.batch_size, int(caps["max_batch"])))
-                     if caps.get("max_batch") else self.batch_size)
+            # Per-worker batch ceiling, clamped to its advertised memory cap; W5b
+            # sizes a task down from this toward task_seconds. ``inner`` defaults
+            # to the configured count (the ceiling).
+            batch_cap = (max(1, min(self.batch_size, int(caps["max_batch"])))
+                         if caps.get("max_batch") else self.batch_size)
+            inner = self.diloco.inner_steps
             if not eligible:
                 # No primary work: absorb the surplus as a redundant check for an
                 # open audit (§1.9), if one needs this distinct worker.
@@ -1933,9 +1940,15 @@ class Scheduler(_ReactorServer):
                     return self._idle()
                 if not self.rate_limiter.allow(peer_id, reputation=rep):
                     return self._idle()
-                (path, generation, base, lease, check_private,
-                 check_grant) = self._reserve_check_locked(cand, member)
+                (path, generation, base, lease, check_private, check_grant,
+                 pin_batch, pin_inner) = self._reserve_check_locked(cand, member)
                 check_only = True
+                # Reproduce the audited primary's exact computation (design D8):
+                # a check must use the *primary's* batch/inner, not the checker's
+                # own ceiling -- else the digest diverges (and a heterogeneous
+                # max_batch would falsely flag every audit).
+                batch = pin_batch or batch_cap
+                inner = pin_inner or inner
             else:
                 # Rate limit only the *expensive* path (issuing a task with a
                 # weight/shard payload): a throttled peer gets a cheap backoff
@@ -1944,15 +1957,17 @@ class Scheduler(_ReactorServer):
                     return self._idle()
                 path = min(eligible, key=lambda p: (self._completed[p], p not in warm, p))
                 lease = uuid.uuid4().hex  # unique per lease; fences commit/heartbeat
+                # W5b: size (batch, inner) for this worker toward task_seconds
+                # (shrink-only; the full configured task when off / fast / no rate).
+                batch, inner = self._size_task_locked(wid, batch_cap)
                 self._owner[path] = wid
                 self._inflight[path] = time.monotonic() + self.heartbeat_timeout
                 self._issued[path] = self._T
                 self._lease[path] = lease
-                # W5a: remember when this lease opened and how much work it carries,
-                # so its commit yields an effective-rate sample for this worker.
+                # W5a: remember when this lease opened and how much work it carries
+                # (the *sized* work), so its commit yields an effective-rate sample.
                 self._lease_at[path] = time.monotonic()
-                self._lease_work[path] = batch * self.diloco.inner_steps * \
-                    self.config.sequence_length
+                self._lease_work[path] = batch * inner * self.config.sequence_length
                 generation = self._completed[path]
                 # Sample this task for an audit: the primary will report a pinned
                 # base + digest, and checkers re-run it from that base. A
@@ -1969,6 +1984,9 @@ class Scheduler(_ReactorServer):
                         "target": self.redundancy - 1, "base": None,
                         "primary_digest": None, "primary_peer": None,
                         "checks": [], "members": {member},
+                        # Pin the primary's task size so checkers reproduce its
+                        # exact computation (design D8).
+                        "batch": batch, "inner": inner,
                         # A creation deadline so an audit whose primary never
                         # commits (worker died) still expires and is reaped --
                         # the primary's commit extends it for the checkers.
@@ -2000,6 +2018,11 @@ class Scheduler(_ReactorServer):
             "total_rounds": self.total_rounds,
             "seed": self.seed,
         }
+        # Per-task inner_steps travels only when sizing is active or for a check
+        # (which pins the primary's count); absent otherwise -> the worker uses
+        # its configured default -> byte-identical to the pre-W5 task (D6).
+        if self.task_seconds or check_only:
+            task["inner_steps"] = inner
         if check_only:
             task["check_only"], task["base"] = True, base
             if check_private:  # also submit private proposals to the owners
@@ -2037,7 +2060,8 @@ class Scheduler(_ReactorServer):
                             if is_private_key(k)]
             grant = make_grant(path, private_keys, 0.0, lease, self.grant_key,
                                identity=self.identity)
-        return path, generation, a["base"], lease, bool(a.get("private")), grant
+        return (path, generation, a["base"], lease, bool(a.get("private")), grant,
+                a.get("batch"), a.get("inner"))
 
     def _commit_check(self, msg: dict, peer_id: str | None = None) -> dict:
         """Record a checker's digest against its audit; resolve if complete.
@@ -2195,6 +2219,26 @@ class Scheduler(_ReactorServer):
         task from this so the lease lands in ~``task_seconds``."""
         with self._lock:
             return self._worker_rate.get(wid)
+
+    def _size_task_locked(self, wid, batch_ceiling):
+        """Size ``(batch_size, inner_steps)`` for ``wid`` so its lease lands in
+        ~``task_seconds``, from its measured rate (W5b, design D2/D3). **Shrink
+        only**: the configured ``(batch_ceiling, inner_steps)`` is the ceiling, so
+        a fast worker (or one with no estimate yet, or sizing off) gets the full
+        configured task -- the anchor task. A slow worker gets a smaller **batch**
+        first (the gentle, bandwidth-neutral lever that keeps the inner-step
+        count fixed); ``inner_steps`` shrinks only once batch is floored at 1 and
+        the task still overshoots the target."""
+        inner = self.diloco.inner_steps
+        rate = self._worker_rate.get(wid)
+        if not self.task_seconds or not rate:
+            return batch_ceiling, inner
+        seq = self.config.sequence_length
+        target = rate * self.task_seconds                      # target tokens
+        batch = max(1, min(batch_ceiling, round(target / (inner * seq))))
+        if batch == 1 and inner * seq > target:                # batch floored, still over
+            inner = max(1, min(inner, round(target / seq)))
+        return batch, inner
 
     def _heartbeat(self, msg: dict) -> None:
         path = msg["path"]
@@ -2622,7 +2666,8 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions, keyfr
                 fetch_keys(pin)
                 engine._opt_state.pop(path, None)  # cold
                 contrib = worker._train_path(path, load_shard_locked(),
-                                             task["batch_size"], task["gen_id"])
+                                             task["batch_size"], task["gen_id"],
+                                             task.get("inner_steps"))
                 if not contrib.empty:
                     digest = pseudograd_digest(contrib.shared_delta)
             except _CheckAborted:
@@ -2668,7 +2713,8 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions, keyfr
                 engine._opt_state.pop(path, None)  # reset Adam on a cold start
                 residuals.pop(path, None)          # and any stale error-feedback carry
             shard = load_shard_locked()
-            contrib = worker._train_path(path, shard, task["batch_size"], task["gen_id"])
+            contrib = worker._train_path(path, shard, task["batch_size"], task["gen_id"],
+                                         task.get("inner_steps"))
             if audit and not contrib.empty:
                 # Pin the exact base for checkers, and digest this contribution.
                 base = {k: list(versions[k]) for k in routing if k in versions}
