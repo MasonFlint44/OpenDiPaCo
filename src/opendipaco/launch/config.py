@@ -131,7 +131,10 @@ class TransportCfg:
     # that signs commit grants, so workers can't forge push weights.
     grant_key: str | None = None
     max_msg_bytes: int | None = None
-    heartbeat_timeout: float = 30.0
+    # Home-grade (W4d, design D2): a dropped worker's lease re-leases sooner.
+    # Workers heartbeat every heartbeat_interval (3s), so 20s = ~6 missed beats
+    # before reclaim -- a slow-but-alive worker isn't reclaimed mid-task.
+    heartbeat_timeout: float = 20.0
     heartbeat_interval: float = 3.0
     staleness_bound: int | None = None
     staleness_weight: str = "inverse"
@@ -174,7 +177,10 @@ class TrackerCfg:
     host: str = "0.0.0.0"
     connect_host: str | None = None    # address peers dial (defaults from host)
     port: int = 29600
-    ttl: float = 120.0                 # registrations expire unless re-registered
+    # Home-grade default (W4d, design D2): a rebooting consumer node should be
+    # detectable in tens of seconds, not minutes. The library Tracker default
+    # stays 120 (cluster) for the in-process anchor + unit tests.
+    ttl: float = 30.0                  # registrations expire unless re-registered
     open_enrollment: bool = False      # True: any validly-signed record may register
     enroll_peers: list[str] = field(default_factory=list)  # pubkeys allowed to register
 
@@ -192,15 +198,21 @@ class OwnershipCfg:
     the owners/parameter servers.
     """
 
+    # Home-grade detection timings (W4d, design D2): tuned for consumer churn
+    # (machines sleep/reboot/drop), not cluster stability. Invariants kept:
+    # owner_grace >= 2*tracker.ttl (a flapping owner mustn't thrash ownership)
+    # and heartbeat_interval < tracker.ttl (one missed beat isn't an eviction).
+    # The library EpochManager/ParameterServer defaults stay conservative
+    # (240/60/30) for the in-process anchor + unit tests.
     mode: str = "static"               # "static" | "rendezvous"
     k: int = 3                         # replicas per module key (rank 0 = primary)
     salt: str = ""                     # run-level placement salt (changing it remaps all)
     bank_seed: int = 0                 # shared init seed: (0,0) = same bytes everywhere
-    replicate_interval: float = 10.0   # backup pull cadence = the failover loss window
-    owner_grace: float = 240.0         # owner unseen this long -> dropped next epoch
-    min_epoch_interval: float = 60.0   # at most one epoch bump per this many seconds
-    epoch_poll_interval: float = 5.0   # scheduler's tracker-directory poll cadence
-    heartbeat_interval: float = 30.0   # owner -> tracker re-registration (keep < ttl)
+    replicate_interval: float = 10.0   # backup pull cadence = the abrupt-failover loss window
+    owner_grace: float = 60.0          # owner unseen this long -> dropped next epoch (>= 2*ttl)
+    min_epoch_interval: float = 20.0   # at most one epoch bump per this many seconds
+    epoch_poll_interval: float = 3.0   # scheduler's tracker-directory poll cadence
+    heartbeat_interval: float = 10.0   # owner -> tracker re-registration (keep < ttl)
     advertise_host: str | None = None  # address other peers dial for this owner
 
 
@@ -286,7 +298,7 @@ class ScheduleCfg:
     """
 
     mode: str = "central"              # "central" | "decentralized"
-    lease_ttl: float = 30.0            # rank-0's window before takeover-on-expiry
+    lease_ttl: float = 20.0            # rank-0's window before takeover-on-expiry (home-grade, W4d)
     gossip_interval: float = 10.0      # owner-to-owner directory pull cadence
     read_quorum: int = 2               # replicas a fetch cross-checks (Byzantine reads)
 

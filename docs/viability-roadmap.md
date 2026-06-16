@@ -153,14 +153,23 @@ needed for 12 GB): the PCIe-bound CPU offloads (optimizer offload superseded by
 8-bit Adam; embedding gather covered by tying). `inner_autocast` composes with
 all of it.
 
-### W4 · Churn robustness at consumer reality · B1 · [eng / tuning]
+### W4 · Churn robustness at consumer reality · B1 · [eng / tuning] ✅
 
-Failover, replication, and recovery are built (Phase 2) — but for *cluster*
-churn. Home machines sleep, reboot, and drop their links constantly, at rates a
-cluster never sees. Needs the replication factor `k`, `owner_grace`,
-`replicate_interval`, and lease/takeover timings tuned for (and stress-tested
-against) high churn, and likely graceful suspend/resume so a closing laptop
-hands off cleanly instead of timing out.
+Failover, replication, and recovery were built in Phase 2 — but for *cluster*
+churn. W4 makes them survive *home* churn (sleep/reboot/drop). **Landed**
+(`docs/w4-churn-design.md`): a measure-first churn stress harness
+(`examples/validate_churn.py`: a real in-process cluster driven through abrupt /
+graceful / suspend / flap / join arms, reporting survival + failover latency);
+**graceful departure** — a signed deregister tombstones the leaver so failover
+skips `owner_grace` (~10× faster than abrupt at the harness's timings), the
+departing primary **drains** its latest state (weights + outer momentum) to the
+rank-1 successor so the loss window collapses to ~0, and a leaving worker nacks
+its in-flight lease for immediate re-lease; and **home-grade launch timings**
+(`tracker.ttl` 120→30 s, `owner_grace` 240→60 s, lease reclaim 30→20 s, …, kept
+`owner_grace ≥ 2·ttl`), with the library/anchor defaults left conservative and
+`SIGTERM`/`SIGINT` routed through `shutdown(graceful=True)` under a hard deadline.
+The convergence-under-churn verdict at WAN scale rides the §0f run (the harness
+is the on-box half).
 
 ### W5 · Throughput-measured task sizing & pacing · B1 · [eng]
 
@@ -215,7 +224,7 @@ needs a reason to contribute. These are research-shaped, not just unbuilt.
                   W1 NAT / relay ✅                                W2 bandwidth ✅   (parallel; both B0)
                         └───────────────────────┬───────────────────────┘
                                                 ▼
-                       W3 VRAM fit   ·   W4 churn   ·   W5 task sizing       (B1: "large + consumer")
+                     W3 VRAM fit ✅  ·  W4 churn ✅  ·  W5 task sizing        (B1: "large + consumer")
                                                 ▼
                        W6 client   ·   W7 data plane   ·   W8 trust/incentives   (B2: ecosystem)
 ```

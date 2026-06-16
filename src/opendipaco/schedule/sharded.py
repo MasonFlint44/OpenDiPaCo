@@ -374,6 +374,15 @@ class ParameterServer(_ReactorServer):
         self._repl_stop = threading.Event()
         self._repl_thread = None
         self._beat_thread = None
+        # Set => the tracker heartbeat skips re-registration (the server stays up
+        # but stops refreshing its TTL): a deterministic *suspend* injection for
+        # the churn harness (examples/validate_churn.py). Clear by default, so
+        # the normal path is unchanged; resume_heartbeat() clears it.
+        self._hb_paused = threading.Event()
+        # Set on a graceful shutdown (W4c): the owner stops accepting writes so a
+        # push can't race the drain and land on the departing primary (it would
+        # be lost on failover). A refused push retries to the new primary post-bump.
+        self._draining = False
         # With a scheduler address the replication loop also polls for newer
         # epoch records, so ownership changes reach owners without restarts.
         self._scheduler_addr = tuple(scheduler_addr) if scheduler_addr else None
@@ -450,6 +459,8 @@ class ParameterServer(_ReactorServer):
         self._directory: dict = {}   # peer_id -> verified peer record (TTL-pruned)
         self._self_record = None     # this owner's own peer record, gossiped onward
         self._seed_addr = None       # bootstrap tracker (gossip survives its loss)
+        self._tracker_auth = None    # tracker creds, for a graceful deregister (W4b)
+        self._tracker_tls = None
         # path tuple -> [generation, opened_at] (the per-path clock + fence).
         self._gen: dict = {}
 
@@ -461,6 +472,8 @@ class ParameterServer(_ReactorServer):
         kind = msg.get("type")
         if kind == "fetch":
             return self._fetch(msg, peer_id)
+        if kind == "drain":
+            return self._drain_recv(msg, peer_id)
         if kind == "push":
             return self._push(msg, peer_id)
         if kind == "commit":  # decentralized: this owner coordinates the path
@@ -502,6 +515,8 @@ class ParameterServer(_ReactorServer):
         """Is this server the (active) primary for ``key``? Static mode: always."""
         if self._epoch is None:
             return True
+        if self._draining:
+            return False  # leaving gracefully: refuse writes so none race the drain
         if key not in self._active:
             return False  # a syncing primary's base state is stale; refuse writes
         owners = owners_for(key, self._epoch)
@@ -749,6 +764,81 @@ class ParameterServer(_ReactorServer):
             out["missing"] = missing
         return out
 
+    def _drain_recv(self, msg: dict, peer_id: str | None = None) -> dict:
+        """Receive a departing primary's pushed state for keys it owns (W4c
+        graceful-leave drain — the push-direction inverse of the include_state
+        pull). Applied **version-gated** (only strictly-newer bytes, idempotent /
+        last-writer-wins) and only from a session authenticated as a current
+        owner of the key (same gate as the pull). Exact bytes + outer momentum,
+        never compressed. Returns the keys adopted.
+
+        Refused in decentralized mode: a pushed version isn't quorum-confirmable,
+        so a Byzantine primary could poison a backup that then reaches false
+        read-quorum (the same hazard `_replicate_once` guards). There, the normal
+        pull + quorum path applies; the drain is a central/rendezvous optimization.
+        """
+        if self.schedule_mode == "decentralized":
+            return {"type": "drained", "adopted": []}
+        adopted = []
+        with self._lock:
+            for k, payload in (msg.get("states") or {}).items():
+                if k not in self.bank or not isinstance(payload, dict):
+                    continue
+                if not self._state_allowed_locked(k, peer_id):  # sender must own k
+                    continue
+                v = _safe_version(payload.get("version"))
+                sd = payload.get("weights")
+                if v is None or sd is None or v <= self._versions[k]:
+                    continue  # not newer (or malformed) -> ignore
+                self.bank[k].load_state_dict({n: t.to(self.device) for n, t in sd.items()})
+                osd = payload.get("state")
+                if osd is not None and k in self._outer_opts:
+                    self._outer_opts[k].load_state_dict(_opt_from_wire(osd))
+                self._versions[k] = v
+                adopted.append(k)
+        return {"type": "drained", "adopted": adopted}
+
+    def _drain_to_backups(self) -> dict:
+        """Graceful-leave drain (W4c): for each key this owner is the **active
+        primary** of, push its exact current state (weights + outer momentum +
+        version) to **rank-1**, the successor that promotion will make primary.
+        Rank-1 then holds the *last* accepted push, collapsing the failover loss
+        window from <= replicate_interval to ~0 for a clean leave.
+
+        Best-effort: any send failure falls back to the normal pull window, so a
+        drain is never worse than an abrupt leave. No-op in static/decentralized
+        mode (no successor concept / pushed state isn't quorum-safe)."""
+        if self.schedule_mode == "decentralized":
+            return {}
+        with self._lock:
+            epoch = self._epoch
+            if epoch is None or self.peer_id is None:
+                return {}
+            by_peer: dict = {}  # successor peer_id -> (dial target, {key: payload})
+            for k in sorted(self.owned_keys):
+                if k not in self._active or k not in self.bank:
+                    continue
+                owners = owners_for(k, epoch)
+                if len(owners) < 2 or owners[0]["peer_id"] != self.peer_id:
+                    continue  # only the primary drains, and only if a successor exists
+                rank1 = owners[1]
+                payload = {"version": self._versions[k],
+                           "weights": _state_to_cpu(self.bank[k].state_dict())}
+                if k in self._outer_opts:
+                    payload["state"] = _opt_to_wire(
+                        _optimizer_state_to_cpu(self._outer_opts[k].state_dict()))
+                by_peer.setdefault(rank1["peer_id"],
+                                   (self._owner_targets(rank1), {}))[1][k] = payload
+        results: dict = {}
+        for target, states in by_peer.values():       # sent outside the lock
+            try:
+                reply = self._peer_rpc(target, {"type": "drain", "states": states})
+                for k in (reply or {}).get("adopted", []):
+                    results[k] = "drained"
+            except (OSError, ConnectionError):
+                pass  # best-effort -> fall back to the replicate_interval pull window
+        return results
+
     def apply_epoch(self, record, *, bootstrap: bool | None = None) -> None:
         """Adopt a newer owner-set epoch.
 
@@ -989,24 +1079,38 @@ class ParameterServer(_ReactorServer):
         # is what this owner gossips onward so its membership propagates even
         # after the tracker is gone.
         self._seed_addr = addr
+        # Remembered so a graceful shutdown can deregister (W4b): the scheduler's
+        # epoch watcher then fails this owner over immediately, skipping grace.
+        self._tracker_auth, self._tracker_tls = auth_key, tls
 
         def beat():
             while not (self._stop or self._dead):
-                try:
-                    self._self_record = make_peer_record(
-                        self.identity, reachability="public",
-                        addr=(advertise_host, self.port), roles=roles,
-                        capabilities=capabilities)
-                    register_peer(addr, self.identity, reachability="public",
-                                  peer_addr=(advertise_host, self.port), roles=roles,
-                                  capabilities=capabilities, auth_key=auth_key, tls=tls)
-                except (OSError, ConnectionError):
-                    pass  # tracker briefly away; the next beat retries
+                if not self._hb_paused.is_set():  # suspended: let the TTL lapse
+                    try:
+                        self._self_record = make_peer_record(
+                            self.identity, reachability="public",
+                            addr=(advertise_host, self.port), roles=roles,
+                            capabilities=capabilities)
+                        register_peer(addr, self.identity, reachability="public",
+                                      peer_addr=(advertise_host, self.port), roles=roles,
+                                      capabilities=capabilities, auth_key=auth_key, tls=tls)
+                    except (OSError, ConnectionError):
+                        pass  # tracker briefly away; the next beat retries
                 if self._repl_stop.wait(interval):
                     return
 
         self._beat_thread = threading.Thread(target=beat, daemon=True)
         self._beat_thread.start()
+
+    def pause_heartbeat(self) -> None:
+        """Stop refreshing the tracker TTL while the server keeps running -- a
+        deterministic *suspend* (sleep) injection for the churn harness. The
+        record lapses after the tracker's TTL exactly as a slept laptop would."""
+        self._hb_paused.set()
+
+    def resume_heartbeat(self) -> None:
+        """Resume tracker re-registration after :meth:`pause_heartbeat` (wake)."""
+        self._hb_paused.clear()
 
     def _owner_targets(self, owner):
         """Dial target(s) for an owner epoch entry: a candidate list of its relay
@@ -1038,8 +1142,47 @@ class ParameterServer(_ReactorServer):
                 pass
             raise
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, graceful: bool = False) -> None:
+        """Stop the owner. ``graceful=True`` first sends a signed deregister to
+        the tracker (W4b) so the scheduler's epoch watcher fails this owner over
+        **immediately**, skipping ``owner_grace`` -- a clean leave instead of a
+        timeout. Best-effort: if the tracker is unreachable, the TTL+grace path
+        still applies, so a graceful shutdown is never worse than an abrupt one.
+        The default (``graceful=False``) is byte-identical to before."""
         self._repl_stop.set()
+        if graceful and self.peer_id is not None:
+            # Stop the heartbeat *before* deregistering, else a re-registration
+            # racing the deregister could land after it (with a newer issued_at)
+            # and resurrect the record, undoing the tombstone. We set _repl_stop
+            # above (which ends the beat loop) and join the beat thread; any
+            # register already in flight carries an older issued_at, so the
+            # tracker refuses it as stale behind our (newer) tombstone.
+            self._hb_paused.set()
+            if self._beat_thread is not None:
+                self._beat_thread.join(timeout=2.0)
+            # Stop accepting writes, then flush any buffered (already-accepted)
+            # robust-aggregation work into the bank, *then* drain. Order matters:
+            # a push that raced the drain would land on the departing primary and
+            # be lost, and buffered contributions flushed *after* the drain would
+            # never reach rank-1 -- both re-open the loss window. With writes
+            # fenced and buffers flushed first, the state we drain is final; a
+            # refused push retries to the new primary once the epoch bumps (W4c).
+            with self._lock:
+                self._draining = True
+                self._flush_all_buffers_locked()  # accepted work -> bank, before draining
+            # Drain *before* deregistering: while we're still the valid primary
+            # (epoch not yet bumped), push our latest state to each key's rank-1
+            # successor, so a promoted backup holds the last accepted push (W4c).
+            self._drain_to_backups()
+            if self.identity is not None and self._seed_addr is not None:
+                try:
+                    from .tracker import deregister_peer  # lazy: tracker imports this
+                    # Short timeout: a closing node (laptop lid) must not block on
+                    # a slow/absent tracker -- past the budget, fall back to grace.
+                    deregister_peer(self._seed_addr, self.identity, timeout=3.0,
+                                    auth_key=self._tracker_auth, tls=self._tracker_tls)
+                except (OSError, ConnectionError):
+                    pass  # tracker away -> fall back to TTL+grace expiry
         with self._lock:
             self._flush_all_buffers_locked()  # don't drop accepted-but-buffered work
         for s in self._peer_conns.values():
@@ -1617,6 +1760,8 @@ class Scheduler(_ReactorServer):
             return self._commit(msg, peer_id)
         if kind == "routing":
             return self._fresh_routing(msg)
+        if kind == "nack":
+            return self._nack(msg)
         if kind == "heartbeat":
             self._heartbeat(msg)
             return None
@@ -1671,7 +1816,11 @@ class Scheduler(_ReactorServer):
         """
         if self.identity is None:
             raise RuntimeError("watch_tracker needs the scheduler's identity=")
-        from .tracker import fetch_directory, get_epoch, put_epoch  # lazy: tracker imports this
+        from .tracker import (  # lazy: tracker imports this
+            fetch_directory_and_tombstones,
+            get_epoch,
+            put_epoch,
+        )
 
         manager = EpochManager(
             owner_grace=owner_grace, min_epoch_interval=min_epoch_interval,
@@ -1696,9 +1845,10 @@ class Scheduler(_ReactorServer):
         def watch():
             while True:
                 try:
-                    records = fetch_directory(addr, roles=["owner"], reachability="public",
-                                              auth_key=tracker_auth, tls=tracker_tls)
-                    due = manager.observe(records)
+                    records, tombstoned = fetch_directory_and_tombstones(
+                        addr, roles=["owner"], reachability="public",
+                        auth_key=tracker_auth, tls=tracker_tls)
+                    due = manager.observe(records, tombstoned=tombstoned)
                     if due is not None:
                         record = self.publish_epoch(due, k=k, salt=salt)
                         if cache_on_tracker:
@@ -1983,6 +2133,20 @@ class Scheduler(_ReactorServer):
             elif rep is False:
                 self.reputation.debit(peer_id)
 
+    def _nack(self, msg: dict) -> dict:
+        """A worker voluntarily returning its lease (graceful leave, W4b): free
+        the in-flight lease **now** so the path is re-leasable immediately
+        instead of after the heartbeat timeout. Fenced by the lease token (a
+        stale/zombie nack can't free a path that's since been re-leased), and
+        reputation-neutral -- returning work cleanly is not a fault."""
+        path = msg.get("path")
+        with self._lock:
+            if path in self._inflight and msg.get("lease") == self._lease.get(path):
+                self._inflight.pop(path, None)
+                self._lease.pop(path, None)
+                return {"type": "nack_ack", "freed": True}
+        return {"type": "nack_ack", "freed": False}
+
     def _heartbeat(self, msg: dict) -> None:
         path = msg["path"]
         with self._lock:
@@ -2155,7 +2319,8 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
                        connect_timeout=10.0, reconnect=False, reconnect_timeout=30.0,
                        fault_hook=None, tls=None, tls_hostname=None,
                        data_dir=None, data_source=None, data_tokenizer=None,
-                       max_batch_size=None, transport="tcp", identity=None):
+                       max_batch_size=None, transport="tcp", identity=None,
+                       stop_event=None):
     """Train path-tasks for a sharded scheduler + parameter servers.
 
     Per task: lease from the scheduler, fetch the path's modules from the owning
@@ -2201,8 +2366,8 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
                     if _serve_sharded(link, engine, worker, wid, warm, shard_cache,
                                       versions, keyframes, residuals, data_ctx, caps, state,
                                       heartbeat_interval, poll_interval, max_tasks,
-                                      fault_hook):
-                        return  # clean finish (stop / budget)
+                                      fault_hook, stop_event):
+                        return  # clean finish (stop / budget / graceful leave)
                 except (OSError, ConnectionError):
                     pass  # transient libp2p fault (e.g. a raced dial) -> retry
                 if state["done"] > last_done:    # progress -> the fault was transient
@@ -2233,7 +2398,8 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
         try:
             clean = _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions,
                                    keyframes, residuals, data_ctx, caps, state,
-                                   heartbeat_interval, poll_interval, max_tasks, fault_hook)
+                                   heartbeat_interval, poll_interval, max_tasks, fault_hook,
+                                   stop_event)
         except (OSError, ConnectionError):
             clean = False  # disconnected -> reconnect (if enabled)
         finally:
@@ -2244,18 +2410,28 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
                 pass
         if clean or not reconnect:
             return
+        if stop_event is not None and stop_event.is_set():
+            return  # graceful leave during a disconnect: don't reconnect
         time.sleep(backoff)
         backoff = min(backoff * 2, 1.0)
 
 
 def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions, keyframes,
                    residuals, data_ctx, caps, state, heartbeat_interval, poll_interval,
-                   max_tasks, fault_hook) -> bool:
+                   max_tasks, fault_hook, stop_event=None) -> bool:
     """One scheduler connection: serve tasks. Returns True on a clean finish (stop /
     budget), raises ``OSError`` on a disconnect (so the caller can reconnect). All
     peer comms go through ``link`` (the transport seam), so TCP and libp2p share
-    this loop verbatim."""
+    this loop verbatim.
+
+    ``stop_event`` (W4b graceful leave): when set, the worker stops between tasks
+    and -- if it had *just* leased one -- nacks it, so the path is re-leasable
+    immediately instead of after the lease timeout. A worker already mid-train
+    (the expensive part, which can't be interrupted) finishes and commits that
+    task, then leaves at the next loop top -- no work lost, no nack needed."""
     while True:
+        if stop_event is not None and stop_event.is_set():
+            return True  # graceful leave between tasks
         task = link.sch_rpc({"type": "request", "worker_id": wid,
                              "warm_paths": list(warm), "cached_shards": list(shard_cache),
                              "capabilities": caps})
@@ -2269,6 +2445,12 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions, keyfr
 
         path = task["path"]
         lease = task.get("lease")
+        # Graceful leave raced the lease: return it now (fenced by the token) so
+        # the scheduler re-leases the path immediately, not after a timeout.
+        if stop_event is not None and stop_event.is_set():
+            if lease is not None and not task.get("check_only"):
+                link.sch_rpc({"type": "nack", "path": path, "lease": lease, "worker_id": wid})
+            return True
         worker.seed = task["seed"]
         engine.total_rounds = task["total_rounds"]
         # Routing values are replica addr lists in rank order (primary first).
