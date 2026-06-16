@@ -322,6 +322,16 @@ class RunCfg:
     # Worker-advertised batch cap: the server clamps this worker's task batch
     # size to it (small-VRAM volunteers train smaller batches instead of OOMing).
     worker_max_batch: int | None = None
+    # W5 task sizing (sharded mode; docs/w5-task-sizing-design.md). None (default)
+    # = off, byte-identical: every task is the configured size. When set, the
+    # scheduler sizes each task from the worker's measured rate so its lease lands
+    # in ~task_seconds (batch first, then inner_steps; shrink-only). Changes
+    # training dynamics -> validate with examples/validate_dynamics.py. A worker
+    # too slow even for the minimum task (> task_seconds * park_factor, or below
+    # min_task_rate tokens/s) is parked so it can't straggle a module.
+    task_seconds: float | None = None
+    park_factor: float = 3.0
+    min_task_rate: float | None = None
 
 
 @dataclass

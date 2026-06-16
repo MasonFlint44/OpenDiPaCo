@@ -1674,12 +1674,21 @@ class Scheduler(_ReactorServer):
                  reputation=None, rate_limiter=None, min_owner_reputation=0.25,
                  redundancy=3, redundancy_rate=0.0, audit_timeout=60.0,
                  private_policy="overwrite", down="full", up_density=1.0,
-                 task_seconds=None, **reactor_kw):
+                 task_seconds=None, park_factor=3.0, min_task_rate=None, **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         # W5b: target wall-time per task. None (default) -> no sizing, every task
         # is the configured (batch_size, inner_steps) -> byte-identical anchor.
         # When set, slow workers get smaller tasks so their lease lands in ~this.
         self.task_seconds = task_seconds
+        # W5c: a worker whose minimum task (batch=1, inner=1) is estimated to take
+        # longer than task_seconds * park_factor (or whose rate is below an
+        # absolute min_task_rate) is *parked* -- given idle instead of a lease so
+        # it can't hold a path hostage. Parking is re-evaluated each request and
+        # lets one through per cooldown to re-measure, so a worker that speeds up
+        # rejoins. Only active when task_seconds is set.
+        self.park_factor = park_factor
+        self.min_task_rate = min_task_rate
+        self._parked: dict = {}   # worker_id -> monotonic time it was last let through
         self.ps_tls = ps_tls  # client context for the scheduler's checkpoint RPCs to PSs
         self.grant_key = grant_key  # shared with the PSs (not workers) to sign grants
         # Reputation (Phase 3b): scores authenticated peers from commit outcomes,
@@ -1932,6 +1941,16 @@ class Scheduler(_ReactorServer):
             batch_cap = (max(1, min(self.batch_size, int(caps["max_batch"])))
                          if caps.get("max_batch") else self.batch_size)
             inner = self.diloco.inner_steps
+            # W5c: park a worker too slow even for the minimum task so it holds no
+            # path (or check). Re-measure one request per cooldown so it can rejoin.
+            if self._too_slow_locked(wid):
+                now = time.monotonic()
+                last = self._parked.get(wid)
+                if last is not None and now - last < self.task_seconds * self.park_factor:
+                    return self._idle()
+                self._parked[wid] = now   # let this one through to re-measure
+            else:
+                self._parked.pop(wid, None)
             if not eligible:
                 # No primary work: absorb the surplus as a redundant check for an
                 # open audit (§1.9), if one needs this distinct worker.
@@ -2239,6 +2258,21 @@ class Scheduler(_ReactorServer):
         if batch == 1 and inner * seq > target:                # batch floored, still over
             inner = max(1, min(inner, round(target / seq)))
         return batch, inner
+
+    def _too_slow_locked(self, wid) -> bool:
+        """Is ``wid`` too slow to lease without straggling -- its measured rate
+        implies even the minimum task (batch=1, inner=1 -> seq tokens) overshoots
+        ``task_seconds * park_factor`` (or it is below an absolute
+        ``min_task_rate``)? Only when sizing is on and an estimate exists (a fresh
+        worker bootstraps with a full task and isn't parked)."""
+        if not self.task_seconds:
+            return False
+        rate = self._worker_rate.get(wid)
+        if not rate:
+            return False
+        if self.min_task_rate is not None and rate < self.min_task_rate:
+            return True
+        return self.config.sequence_length / rate > self.task_seconds * self.park_factor
 
     def _heartbeat(self, msg: dict) -> None:
         path = msg["path"]

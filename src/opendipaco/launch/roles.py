@@ -398,6 +398,8 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None, identity=N
         ps_tls=build_tls_client(cfg), grant_key=cfg.transport.grant_key,
         identity=ident, compress=cfg.transport.compress, down=cfg.transport.down,
         up_density=cfg.transport.up_density, idle_backoff=cfg.transport.idle_backoff,
+        task_seconds=cfg.run.task_seconds, park_factor=cfg.run.park_factor,
+        min_task_rate=cfg.run.min_task_rate,
         **_scheduler_robustness_kw(cfg), **_server_kw(cfg, extra_admitted))
     scheduler.start()
     lp = _serve_libp2p(scheduler, cfg, ident) if _libp2p_routes(cfg) else None

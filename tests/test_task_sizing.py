@@ -209,6 +209,98 @@ def test_audit_pins_size_even_with_sizing_off_heterogeneous_caps():
         sched.shutdown()
 
 
+# -- launch wiring -------------------------------------------------------------
+
+
+def test_launch_config_maps_sizing_knobs():
+    """run.task_seconds / park_factor / min_task_rate flow into the launch config
+    (off by default), so a missing mapping can't silently make them inert."""
+    from opendipaco.launch.config import LaunchConfig
+
+    tiny = {"mode": "sharded",
+            "model": {"vocab_size": 64, "hidden_size": 32, "num_attention_heads": 4,
+                      "intermediate_size": 64, "max_position_embeddings": 64,
+                      "layers_per_level": [1, 1], "level_sizes": [2, 2], "sequence_length": 16},
+            "data": {"source": "synthetic", "num_documents": 16}}
+    base = LaunchConfig.from_dict(tiny)
+    assert base.run.task_seconds is None and base.run.park_factor == 3.0
+    assert base.run.min_task_rate is None
+    sized = LaunchConfig.from_dict({**tiny, "run": {"task_seconds": 5.0, "park_factor": 2.0,
+                                                    "min_task_rate": 100.0}})
+    assert sized.run.task_seconds == 5.0 and sized.run.park_factor == 2.0
+    assert sized.run.min_task_rate == 100.0
+
+
+# -- slow-worker parking (D7) --------------------------------------------------
+
+
+def test_too_slow_predicate():
+    cfg = _cfg()   # seq 16; park_factor 3 -> too slow if 16/rate > 3, i.e. rate < ~5.33
+    sched = _serving(cfg, task_seconds=1.0, park_factor=3.0)
+    try:
+        with sched._lock:
+            sched._record_rate_locked("slow", 4, 1.0)     # 16/4 = 4 > 3 -> too slow
+            sched._record_rate_locked("ok", 100, 1.0)     # 16/100 << 3 -> fine
+        assert sched._too_slow_locked("slow")
+        assert not sched._too_slow_locked("ok")
+        assert not sched._too_slow_locked("unknown")        # no estimate -> not parked
+    finally:
+        sched.shutdown()
+
+
+def test_min_task_rate_absolute_floor():
+    cfg = _cfg()
+    sched = _serving(cfg, task_seconds=1.0, min_task_rate=50.0)
+    try:
+        with sched._lock:
+            sched._record_rate_locked("x", 40, 1.0)         # 40 < 50 -> too slow (floor)
+        assert sched._too_slow_locked("x")
+    finally:
+        sched.shutdown()
+
+
+def test_parking_off_when_sizing_off():
+    """No task_seconds -> no parking, even for a very slow worker (the lever is
+    part of the sizing feature)."""
+    cfg = _cfg()
+    sched = _serving(cfg)   # sizing off
+    try:
+        with sched._lock:
+            sched._record_rate_locked("slow", 1, 1.0)
+        assert not sched._too_slow_locked("slow")
+        assert _lease(sched, "slow")["type"] == "task"
+    finally:
+        sched.shutdown()
+
+
+def test_too_slow_worker_is_parked_then_re_measured():
+    """A too-slow worker is parked (idle) within the cooldown, but one request
+    per cooldown is let through so it can re-measure and rejoin if it speeds up."""
+    cfg = _cfg()
+    sched = _serving(cfg, task_seconds=1.0, park_factor=3.0)
+    try:
+        _set_rate(sched, "slow", 4)                          # too slow
+        assert _lease(sched, "slow")["type"] == "task"       # 1st: let through to re-measure
+        t2 = sched._next_task({"worker_id": "slow", "warm_paths": [], "cached_shards": []})
+        assert t2["type"] == "idle"                          # parked within the cooldown
+    finally:
+        sched.shutdown()
+
+
+def test_parked_worker_resumes_when_it_speeds_up():
+    cfg = _cfg()
+    sched = _serving(cfg, task_seconds=1.0, park_factor=3.0)
+    try:
+        _set_rate(sched, "w", 4)                             # too slow
+        _lease(sched, "w")                                   # let through, now parked
+        assert sched._next_task({"worker_id": "w", "warm_paths": [],
+                                 "cached_shards": []})["type"] == "idle"
+        _set_rate(sched, "w", 100000)                        # EMA jumps -> fast
+        assert _lease(sched, "w")["type"] == "task"          # un-parked, leased again
+    finally:
+        sched.shutdown()
+
+
 def test_check_task_uses_pinned_size_not_checker_ceiling():
     """End to end: with all paths leased so only checks remain, a fast checker
     with a big cap still gets the audited primary's small batch/inner."""

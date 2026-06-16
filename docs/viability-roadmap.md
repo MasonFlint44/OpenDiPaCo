@@ -171,13 +171,24 @@ its in-flight lease for immediate re-lease; and **home-grade launch timings**
 The convergence-under-churn verdict at WAN scale rides the §0f run (the harness
 is the on-box half).
 
-### W5 · Throughput-measured task sizing & pacing · B1 · [eng]
+### W5 · Throughput-measured task sizing & pacing · B1 · [eng] ✅
 
-Heterogeneity basics exist (bf16 autocast, `max_batch_size` caps), but tasks are
-not sized from *measured* tokens/sec, so one slow volunteer can straggle a whole
-module. The capability profile workers already advertise (§1.10) is the place to
-put a measured throughput estimate; per-worker pacing (and possibly per-worker
-`inner_steps`, which changes the inner-LR schedule and so needs care) follows.
+Heterogeneity basics existed (bf16 autocast, `max_batch_size` caps), but tasks
+were not sized from *measured* speed, so one slow-but-alive volunteer held a
+path's lease far longer than a fast one and straggled every module that path
+feeds. **Landed** (`docs/w5-task-sizing-design.md`): the scheduler measures each
+worker's **effective rate** (lease→commit ÷ task work, EMA — captures slow links
+as well as slow compute, no new trust) and sizes each task toward a target
+`task_seconds` — **batch first** (gentle, bandwidth-neutral) down to a floor of
+1, then fewer `inner_steps`; **shrink-only**, so a fast worker gets the exact
+configured task and the off path is byte-identical. A worker too slow even for
+the minimum task is **parked** (gets `idle`, holds no path; one request per
+cooldown re-measures so a recovered worker rejoins). Audited tasks **pin their
+size** so a checker reproduces the primary exactly (also fixing a latent
+heterogeneous-`max_batch` false-divergence bug). Off by default
+(`run.task_seconds`); the convergence-at-scale + wall-time straggler verdict
+rides the §0f run, with an on-box `validate_dynamics.py` `het-batch` arm (per-path
+batch heterogeneity converges ~0.9× the anchor).
 
 ---
 
@@ -224,7 +235,7 @@ needs a reason to contribute. These are research-shaped, not just unbuilt.
                   W1 NAT / relay ✅                                W2 bandwidth ✅   (parallel; both B0)
                         └───────────────────────┬───────────────────────┘
                                                 ▼
-                     W3 VRAM fit ✅  ·  W4 churn ✅  ·  W5 task sizing        (B1: "large + consumer")
+                  W3 VRAM fit ✅  ·  W4 churn ✅  ·  W5 task sizing ✅       (B1: "large + consumer")
                                                 ▼
                        W6 client   ·   W7 data plane   ·   W8 trust/incentives   (B2: ecosystem)
 ```

@@ -29,6 +29,11 @@ genuinely race and go stale), with two further deltas layered on:
   quantized inner optimizer still train?
 * ``dedup-private`` (W3d, ``dedup_private``) — aliasing the worker's private modules
   changes warm-round private warming; does it still converge?
+* ``het-batch`` (W5, ``het_batch``) — half the workers train a smaller batch, so
+  paths see mixed batch sizes round to round (the per-path batch heterogeneity
+  throughput-measured task sizing introduces); does it still converge? (One box
+  has no real *speed* heterogeneity, so the batch mix is injected directly; the
+  straggler/wall-time benefit of sizing rides the WAN run.)
 
 All configs train the **same** corpus/sharding/seed and are evaluated by the same
 router-free metric (best-path perplexity on a held-out split), so the numbers are
@@ -132,10 +137,17 @@ def train_sync(config, diloco, corpus) -> dict:
 
 
 def train_async(config, diloco, corpus, *, compress="none", robustness="off",
-                down="full", up_density=1.0, optim_8bit=False, dedup_private=False) -> dict:
+                down="full", up_density=1.0, optim_8bit=False, dedup_private=False,
+                het_batch=False) -> dict:
     """The real in-process async sharded path (localhost TCP, worker oversupply
     so commits race + go stale). Returns the merged authoritative bank from the
-    parameter servers -- no node held it whole."""
+    parameter servers -- no node held it whole.
+
+    ``het_batch`` (W5) gives half the workers a smaller advertised batch cap, so
+    paths train with **mixed batch sizes round to round** -- the per-path batch
+    heterogeneity that throughput-measured sizing introduces. (One box can't
+    create real *speed* heterogeneity, so we inject the batch heterogeneity it
+    produces directly; the wall-time/straggler benefit rides the WAN run.)"""
     import dataclasses
     # W3d worker-side levers live on the worker's diloco (8-bit inner optimizer;
     # private-copy de-dup in _train_path).
@@ -157,10 +169,13 @@ def train_async(config, diloco, corpus, *, compress="none", robustness="off",
                       down=down, up_density=up_density)
     sched.start()
     n_workers = WORKERS or config.num_paths
+    # W5: half the cohort advertises a smaller batch cap -> per-path batch varies.
+    def _mb(i):
+        return max(1, BATCH // 2) if (het_batch and i % 2 == 1) else None
     workers = [threading.Thread(
         target=run_sharded_worker, args=(config, diloco, ("127.0.0.1", sched.port)),
-        kwargs=dict(seed=SEED, heartbeat_interval=2.0), daemon=True)
-        for _ in range(n_workers)]
+        kwargs=dict(seed=SEED, heartbeat_interval=2.0, max_batch_size=_mb(i)), daemon=True)
+        for i in range(n_workers)]
     for w in workers:
         w.start()
     try:
@@ -218,6 +233,7 @@ def main() -> None:
         ("async + W2 stacked", dict(compress="int4", down="delta", up_density=0.25)),
         ("async + 8-bit Adam", dict(optim_8bit=True)),                   # W3d
         ("async + dedup-private", dict(dedup_private=True)),             # W3d
+        ("async + het-batch (W5)", dict(het_batch=True)),                # W5: per-path batch mix
     ]
     worst, all_learned = 1.0, True
     for name, kw in variants:

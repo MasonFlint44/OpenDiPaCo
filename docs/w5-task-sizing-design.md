@@ -1,11 +1,24 @@
 # W5 design — throughput-measured task sizing & pacing
 
-Status: **design.** Heterogeneity *basics* exist (bf16 inner loop, a self-declared
-`max_batch` memory cap clamped per task), but tasks are not sized from **measured**
-speed, so a slow-but-alive volunteer holds a path's lease far longer than a fast
-one and straggles every module that path feeds. W5 is the last B1 item
-(`docs/viability-roadmap.md` §W5; plan §1.10 "still open"): measure each worker's
-effective rate and size each task so its lease completes in a bounded wall-time.
+Status: **complete — W5a/b/c landed.** Heterogeneity *basics* existed (bf16 inner
+loop, a self-declared `max_batch` memory cap clamped per task), but tasks were not
+sized from **measured** speed, so a slow-but-alive volunteer held a path's lease
+far longer than a fast one and straggled every module that path feeds. W5 is the
+last B1 item (`docs/viability-roadmap.md` §W5; plan §1.10 "still open"): measure
+each worker's effective rate and size each task so its lease completes in a
+bounded wall-time.
+
+**W5a** scheduler-observed effective-rate EMA (lease→commit ÷ task work),
+dynamics-neutral. **W5b** batch-first shrink sizing to `task_seconds`
+(`_size_task_locked`; per-task `inner_steps` only at the batch floor) + audit
+size-pinning (a check reuses the primary's `batch`/`inner` — also fixing a latent
+heterogeneous-`max_batch` false-divergence bug). **W5c** slow-worker **parking**
+(too slow even for the minimum task → `idle`, one request per cooldown re-measures
+so a recovered worker rejoins) + launch wiring (`run.task_seconds`/`park_factor`/
+`min_task_rate`, off by default) + the `validate_dynamics.py` `het-batch` arm
+(per-path batch heterogeneity converges within tolerance on-box, ~0.9× anchor).
+Off by default (byte-identical anchor); convergence-at-scale + the wall-time
+straggler benefit ride the §0f run.
 
 Like W2/W3's lossy levers, task sizing **changes training dynamics** (it varies
 the minibatch, and at the floor the inner-step count), so it is **off by
@@ -170,9 +183,9 @@ Measure-first (the W3/W4 discipline): the estimate lands before the sizing it dr
 
 | Slice | Contents | Key tests |
 |---|---|---|
-| **W5a** | Scheduler-observed effective-rate EMA per worker (lease→commit ÷ task work), exposed in metrics. No behavior change (sizing not wired yet). | Rate EMA tracks a known work/latency; survives reconnect (keyed by id); a missing/instant sample doesn't divide-by-zero or poison the EMA; default task unchanged. |
-| **W5b** | Batch-first task sizing to `task_seconds` (D2/D3/D4) + per-task `inner_steps` field (D6) + audit size-pinning (D8); `run.task_seconds` off by default. | Slow worker → smaller batch, lease ≈ `task_seconds`; batch floors at 1 then inner_steps shrinks; fast worker → exact configured task; sizing off ⇒ byte-identical; audited task + its check use identical size (digests match). |
-| **W5c** | Slow-worker parking (D7) + launch wiring (`run.task_seconds`, floors) + `validate_dynamics.py` heterogeneous-speed arm + docs/roadmap status. | A too-slow worker is parked (gets idle, holds no path) and resumes when it speeds up; launch config maps the knob; the dynamics arm shows sized vs fixed converge comparably while latency is bounded. |
+| **W5a** ✅ | Scheduler-observed effective-rate EMA per worker (lease→commit ÷ task work), exposed in metrics. No behavior change (sizing not wired yet). | Rate EMA tracks a known work/latency; survives reconnect (keyed by id); a missing/instant sample doesn't divide-by-zero or poison the EMA; default task unchanged. |
+| **W5b** ✅ | Batch-first task sizing to `task_seconds` (D2/D3/D4) + per-task `inner_steps` field (D6) + audit size-pinning (D8); `run.task_seconds` off by default. | Slow worker → smaller batch, lease ≈ `task_seconds`; batch floors at 1 then inner_steps shrinks; fast worker → exact configured task; sizing off ⇒ byte-identical; audited task + its check use identical size (digests match). |
+| **W5c** ✅ | Slow-worker parking (D7) + launch wiring (`run.task_seconds`, floors) + `validate_dynamics.py` heterogeneous-speed arm + docs/roadmap status. | A too-slow worker is parked (gets idle, holds no path) and resumes when it speeds up; launch config maps the knob; the dynamics arm shows sized vs fixed converge comparably while latency is bounded. |
 
 Rough sizing: W5a S–M, W5b M (the heart), W5c S–M.
 
