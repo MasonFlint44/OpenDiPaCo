@@ -2237,6 +2237,7 @@ class Scheduler(_ReactorServer):
         with self._lock:
             self._completed = {p: self._completed.get(p, 0) for p in self.paths}
             self._inflight, self._issued = {}, {}
+            self._lease_at, self._lease_work = {}, {}  # no stale rate timing across fits (W5a)
             self._target = self._T + num_generations * len(self.paths)
             self._serving = True
         t0 = time.monotonic()
