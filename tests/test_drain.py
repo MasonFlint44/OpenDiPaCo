@@ -173,6 +173,25 @@ def test_drain_failure_degrades_to_pull_window_no_wedge():
             ps.shutdown()
 
 
+def test_draining_primary_refuses_writes():
+    """Once draining (graceful leave committed), the primary refuses pushes so
+    none race the drain and get silently lost; the worker re-routes to the new
+    primary after the bump (the existing not_primary retry path)."""
+    cfg = _cfg()
+    pss, epoch = _two_owners_k2(cfg)
+    try:
+        path, key, primary, _backup = _shared_key(cfg, epoch, pss)
+        with primary._lock:
+            primary._draining = True
+        grad = [torch.ones_like(p) for p in primary.bank[key].parameters()]
+        r = primary._push({"grant": make_grant(path, [key], 1.0, "t0"),
+                           "updates": {key: {"grad": grad}}})
+        assert r["applied"] is False and r["reason"] == "not_primary"
+    finally:
+        for ps in pss:
+            ps.shutdown()
+
+
 def test_graceful_shutdown_drains_before_leaving():
     """shutdown(graceful=True) runs the drain end to end: a stale rank-1 holds the
     departing primary's last push afterward."""

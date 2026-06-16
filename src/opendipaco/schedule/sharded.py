@@ -379,6 +379,10 @@ class ParameterServer(_ReactorServer):
         # the churn harness (examples/validate_churn.py). Clear by default, so
         # the normal path is unchanged; resume_heartbeat() clears it.
         self._hb_paused = threading.Event()
+        # Set on a graceful shutdown (W4c): the owner stops accepting writes so a
+        # push can't race the drain and land on the departing primary (it would
+        # be lost on failover). A refused push retries to the new primary post-bump.
+        self._draining = False
         # With a scheduler address the replication loop also polls for newer
         # epoch records, so ownership changes reach owners without restarts.
         self._scheduler_addr = tuple(scheduler_addr) if scheduler_addr else None
@@ -511,6 +515,8 @@ class ParameterServer(_ReactorServer):
         """Is this server the (active) primary for ``key``? Static mode: always."""
         if self._epoch is None:
             return True
+        if self._draining:
+            return False  # leaving gracefully: refuse writes so none race the drain
         if key not in self._active:
             return False  # a syncing primary's base state is stale; refuse writes
         owners = owners_for(key, self._epoch)
@@ -1154,6 +1160,12 @@ class ParameterServer(_ReactorServer):
             self._hb_paused.set()
             if self._beat_thread is not None:
                 self._beat_thread.join(timeout=2.0)
+            # Stop accepting writes, *then* drain: a push that raced the drain
+            # would otherwise land on the departing primary and be lost. With
+            # writes fenced, the state we drain is final, and a refused push
+            # retries to the new primary once the epoch bumps (W4c).
+            with self._lock:
+                self._draining = True
             # Drain *before* deregistering: while we're still the valid primary
             # (epoch not yet bumped), push our latest state to each key's rank-1
             # successor, so a promoted backup holds the last accepted push (W4c).
