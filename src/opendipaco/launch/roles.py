@@ -517,7 +517,9 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
     auth = _worker_auth(cfg)
     # SIGTERM/SIGINT -> graceful leave (W4d): the sharded worker nacks its in-flight
     # lease so the path re-leases at once instead of waiting out the lease timeout.
-    ev = stop_event or _wait_for_signal()
+    # Only installed on the sharded paths that *consume* the event -- the
+    # coordinator path (run_worker) has no stop hook, so installing a handler
+    # there would swallow SIGTERM and make the worker unkillable but by SIGKILL.
     if cfg.transport.kind == "libp2p":
         # libp2p worker: dials the scheduler's multiaddr over Noise streams
         # (NAT-traversing via relays/DCUtR). Sharded/owner topology only -- the
@@ -533,7 +535,7 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             heartbeat_interval=cfg.transport.heartbeat_interval,
             data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch,
             transport="libp2p", identity=_node_identity(cfg, generate=True),
-            stop_event=ev)
+            stop_event=stop_event or _wait_for_signal())
         return
     if cfg.mode == "sharded":
         target = scheduler_addr or cfg.connect_addr()
@@ -542,7 +544,8 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             auth_key=auth, max_tasks=mt, reconnect=True,
             heartbeat_interval=cfg.transport.heartbeat_interval,
             tls=build_tls_client(cfg), tls_hostname=cfg.tls.server_hostname,
-            data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch, stop_event=ev)
+            data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch,
+            stop_event=stop_event or _wait_for_signal())
     else:
         host, port = addr or cfg.connect_addr()
         run_worker(

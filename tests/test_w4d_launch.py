@@ -5,9 +5,22 @@ library defaults stay conservative so the in-process anchor + unit tests are
 unaffected.
 """
 
-from opendipaco.launch.config import OwnershipCfg, ScheduleCfg, TrackerCfg, TransportCfg
+import threading
+
+from opendipaco.launch import roles
+from opendipaco.launch.config import LaunchConfig, OwnershipCfg, ScheduleCfg, TrackerCfg, TransportCfg
 from opendipaco.launch.roles import _bounded_graceful_shutdown
 from opendipaco.schedule import EpochManager, Tracker
+
+# Mirror of test_launch._tiny_dict, kept local so this file stands alone.
+_TINY = {"model": {"vocab_size": 64, "hidden_size": 32, "num_attention_heads": 4,
+                   "intermediate_size": 64, "max_position_embeddings": 64,
+                   "layers_per_level": [1, 1], "level_sizes": [2, 2], "sequence_length": 16},
+         "diloco": {"inner_steps": 4, "inner_lr": 0.001},
+         "data": {"source": "synthetic", "num_documents": 64},
+         "transport": {"host": "127.0.0.1", "port": 0},
+         "run": {"generations": 2, "batch_size": 8, "local_workers": 2},
+         "sharded": {"num_shards": 2}}
 
 
 def test_home_grade_launch_defaults_are_consistent_and_moved():
@@ -45,3 +58,21 @@ def test_bounded_graceful_shutdown_runs_graceful_and_cancels_deadline():
     # os._exit would later kill the run -- so reaching the assert is the check.
     _bounded_graceful_shutdown(_FakeServer(), deadline=300.0)
     assert seen["graceful"] is True
+
+
+def test_worker_role_installs_signal_handler_only_for_sharded(monkeypatch):
+    """The worker role installs the SIGTERM/SIGINT graceful-leave handler only on
+    the sharded path that consumes it. Coordinator mode has no stop hook, so
+    installing one would swallow SIGTERM and leave the worker killable only by
+    SIGKILL -- it must keep the default handler."""
+    waited = []
+    monkeypatch.setattr(roles, "_wait_for_signal",
+                        lambda: waited.append(1) or threading.Event())
+    monkeypatch.setattr(roles, "run_worker", lambda *a, **k: None)
+    monkeypatch.setattr(roles, "run_sharded_worker", lambda *a, **k: None)
+
+    roles.run_worker_role(LaunchConfig.from_dict({**_TINY, "mode": "coordinator"}))
+    assert waited == []                                # coordinator: no handler
+
+    roles.run_worker_role(LaunchConfig.from_dict({**_TINY, "mode": "sharded"}))
+    assert waited == [1]                               # sharded: graceful handler installed
