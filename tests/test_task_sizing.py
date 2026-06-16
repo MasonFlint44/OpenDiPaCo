@@ -132,7 +132,51 @@ def test_fast_worker_gets_full_configured_task():
         sched.shutdown()
 
 
-# -- audit size-pinning (D8) ---------------------------------------------------
+# -- end-to-end fit with sizing on ---------------------------------------------
+
+
+def test_sizing_fires_end_to_end_in_a_real_fit():
+    """The full loop under a real in-process fit: with a tiny task_seconds the
+    scheduler measures rates and sizes tasks down (batch < configured), trains the
+    sized tasks via the per-task inner_steps override, and the fit still completes
+    -- exercising measure -> size -> worker override -> commit -> re-measure
+    together (the unit tests poke the pieces in isolation). park_factor is huge so
+    parking never fires, keeping the assertion independent of the box's speed."""
+    import threading
+
+    from opendipaco.schedule import ParameterServer, assign_shards, run_sharded_worker
+
+    cfg = _cfg()
+    dl = DiLoCoConfig(inner_steps=INNER)
+    keys = cfg.build_topology().module_keys()
+    shards = [[k for k, s in assign_shards(keys, 2).items() if s == i] for i in range(2)]
+    pss = [ParameterServer(cfg, sk, dl, host="127.0.0.1", port=0) for sk in shards]
+    for ps in pss:
+        ps.start()
+    sched = Scheduler(cfg, _corpus(cfg), [("127.0.0.1", ps.port) for ps in pss], dl,
+                      batch_size=BATCH, host="127.0.0.1", port=0,
+                      task_seconds=1e-4, park_factor=1e6)   # size hard; never park
+    sized = []
+    orig = sched._size_task_locked
+    sched._size_task_locked = lambda wid, cap: sized.append(r := orig(wid, cap)) or r
+    sched.start()
+    ws = [threading.Thread(target=run_sharded_worker, args=(cfg, dl, ("127.0.0.1", sched.port)),
+                           kwargs=dict(seed=0, heartbeat_interval=1.0), daemon=True)
+          for _ in range(2)]
+    for w in ws:
+        w.start()
+    try:
+        completed = sched.fit(num_generations=4, total_generations=4)
+    finally:
+        sched.shutdown()
+        for ps in pss:
+            ps.shutdown()
+        for w in ws:
+            w.join(timeout=10)
+    assert sum(completed.values()) >= sched._target            # completed with sizing on
+    assert sched._worker_rate                                   # rates were measured
+    assert any(b < BATCH for (b, _i) in sized)                 # sizing fired after measuring
+
 
 
 def test_audit_record_pins_sized_batch_and_inner():
@@ -229,6 +273,12 @@ def test_launch_config_maps_sizing_knobs():
                                                     "min_task_rate": 100.0}})
     assert sized.run.task_seconds == 5.0 and sized.run.park_factor == 2.0
     assert sized.run.min_task_rate == 100.0
+    # Sharded-only: task_seconds in coordinator mode fails fast (like down/up_density),
+    # rather than silently doing nothing (sizing is a sharded scheduler feature).
+    import pytest
+    with pytest.raises(ValueError, match="requires mode: sharded"):
+        LaunchConfig.from_dict({**{k: v for k, v in tiny.items() if k != "mode"},
+                                "mode": "coordinator", "run": {"task_seconds": 5.0}})
 
 
 # -- slow-worker parking (D7) --------------------------------------------------

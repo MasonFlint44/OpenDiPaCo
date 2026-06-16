@@ -384,6 +384,12 @@ class LaunchConfig:
         if kw["transport"].up_density < 1.0 and kw["mode"] != "sharded":
             raise ValueError("transport.up_density < 1.0 requires mode: sharded "
                              "(it is stamped on sharded tasks)")
+        # Task sizing (W5) lives on the sharded scheduler's lease path; the
+        # single-node coordinator has no per-worker lease sizing, so task_seconds
+        # there would silently do nothing -- fail fast (as down/up_density do).
+        if kw["run"].task_seconds is not None and kw["mode"] != "sharded":
+            raise ValueError("run.task_seconds requires mode: sharded "
+                             "(throughput-measured sizing is a scheduler lease feature)")
         # Decentralized scheduling is built on the replicated owner tier, so it
         # requires rendezvous ownership (Phase 4 D9). Catch the mismatch at load
         # rather than half-wiring a run with no owners to mint grants.
