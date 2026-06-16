@@ -32,14 +32,14 @@ def _diloco():
     return DiLoCoConfig(inner_steps=4, inner_lr=1e-3)
 
 
-def _two_owners_k2(cfg):
+def _two_owners_k2(cfg, **ps_kw):
     """Two owners, k=2: every key is owned by both (rank 0 = primary, rank 1 =
     backup), bootstrap epoch so both boot active."""
     sched_id = PeerIdentity.generate()
     ids = [PeerIdentity.generate() for _ in range(2)]
     pss = [ParameterServer(cfg, [], _diloco(), host="127.0.0.1", port=0, identity=i,
                            replicate_interval=60.0,
-                           admitted_peers=[p for p in ids if p is not i])
+                           admitted_peers=[p for p in ids if p is not i], **ps_kw)
            for i in ids]
     recs = [make_peer_record(i, reachability="public", addr=("127.0.0.1", ps.port),
                              roles=("owner",)) for i, ps in zip(ids, pss)]
@@ -187,6 +187,40 @@ def test_draining_primary_refuses_writes():
         r = primary._push({"grant": make_grant(path, [key], 1.0, "t0"),
                            "updates": {key: {"grad": grad}}})
         assert r["applied"] is False and r["reason"] == "not_primary"
+    finally:
+        for ps in pss:
+            ps.shutdown()
+
+
+def test_graceful_drain_includes_flushed_robust_buffers():
+    """In robust mode, accepted-but-buffered contributions are flushed into the
+    bank BEFORE the drain, so rank-1 receives them. If the flush ran after the
+    drain (as plain shutdown does), the buffered work would apply locally only
+    and be lost when the stale rank-1 is promoted."""
+    cfg = _cfg()
+    pss, epoch = _two_owners_k2(cfg, robustness="on", quorum_target=2)
+    try:
+        topo = cfg.build_topology()
+        # A shared key with sharing degree >= 2 so a single push *buffers* (1 < 2)
+        # rather than applying immediately.
+        key = next(k for k in topo.module_keys()
+                   if not is_private_key(k) and topo.sharing_count(k) >= 2)
+        owners = owners_for(key, epoch)
+        primary = next(ps for ps in pss if ps.peer_id == owners[0]["peer_id"])
+        backup = next(ps for ps in pss if ps.peer_id == owners[1]["peer_id"])
+        path = next(topo.path_from_index(i) for i in range(cfg.num_paths)
+                    if key in topo.path_module_keys(topo.path_from_index(i)))
+
+        grad = [torch.ones_like(p) for p in primary.bank[key].parameters()]
+        assert primary._push({"grant": make_grant(path, [key], 1.0, "t0"),
+                              "updates": {key: {"grad": grad}}})["applied"] is True
+        assert key in primary._buffers and primary._versions[key] == (0, 0)  # buffered, not applied
+
+        primary.shutdown(graceful=True)
+        # The flush applied the buffered work (version bumped) AND the drain
+        # shipped that final state to rank-1 -- the accepted work survived.
+        assert primary._versions[key] != (0, 0)
+        assert backup._versions[key] == primary._versions[key]
     finally:
         for ps in pss:
             ps.shutdown()

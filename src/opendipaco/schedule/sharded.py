@@ -1160,12 +1160,16 @@ class ParameterServer(_ReactorServer):
             self._hb_paused.set()
             if self._beat_thread is not None:
                 self._beat_thread.join(timeout=2.0)
-            # Stop accepting writes, *then* drain: a push that raced the drain
-            # would otherwise land on the departing primary and be lost. With
-            # writes fenced, the state we drain is final, and a refused push
-            # retries to the new primary once the epoch bumps (W4c).
+            # Stop accepting writes, then flush any buffered (already-accepted)
+            # robust-aggregation work into the bank, *then* drain. Order matters:
+            # a push that raced the drain would land on the departing primary and
+            # be lost, and buffered contributions flushed *after* the drain would
+            # never reach rank-1 -- both re-open the loss window. With writes
+            # fenced and buffers flushed first, the state we drain is final; a
+            # refused push retries to the new primary once the epoch bumps (W4c).
             with self._lock:
                 self._draining = True
+                self._flush_all_buffers_locked()  # accepted work -> bank, before draining
             # Drain *before* deregistering: while we're still the valid primary
             # (epoch not yet bumped), push our latest state to each key's rank-1
             # successor, so a promoted backup holds the last accepted push (W4c).
