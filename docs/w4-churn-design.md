@@ -1,6 +1,6 @@
 # W4 design — churn robustness at consumer reality
 
-Status: **W4a + W4b + W4c landed.** Phase 2 built dynamic ownership, k-replication,
+Status: **complete — W4a/b/c/d landed.** Phase 2 built dynamic ownership, k-replication,
 pull replication, epoch-bump failover, per-key checkpoints, and a signed recovery
 manifest — but timed and tested for **cluster** churn. W4 is the roadmap's
 *"eng / tuning"* item (`docs/viability-roadmap.md` §W4): make those mechanisms
@@ -28,8 +28,16 @@ to each key's rank-1 successor before leaving (`shutdown(graceful=True)` →
 of the `include_state` pull: version-gated, owner-session gated, exact bytes,
 best-effort). A promoted backup then holds the *last* accepted push, collapsing
 the failover loss window from ≤ `replicate_interval` to ~0. Refused in
-decentralized mode (a pushed version isn't quorum-confirmable). **Remaining:
-W4d** (home-grade launch defaults + signal handlers + docs).
+decentralized mode (a pushed version isn't quorum-confirmable). **W4d** (D2 +
+D5 launch half): the launch layer retunes detection timings for home churn —
+`tracker.ttl` 120→30 s, `owner_grace` 240→60 s (kept ≥ 2× ttl), `min_epoch_interval`
+60→20 s, owner→tracker `heartbeat_interval` 30→10 s, `epoch_poll_interval` 5→3 s,
+lease reclaim (`heartbeat_timeout`/`lease_ttl`) 30→20 s — while the **library**
+constructor defaults (`Tracker`, `EpochManager`, `ParameterServer`) stay
+conservative so the in-process anchor + unit tests are unchanged; and the CLI
+routes `SIGTERM`/`SIGINT` through `shutdown(graceful=True)` (owner drain +
+deregister; worker `stop_event` → nack-on-leave) under a hard `os._exit`
+deadline so a hung peer can't stall a closing node. **W4 is complete.**
 
 W4 builds **no new subsystem.** Every decision below either tightens an existing
 timing, adds a clean-departure fast path beside the existing TTL-expiry slow
@@ -271,7 +279,7 @@ it justifies.
 | **W4a** ✅ | `examples/validate_churn.py`: in-process churn injector (abrupt/graceful/suspend/join) + churn metrics (epochs, remaps, time-to-failover, dropped contributions); minimal test hooks on the owner/worker loops to drive churn deterministically. No behavior change. | Harness runs a job through injected churn and reports metrics; abrupt-kill failover completes with bounded loss (today's behavior, now measured); suspend-within-grace causes 0 bumps. |
 | **W4b** ✅ | Graceful departure mechanics (D3 parts 1+3): signed fast-deregister → `EpochManager` immediate-removal predicate; worker nack-on-leave; `shutdown(graceful=True)` seam (D5 library half). | Tombstone → next bump removes the peer skipping `owner_grace`, still rate-limited; forged tombstone for a live peer rejected (wrong signer); graceful worker leave re-leases its path immediately; non-graceful path bit-identical to today. *(All landed; harness's graceful arm fails over ~10× faster than abrupt.)* |
 | **W4c** ✅ | Primary drain on departure (D3 part 2): a leaving primary flushes highest-version state to rank-1 over the exact-bytes replication path before exit. | Drain → promoted rank-1 serves the *last* accepted push (loss window ~0) vs ≤`replicate_interval` without; drain payload is exact bytes (version identifies identical content); drain failure degrades to the window (no wedge). *(All landed; also version-gated, owner-session gated, refused in decentralized mode.)* |
-| **W4d** | Home-grade launch defaults (D2), validated by the W4a harness across the D1 model; `SIGTERM`/`SIGINT` → `shutdown(graceful=True)` launch handlers (D5 launch half); docs + roadmap/plan status. | Retuned defaults survive + converge in the harness across the churn sweep; launch signal handler runs the handoff within its deadline then exits; `viability-roadmap.md`/`internet-scale-plan.md` W4 status honest. |
+| **W4d** ✅ | Home-grade launch defaults (D2), validated by the W4a harness across the D1 model; `SIGTERM`/`SIGINT` → `shutdown(graceful=True)` launch handlers (D5 launch half); docs + roadmap/plan status. | Retuned defaults survive + converge in the harness across the churn sweep; launch signal handler runs the handoff within its deadline then exits; `viability-roadmap.md`/`internet-scale-plan.md` W4 status honest. *(Landed; launch timings satisfy owner_grace ≥ 2·ttl & heartbeat < ttl, library defaults unchanged, deadline backstop scoped to the CLI signal path.)* |
 
 Rough sizing: W4a M (the harness is the work), W4b M, W4c S–M, W4d S + tuning.
 

@@ -258,7 +258,7 @@ def test_proposal_policy_rejects_guaranteed_stall_config():
 def test_schedule_config_parses_and_defaults_central():
     cfg = LaunchConfig.from_dict(_tiny_dict())
     assert cfg.schedule.mode == "central"        # default: today's single scheduler
-    assert cfg.schedule.lease_ttl == 30.0 and cfg.schedule.read_quorum == 2
+    assert cfg.schedule.lease_ttl == 20.0 and cfg.schedule.read_quorum == 2
     cfg2 = LaunchConfig.from_dict({**_tiny_dict(), "ownership": {"mode": "rendezvous"},
                                    "schedule": {"mode": "decentralized", "lease_ttl": 12.0}})
     assert cfg2.schedule.mode == "decentralized" and cfg2.schedule.lease_ttl == 12.0

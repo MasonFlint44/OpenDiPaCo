@@ -10,6 +10,7 @@ the configured addresses.
 
 from __future__ import annotations
 
+import os
 import signal
 import threading
 
@@ -305,6 +306,27 @@ def _wait_for_signal() -> threading.Event:
     return ev
 
 
+# A closing node (laptop lid, SIGTERM) must hand off cleanly but never *hang*:
+# the graceful path (owner drain + deregister) is internally bounded, but a hung
+# peer could still stall a synchronous RPC. This is the hard backstop (design D5
+# open-Q #2: a few-second budget, then abrupt).
+_SHUTDOWN_DEADLINE = 10.0
+
+
+def _bounded_graceful_shutdown(server, *, deadline: float = _SHUTDOWN_DEADLINE) -> None:
+    """Run ``server.shutdown(graceful=True)`` under a hard deadline: if the
+    handoff overruns (e.g. a hung successor/tracker), force-exit so the node
+    still leaves -- the abrupt fallback the TTL+grace path already tolerates.
+    Fast shutdowns cancel the timer well before it fires."""
+    timer = threading.Timer(deadline, lambda: os._exit(0))
+    timer.daemon = True
+    timer.start()
+    try:
+        server.shutdown(graceful=True)
+    finally:
+        timer.cancel()
+
+
 # -- roles -------------------------------------------------------------------
 
 
@@ -473,18 +495,29 @@ def run_parameter_server(cfg: LaunchConfig, shard_id: int = 0, *, port=None,
     if on_start:
         on_start(ps)
     (stop_event or _wait_for_signal()).wait()
-    ps.shutdown()
+    # Graceful leave (W4d): drain to rank-1 + signed deregister so failover skips
+    # owner_grace and loses ~nothing. (No-op in static mode: no epoch, no tracker.)
+    # The os._exit deadline backstop applies only to the real CLI signal path;
+    # an injected stop_event (run_local / tests) returns to its caller normally.
+    if stop_event is None:
+        _bounded_graceful_shutdown(ps)
+    else:
+        ps.shutdown(graceful=True)
     if lp is not None:
         lp.close()
     return ps
 
 
-def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_tasks=None):
+def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_tasks=None,
+                    stop_event=None):
     """A worker: connect to the coordinator (or scheduler in sharded mode) and train."""
     model, diloco = dipaco_config(cfg.model), diloco_config(cfg.diloco)
     mt = max_tasks if max_tasks is not None else cfg.run.max_tasks
     data_dir = cfg.data.shard_cache_dir  # spec mode: cache materialized shards here
     auth = _worker_auth(cfg)
+    # SIGTERM/SIGINT -> graceful leave (W4d): the sharded worker nacks its in-flight
+    # lease so the path re-leases at once instead of waiting out the lease timeout.
+    ev = stop_event or _wait_for_signal()
     if cfg.transport.kind == "libp2p":
         # libp2p worker: dials the scheduler's multiaddr over Noise streams
         # (NAT-traversing via relays/DCUtR). Sharded/owner topology only -- the
@@ -499,7 +532,8 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             max_tasks=mt, reconnect=True,
             heartbeat_interval=cfg.transport.heartbeat_interval,
             data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch,
-            transport="libp2p", identity=_node_identity(cfg, generate=True))
+            transport="libp2p", identity=_node_identity(cfg, generate=True),
+            stop_event=ev)
         return
     if cfg.mode == "sharded":
         target = scheduler_addr or cfg.connect_addr()
@@ -508,7 +542,7 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             auth_key=auth, max_tasks=mt, reconnect=True,
             heartbeat_interval=cfg.transport.heartbeat_interval,
             tls=build_tls_client(cfg), tls_hostname=cfg.tls.server_hostname,
-            data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch)
+            data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch, stop_event=ev)
     else:
         host, port = addr or cfg.connect_addr()
         run_worker(
