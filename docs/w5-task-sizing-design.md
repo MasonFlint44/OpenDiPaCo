@@ -129,6 +129,14 @@ bigger dynamics change; deferred, D10.)
   stable id (peer id / `worker_id`) so it survives a reconnect.
 - The first task from a worker (no estimate) uses the configured default; the
   estimate refines from its first commit on.
+- **Fetch overhead is in the rate, on purpose.** The measured rate is work ÷
+  (fetch + train), and fetch is ~fixed regardless of task size — so a smaller
+  task has a *lower* effective rate. This doesn't spiral: the sizing map has a
+  stable fixed point at `work* ≈ compute_rate × (task_seconds − fetch)` (clamped
+  at the `(1, 1)` floor, EMA-damped), i.e. sizing converges to the work that fits
+  in `task_seconds` *after* subtracting fetch. A worker whose fetch alone exceeds
+  `task_seconds` floors at the minimum task and is parked (D7) — correct, it
+  genuinely can't keep the cadence.
 
 ### D5. Default off; anchor bit-identical
 
