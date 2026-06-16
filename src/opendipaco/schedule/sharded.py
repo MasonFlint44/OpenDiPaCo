@@ -228,6 +228,12 @@ def _route_target(owner):
     return addrs if len(addrs) > 1 else owner["addr"]
 
 
+# W5a: EMA weight for the per-worker effective-rate estimate. ~0.3 adapts over a
+# handful of tasks -- fast enough to follow a worker that throttles, slow enough
+# to ignore a one-off cold fetch or GC pause (design open-Q 2).
+_RATE_EMA_ALPHA = 0.3
+
+
 def _safe_version(v):
     """A *wire* version coerced to an (epoch, counter) pair, or None if
     malformed. Decentralized sources may be Byzantine (Phase 4), so a bad
@@ -1667,8 +1673,22 @@ class Scheduler(_ReactorServer):
                  identity=None, compress="none", idle_backoff=None,
                  reputation=None, rate_limiter=None, min_owner_reputation=0.25,
                  redundancy=3, redundancy_rate=0.0, audit_timeout=60.0,
-                 private_policy="overwrite", down="full", up_density=1.0, **reactor_kw):
+                 private_policy="overwrite", down="full", up_density=1.0,
+                 task_seconds=None, park_factor=3.0, min_task_rate=None, **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
+        # W5b: target wall-time per task. None (default) -> no sizing, every task
+        # is the configured (batch_size, inner_steps) -> byte-identical anchor.
+        # When set, slow workers get smaller tasks so their lease lands in ~this.
+        self.task_seconds = task_seconds
+        # W5c: a worker whose minimum task (batch=1, inner=1) is estimated to take
+        # longer than task_seconds * park_factor (or whose rate is below an
+        # absolute min_task_rate) is *parked* -- given idle instead of a lease so
+        # it can't hold a path hostage. Parking is re-evaluated each request and
+        # lets one through per cooldown to re-measure, so a worker that speeds up
+        # rejoins. Only active when task_seconds is set.
+        self.park_factor = park_factor
+        self.min_task_rate = min_task_rate
+        self._parked: dict = {}   # worker_id -> monotonic time it was last let through
         self.ps_tls = ps_tls  # client context for the scheduler's checkpoint RPCs to PSs
         self.grant_key = grant_key  # shared with the PSs (not workers) to sign grants
         # Reputation (Phase 3b): scores authenticated peers from commit outcomes,
@@ -1751,6 +1771,11 @@ class Scheduler(_ReactorServer):
         self._issued: dict = {}
         self._lease: dict = {}  # path -> current lease token (fences commits)
         self._owner: dict = {}
+        # W5a: per-worker effective rate (tokens / lease-second), measured from
+        # lease->commit timing. dynamics-neutral; W5b sizes tasks from it.
+        self._lease_at: dict = {}    # path -> monotonic lease time (current lease)
+        self._lease_work: dict = {}  # path -> tokens issued in the leased task
+        self._worker_rate: dict = {}  # worker_id -> EMA effective rate
 
     def _handle(self, msg: dict, nbytes: int, peer_id: str | None = None):
         kind = msg.get("type")
@@ -1910,6 +1935,33 @@ class Scheduler(_ReactorServer):
             check_only, base, audit, check_private, check_grant = (
                 False, None, False, False, None)
             rep = self.reputation.get(peer_id)
+            # Per-worker batch ceiling, clamped to its advertised memory cap; W5b
+            # sizes a task down from this toward task_seconds. ``inner`` defaults
+            # to the configured count (the ceiling).
+            batch_cap = (max(1, min(self.batch_size, int(caps["max_batch"])))
+                         if caps.get("max_batch") else self.batch_size)
+            inner = self.diloco.inner_steps
+            # W5b: size (batch, inner) for this worker toward task_seconds (shrink
+            # only; the full configured task when off / fast / no estimate). Done
+            # before parking so the park cadence uses the task it would *actually*
+            # get. The check branch overrides these with the audited primary's pin.
+            batch, inner = self._size_task_locked(wid, batch_cap)
+            # W5c: park a worker too slow even for the minimum task so it holds no
+            # path (or check). Re-measure one task per `park_factor` of *this
+            # worker's own* sized-task time -- a fixed wall cooldown would be shorter
+            # than a parked worker's task time and so never actually idle it.
+            # Using the sized-task time (not seq/rate) means a worker parked by the
+            # absolute min_task_rate floor -- whose task isn't shrunk by
+            # task_seconds -- is idled too, not just one whose task overshoots.
+            if self._too_slow_locked(wid):
+                now = time.monotonic()
+                last = self._parked.get(wid)
+                task_time = batch * inner * self.config.sequence_length / self._worker_rate[wid]
+                if last is not None and now - last < self.park_factor * task_time:
+                    return self._idle()
+                self._parked[wid] = now   # let this one through to re-measure
+            else:
+                self._parked.pop(wid, None)
             if not eligible:
                 # No primary work: absorb the surplus as a redundant check for an
                 # open audit (§1.9), if one needs this distinct worker.
@@ -1918,9 +1970,15 @@ class Scheduler(_ReactorServer):
                     return self._idle()
                 if not self.rate_limiter.allow(peer_id, reputation=rep):
                     return self._idle()
-                (path, generation, base, lease, check_private,
-                 check_grant) = self._reserve_check_locked(cand, member)
+                (path, generation, base, lease, check_private, check_grant,
+                 pin_batch, pin_inner) = self._reserve_check_locked(cand, member)
                 check_only = True
+                # Reproduce the audited primary's exact computation (design D8):
+                # a check must use the *primary's* batch/inner, not this checker's
+                # own (sized) values -- else the digest diverges (and a heterogeneous
+                # max_batch would falsely flag every audit).
+                batch = pin_batch or batch_cap
+                inner = pin_inner or self.diloco.inner_steps
             else:
                 # Rate limit only the *expensive* path (issuing a task with a
                 # weight/shard payload): a throttled peer gets a cheap backoff
@@ -1929,10 +1987,15 @@ class Scheduler(_ReactorServer):
                     return self._idle()
                 path = min(eligible, key=lambda p: (self._completed[p], p not in warm, p))
                 lease = uuid.uuid4().hex  # unique per lease; fences commit/heartbeat
+                # batch, inner already sized above (before the parking check).
                 self._owner[path] = wid
                 self._inflight[path] = time.monotonic() + self.heartbeat_timeout
                 self._issued[path] = self._T
                 self._lease[path] = lease
+                # W5a: remember when this lease opened and how much work it carries
+                # (the *sized* work), so its commit yields an effective-rate sample.
+                self._lease_at[path] = time.monotonic()
+                self._lease_work[path] = batch * inner * self.config.sequence_length
                 generation = self._completed[path]
                 # Sample this task for an audit: the primary will report a pinned
                 # base + digest, and checkers re-run it from that base. A
@@ -1949,6 +2012,9 @@ class Scheduler(_ReactorServer):
                         "target": self.redundancy - 1, "base": None,
                         "primary_digest": None, "primary_peer": None,
                         "checks": [], "members": {member},
+                        # Pin the primary's task size so checkers reproduce its
+                        # exact computation (design D8).
+                        "batch": batch, "inner": inner,
                         # A creation deadline so an audit whose primary never
                         # commits (worker died) still expires and is reaped --
                         # the primary's commit extends it for the checkers.
@@ -1976,11 +2042,15 @@ class Scheduler(_ReactorServer):
             "down": self.down,          # downlink policy: keep keyframes for deltas (W2a)
             "shard": compress_shard(shard, self.compress),
             "shard_spec": shard_spec,
-            "batch_size": (max(1, min(self.batch_size, int(caps["max_batch"])))
-                           if caps.get("max_batch") else self.batch_size),
+            "batch_size": batch,
             "total_rounds": self.total_rounds,
             "seed": self.seed,
         }
+        # Per-task inner_steps travels only when sizing is active or for a check
+        # (which pins the primary's count); absent otherwise -> the worker uses
+        # its configured default -> byte-identical to the pre-W5 task (D6).
+        if self.task_seconds or check_only:
+            task["inner_steps"] = inner
         if check_only:
             task["check_only"], task["base"] = True, base
             if check_private:  # also submit private proposals to the owners
@@ -2018,7 +2088,8 @@ class Scheduler(_ReactorServer):
                             if is_private_key(k)]
             grant = make_grant(path, private_keys, 0.0, lease, self.grant_key,
                                identity=self.identity)
-        return path, generation, a["base"], lease, bool(a.get("private")), grant
+        return (path, generation, a["base"], lease, bool(a.get("private")), grant,
+                a.get("batch"), a.get("inner"))
 
     def _commit_check(self, msg: dict, peer_id: str | None = None) -> dict:
         """Record a checker's digest against its audit; resolve if complete.
@@ -2088,11 +2159,17 @@ class Scheduler(_ReactorServer):
             with self._lock:
                 lease = self._lease.get(path)
                 if path not in self._inflight or msg.get("lease") != lease:
-                    # stale / already freed / not the current lease holder
+                    # stale / already freed / not the current lease holder. Don't
+                    # touch the rate timing -- it belongs to the *current* lease.
                     return {"type": "commit_ack", "accepted": False}
                 staleness = self._T - self._issued.get(path, self._T)
                 self._inflight.pop(path, None)
                 self._lease.pop(path, None)
+                # W5a: claim this lease's rate sample now (only *recorded* on an
+                # accepted, non-empty commit below; rejects just drop it).
+                rate_wid = self._owner.get(path)
+                lease_t0 = self._lease_at.pop(path, None)
+                lease_work = self._lease_work.pop(path, None)
                 if staleness > self.staleness_bound:
                     self.metrics.record_stale_reject()
                     return {"type": "commit_ack", "accepted": False}
@@ -2106,6 +2183,10 @@ class Scheduler(_ReactorServer):
                 gen = self._completed.get(path, 0)
                 self._T += 1
                 self._completed[path] = gen + 1
+                # W5a: a real, accepted unit of work -> an effective-rate sample.
+                if lease_t0 is not None and not msg.get("empty"):
+                    self._record_rate_locked(rate_wid, lease_work,
+                                             time.monotonic() - lease_t0)
                 damp = 1.0 / (1.0 + staleness) if self.staleness_weight == "inverse" else 1.0
                 push_weight = self.corpus.shard_weight(self.topology.path_index(path)) * damp
                 self.metrics.record_update(staleness)
@@ -2144,8 +2225,63 @@ class Scheduler(_ReactorServer):
             if path in self._inflight and msg.get("lease") == self._lease.get(path):
                 self._inflight.pop(path, None)
                 self._lease.pop(path, None)
+                self._lease_at.pop(path, None)    # returned, not committed: no rate sample
+                self._lease_work.pop(path, None)
                 return {"type": "nack_ack", "freed": True}
         return {"type": "nack_ack", "freed": False}
+
+    def _record_rate_locked(self, wid, work, elapsed) -> None:
+        """Fold one (work, lease-duration) sample into a worker's EMA effective
+        rate (tokens / second). Caller holds the lock. Guards against a zero/
+        negative duration (instant in-process commit) so the EMA can't blow up."""
+        if wid is None or work is None or work <= 0 or elapsed <= 0:
+            return
+        rate = work / elapsed
+        prev = self._worker_rate.get(wid)
+        self._worker_rate[wid] = rate if prev is None else (
+            (1 - _RATE_EMA_ALPHA) * prev + _RATE_EMA_ALPHA * rate)
+
+    def worker_rate(self, wid):
+        """A worker's measured effective rate (tokens per lease-second) as an EMA,
+        or ``None`` if it hasn't completed a task yet (W5a). W5b sizes the next
+        task from this so the lease lands in ~``task_seconds``."""
+        with self._lock:
+            return self._worker_rate.get(wid)
+
+    def _size_task_locked(self, wid, batch_ceiling):
+        """Size ``(batch_size, inner_steps)`` for ``wid`` so its lease lands in
+        ~``task_seconds``, from its measured rate (W5b, design D2/D3). **Shrink
+        only**: the configured ``(batch_ceiling, inner_steps)`` is the ceiling, so
+        a fast worker (or one with no estimate yet, or sizing off) gets the full
+        configured task -- the anchor task. A slow worker gets a smaller **batch**
+        first (the gentle, bandwidth-neutral lever that keeps the inner-step
+        count fixed); ``inner_steps`` shrinks only once batch is floored at 1 and
+        the task still overshoots the target."""
+        inner = self.diloco.inner_steps
+        rate = self._worker_rate.get(wid)
+        if not self.task_seconds or not rate:
+            return batch_ceiling, inner
+        seq = self.config.sequence_length
+        target = rate * self.task_seconds                      # target tokens
+        batch = max(1, min(batch_ceiling, round(target / (inner * seq))))
+        if batch == 1 and inner * seq > target:                # batch floored, still over
+            inner = max(1, min(inner, round(target / seq)))
+        return batch, inner
+
+    def _too_slow_locked(self, wid) -> bool:
+        """Is ``wid`` too slow to lease without straggling -- its measured rate
+        implies even the minimum task (batch=1, inner=1 -> seq tokens) overshoots
+        ``task_seconds * park_factor`` (or it is below an absolute
+        ``min_task_rate``)? Only when sizing is on and an estimate exists (a fresh
+        worker bootstraps with a full task and isn't parked)."""
+        if not self.task_seconds:
+            return False
+        rate = self._worker_rate.get(wid)
+        if not rate:
+            return False
+        if self.min_task_rate is not None and rate < self.min_task_rate:
+            return True
+        return self.config.sequence_length / rate > self.task_seconds * self.park_factor
 
     def _heartbeat(self, msg: dict) -> None:
         path = msg["path"]
@@ -2160,6 +2296,8 @@ class Scheduler(_ReactorServer):
                 del self._inflight[path]
                 self._lease.pop(path, None)  # invalidate the token: zombies can't commit
                 self._owner[path] = None
+                self._lease_at.pop(path, None)    # reclaimed, not committed: no rate sample
+                self._lease_work.pop(path, None)
                 self.metrics.reclaims += 1
         self._resolve_audits_locked(now)  # close out timed-out / complete audits
 
@@ -2186,6 +2324,7 @@ class Scheduler(_ReactorServer):
         with self._lock:
             self._completed = {p: self._completed.get(p, 0) for p in self.paths}
             self._inflight, self._issued = {}, {}
+            self._lease_at, self._lease_work = {}, {}  # no stale rate timing across fits (W5a)
             self._target = self._T + num_generations * len(self.paths)
             self._serving = True
         t0 = time.monotonic()
@@ -2570,7 +2709,8 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions, keyfr
                 fetch_keys(pin)
                 engine._opt_state.pop(path, None)  # cold
                 contrib = worker._train_path(path, load_shard_locked(),
-                                             task["batch_size"], task["gen_id"])
+                                             task["batch_size"], task["gen_id"],
+                                             task.get("inner_steps"))
                 if not contrib.empty:
                     digest = pseudograd_digest(contrib.shared_delta)
             except _CheckAborted:
@@ -2616,7 +2756,8 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions, keyfr
                 engine._opt_state.pop(path, None)  # reset Adam on a cold start
                 residuals.pop(path, None)          # and any stale error-feedback carry
             shard = load_shard_locked()
-            contrib = worker._train_path(path, shard, task["batch_size"], task["gen_id"])
+            contrib = worker._train_path(path, shard, task["batch_size"], task["gen_id"],
+                                         task.get("inner_steps"))
             if audit and not contrib.empty:
                 # Pin the exact base for checkers, and digest this contribution.
                 base = {k: list(versions[k]) for k in routing if k in versions}

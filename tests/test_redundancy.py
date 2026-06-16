@@ -132,7 +132,7 @@ def _check(sched, key, peer, digest):
     vote counts."""
     path, gen = key
     with sched._lock:
-        _, _, _, lease, _, _ = sched._reserve_check_locked(key, peer)
+        _, _, _, lease, *_ = sched._reserve_check_locked(key, peer)
     sched._commit_check({"check_only": True, "path": list(path), "gen_id": gen,
                          "digest": digest, "lease": lease, "worker_id": peer},
                         peer_id=peer)
@@ -154,7 +154,7 @@ def test_unassigned_check_commit_is_ignored():
         assert key in sched._audits and not sched._audits[key]["checks"]
         # A reserved checker echoing the wrong lease also doesn't count.
         with sched._lock:
-            _, _, _, real_lease, _, _ = sched._reserve_check_locked(key, "C1")
+            _, _, _, real_lease, *_ = sched._reserve_check_locked(key, "C1")
         sched._commit_check({"check_only": True, "path": list(key[0]), "gen_id": key[1],
                              "digest": "X", "lease": "wrong", "worker_id": "C1"},
                             peer_id="C1")
