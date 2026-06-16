@@ -544,6 +544,25 @@ class ParameterServer(_ReactorServer):
         owners = owners_for(key, self._epoch)
         return bool(owners) and owners[0]["peer_id"] == self.peer_id
 
+    def _may_write_locked(self, key) -> bool:
+        """May this owner apply a granted push to ``key``?
+
+        Central/static: only the active **primary** writes; backups receive the
+        result by replication. Decentralized: **every active owner** applies the
+        granted push independently (the worker pushes to all `k`). This is load-
+        bearing, not an optimization -- a fresh write is held by one replica until
+        it propagates, and decentralized replication only adopts a *quorum-
+        confirmed* version (Byzantine-source safety), so a single-replica write
+        could never reach quorum and would never propagate (the staleness then
+        grows unbounded and commits stall). Independent application is also the
+        Byzantine-**primary** defense: co-owners recompute the same bytes from the
+        same grant + base rather than trust the primary's value. A draining or
+        still-syncing owner refuses (its base isn't a consistent write target)."""
+        if (self.schedule_mode == "decentralized" and self._epoch is not None
+                and not self._draining):
+            return key in self.owned_keys and key in self._active
+        return self._primary_locked(key)
+
     def _bump_version_locked(self, key) -> None:
         e, c = self._versions[key]
         self._versions[key] = (self._epoch_num, c + 1 if e == self._epoch_num else 1)
@@ -1554,7 +1573,7 @@ class ParameterServer(_ReactorServer):
                     if self._epoch is not None:  # zombie routing: make the miss visible
                         skipped.append(k)
                     continue
-                if not self._primary_locked(k):  # backups copy state, never apply writes
+                if not self._may_write_locked(k):  # central: primary only; dec: any active owner
                     skipped.append(k)
                     continue
                 if self.max_update_norm is not None:
@@ -1578,7 +1597,7 @@ class ParameterServer(_ReactorServer):
                     if self._epoch is not None:
                         skipped.append(k)
                     continue
-                if not self._primary_locked(k):
+                if not self._may_write_locked(k):  # dec: every active replica stores it
                     skipped.append(k)
                     continue
                 if self.private_policy == "proposal":

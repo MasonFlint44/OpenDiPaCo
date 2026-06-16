@@ -11,8 +11,9 @@ environment. Trust and bandwidth are the two walls. Nothing needs to be thrown a
 the engine, wire format, reactor, and scheduler skeleton all evolve into the P2P
 design rather than being replaced.**
 
-> **Status (2026-06):** Phases 0–4 below have **landed** (Phase 4 at the
-> control-plane level — see [phase4-design.md](phase4-design.md)). The two walls
+> **Status (2026-06):** Phases 0–4 below have **landed** (Phase 4 control plane
+> *and* its on-box worker loop — see [phase4-design.md](phase4-design.md) and
+> [decentralized-worker-loop-design.md](decentralized-worker-loop-design.md)). The two walls
 > are addressed *in principle*: bandwidth/SPOF by Phases 1–2, trust by Phase 3,
 > and the central scheduler itself by Phase 4. But **"architecturally complete"
 > is not "viable on consumer hardware over consumer links."** The remaining work
@@ -119,9 +120,10 @@ de-risked on one box:** `examples/validate_dynamics.py` trains the synchronous
 anchor and the real in-process async sharded path (+ int8, + robust aggregation)
 on the same corpus and shows the deltas converge comparably at toy scale (it
 returns `INCONCLUSIVE` rather than a false pass when the anchor itself doesn't
-train). What remains is the *systems* half — the same comparison at real scale
-over real WAN links, plus the Phase 4 decentralized write path — which needs
-multi-node hardware (the §0f-systems run; see [viability-roadmap.md](viability-roadmap.md)).
+train), including a **decentralized arm** for the Phase 4 push-to-all-`k` write
+path. What remains is the *systems* half — the same comparisons at real scale
+over real WAN links — which needs multi-node hardware (the §0f-systems run; see
+[viability-roadmap.md](viability-roadmap.md)).
 The project currently proceeds on the assumption the synchronous result
 extrapolates, with the on-box harness as standing evidence.
 
@@ -354,12 +356,13 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
   shared-with-robust-aggregation for internet runs. (a) preserves paper semantics;
   decide empirically.
 
-### Phase 4 — decentralized scheduling (optional endgame) · ◑ control plane done
+### Phase 4 — decentralized scheduling (optional endgame) · ◑ control plane + on-box worker loop done
 
 > Design, the three operator calls (full Byzantine-owner defense, leaderless
 > assignment, owner gossip), and the amendments found while building
-> (directory-TTL hysteresis instead of a per-owner EpochManager, the 0f-gated
-> worker loop): [phase4-design.md](phase4-design.md).
+> (directory-TTL hysteresis instead of a per-owner EpochManager, the worker
+> loop): [phase4-design.md](phase4-design.md). The worker loop itself:
+> [decentralized-worker-loop-design.md](decentralized-worker-loop-design.md).
 
 - **Leaderless assignment** — ✅ `assignment.py`: HRW`(path, generation)` over the
   live worker set with deterministic takeover-on-expiry replaces the scheduler's
@@ -379,13 +382,16 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
   pure function of the self-certifying, gossiped directory (no scheduler
   signature); owners import each other's directories so the **tracker degrades
   to a bootstrap seed** and the swarm survives its loss.
-- **Still 0f-gated (the residual):** the decentralized **worker loop**
+- **Worker loop — ✅ landed on-box:** the decentralized **worker loop**
   (self-assign → quorum-read → commit → **push to all `k` owners**) and a
-  single-process `run_local` for it are *not* yet runnable — the defense's
-  components are all landed and tested, but the end-to-end write path whose
-  *convergence* must be measured rides the 0f WAN run, exactly as Phase 3's
-  convergence verdict does. `examples/validate_decentralized.py` validates the
-  read-side quorum + divergence primitive (no networking), de-risking it.
+  single-process `run_local` driver for it are built
+  (`run_decentralized_worker`/`_serve_decentralized`, `_run_local_decentralized`;
+  [decentralized-worker-loop-design.md](decentralized-worker-loop-design.md)), and
+  `examples/validate_dynamics.py` now trains the scheduler-less write path vs. the
+  synchronous anchor on one box (the read-side quorum primitive alone is in
+  `examples/validate_decentralized.py`). **Still 0f-gated:** the at-scale
+  *convergence* verdict under real WAN latency/NAT/bandwidth/churn — the systems
+  half — exactly as Phase 3's end-to-end verdict.
 - Only worth completing if tracker/scheduler availability actually becomes the
   limiting factor; Phases 0–3 already deliver the goal without it.
 
@@ -411,11 +417,11 @@ bytes, with validated convergence vs. the synchronous anchor. This also retires
 | ~~0c~~ ✅ | ~~Compression (bf16 + int8 grads + error feedback)~~ | **Done** — 1.2 (2× down / 4× up measured; delta-encoding + convergence validation remain) | M |
 | ~~0d~~ ✅ | ~~Data decentralization (shard ids + worker-side ingest + local routing)~~ | **Done** — 1.3 (`data.ship: spec`; router fitting + EM still central) | M |
 | ~~0e~~ ✅ | ~~bf16 inner loop, capability negotiation, idle backoff, hygiene~~ | **Done** — 1.10 (autocast + batch caps), 1.9 (idle pacing), 1.11, 1.12 | S–M |
-| 0f | ◑ Async-convergence validation: **dynamics half done on one box** (`examples/validate_dynamics.py` — deltas converge vs. the anchor at toy scale); **systems half** (real WAN run + decentralized worker loop) deferred for multi-node hardware, currently assumed | 1.4 | M (mostly wall-clock) |
+| 0f | ◑ Async-convergence validation: **dynamics half done on one box** (`examples/validate_dynamics.py` — async/int8/robust **and the Phase 4 decentralized push-to-all-k write path** converge vs. the anchor at toy scale); **systems half** (real WAN run) deferred for multi-node hardware, currently assumed | 1.4 | M (mostly wall-clock) |
 | ~~1~~ ✅ | ~~Peer identity + tracker + reachability tiers~~ | **Done** — 1.13, 1.8 (prereq); per-frame envelopes + autonomous gossip deferred to Phase 2 | M |
 | ~~2~~ ✅ | ~~Replicated module owners, dynamic ownership, signed manifests~~ | **Done** — 1.8 (HRW placement, signed epochs, Ed25519 grants, version pairs, pull replication, tracker-driven failover + promotion, per-key checkpoints + recovery manifest, `ownership: rendezvous` launch mode; design + amendments in [phase2-design.md](phase2-design.md)) | L |
 | ~~3~~ ✅ | ~~Robust aggregation, redundancy, reputation, private-module policy~~ | **Done** — 1.1 (owner-side robust aggregation, version-pinned redundant execution, reputation-gated influence, private proposal-gating), 1.9 (oversupply absorbed as redundant checks), 1.14 (per-peer rate limiting); `robustness: off` default; design + amendments in [phase3-design.md](phase3-design.md). Adversarial-dynamics harness `examples/validate_robustness.py`; the §1.4 *convergence* verdict rides the 0f WAN run | L |
-| ~~4~~ ◑ | ~~Decentralized scheduling (control plane)~~ | **Control plane done** — residual SPOF (§1.8): leaderless HRW assignment, version-vector clock, owner-minted grants, Byzantine-owner quorum reads + cross-owner digest agreement + eviction, deterministic gossip-derived epochs, `schedule: decentralized` wiring; design + amendments in [phase4-design.md](phase4-design.md). The decentralized **worker loop** + its convergence ride 0f (like Phase 3); `examples/validate_decentralized.py` validates the read-side primitive | L |
+| ~~4~~ ◑ | ~~Decentralized scheduling (control plane + on-box worker loop)~~ | **Control plane + worker loop done** — residual SPOF (§1.8): leaderless HRW assignment, version-vector clock, owner-minted grants, Byzantine-owner quorum reads + cross-owner digest agreement + eviction, deterministic gossip-derived epochs, `schedule: decentralized` wiring (design [phase4-design.md](phase4-design.md)); plus the **worker loop** (`run_decentralized_worker` + in-process `run_local`, design [decentralized-worker-loop-design.md](decentralized-worker-loop-design.md)) trained vs. the anchor on one box by `examples/validate_dynamics.py`. Its **at-scale** convergence rides the 0f WAN run (like Phase 3) | L |
 
 **Bottom line:** Phase 0 is the highest leverage-per-effort and is required no matter
 what; Phases 1–2 remove the bandwidth/SPOF wall; Phase 3 removes the trust wall;

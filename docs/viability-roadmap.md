@@ -50,9 +50,11 @@ robust-agg deltas **converge comparably to the anchor** (within ~1× — they
 track, sometimes beat it), and the harness self-reports `INCONCLUSIVE` rather
 than a vacuous pass when the anchor itself doesn't train at the chosen scale.
 This **de-risks the dynamics deltas** that the DiPaCo paper (synchronous) does
-not cover. *Still owed:* the same comparison at real scale, and the one delta
-this harness can't reach — Phase 4's decentralized **push-to-all-`k`** write
-path, which needs the worker loop below.
+not cover. The harness now also includes a **decentralized arm** (Phase 4's
+scheduler-less **push-to-all-`k`** write path: self-assign + quorum reads +
+owner-minted grants), driven by the now-landed worker loop below — so the last
+dynamics delta it couldn't previously reach is covered on-box. *Still owed:* the
+same comparisons at real scale (the systems half, below).
 
 ### 0f-systems · *does it work over real consumer links?* · B0 · [research + eng]
 
@@ -226,11 +228,13 @@ needs a reason to contribute. These are research-shaped, not just unbuilt.
 ## Sequencing
 
 ```
-   0f-dynamics ✅ on-box (validate_dynamics.py: deltas converge at toy scale)
+   0f-dynamics ✅ on-box (validate_dynamics.py: async/int8/robust + decentralized
+                          push-to-all-k deltas converge at toy scale)
         │
         ▼
         ┌──────────────────── 0f-systems: WAN verdict (deferred / assumed) ────────────┐
-        │  (decentralized worker loop + real multi-node run)  GATES EVERYTHING BELOW    │
+        │  (decentralized worker loop landed on-box; real multi-node run owed)          │
+        │  GATES EVERYTHING BELOW                                                        │
         └──────────────────────────────────────┬──────────────────────────────────────┘
                                                 ▼
                         ┌───────────────────────┴───────────────────────┐

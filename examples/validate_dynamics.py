@@ -34,6 +34,11 @@ genuinely race and go stale), with two further deltas layered on:
   throughput-measured task sizing introduces); does it still converge? (One box
   has no real *speed* heterogeneity, so the batch mix is injected directly; the
   straggler/wall-time benefit of sizing rides the WAN run.)
+* ``decentralized`` (Phase 4, ``schedule: decentralized``) — the **scheduler-less**
+  write path: workers self-assign from a gossiped directory, quorum-read bases,
+  commit to each path's owner-coordinator (which mints the grant), and **push to
+  all k owners** (primary applies, co-owners converge by replication). Does the
+  decentralized control + write path converge comparably to the central anchor?
 
 All configs train the **same** corpus/sharding/seed and are evaluated by the same
 router-free metric (best-path perplexity on a held-out split), so the numbers are
@@ -44,11 +49,12 @@ directly comparable. Env-overridable:
 
 HONEST CAVEAT — what this does and does NOT cover:
   • COVERS, end-to-end, on one box: async staleness dynamics, int8 compression,
-    and robust-aggregation dynamics, vs. the synchronous anchor.
+    robust-aggregation dynamics, and Phase 4's **decentralized push-to-all-k write
+    path** (self-assign + quorum reads + owner-minted grants), each vs. the
+    synchronous anchor.
   • Does NOT cover: real-WAN *systems* behavior (latency / NAT / bandwidth / real
-    churn) — that still needs the multi-node run — nor Phase 4's decentralized
-    push-to-all-k *write* path (the worker loop is 0f's other half, unbuilt); its
-    aggregation primitive is covered by validate_decentralized.py.
+    churn) — that still needs the multi-node run. The decentralized arm here is the
+    *dynamics* half of §0f; the systems half rides the WAN run.
   • This is a SMALL-SCALE check: read the gap-to-anchor *trend*, not absolute
     perplexity. A green run is evidence the deltas converge, not a scale proof.
 """
@@ -57,6 +63,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 
 import torch
 
@@ -64,7 +71,19 @@ from opendipaco import BackboneConfig, DiLoCoConfig, DiPaCoConfig, DiPaCoEngine
 from opendipaco.backend import LocalBackend
 from opendipaco.data import ShardedCorpus, pack_sequences
 from opendipaco.inference import compose_path, config_path, perplexity
-from opendipaco.schedule import ParameterServer, Scheduler, assign_shards, run_sharded_worker
+from opendipaco.schedule import (
+    ParameterServer,
+    PeerIdentity,
+    Scheduler,
+    Tracker,
+    assign_shards,
+    derive_epoch,
+    make_peer_record,
+    owners_for,
+    path_primary,
+    run_decentralized_worker,
+    run_sharded_worker,
+)
 
 
 def _i(name, d):
@@ -84,6 +103,16 @@ INNER_LR = float(os.environ.get("INNER_LR", "3e-4"))   # stable regime for the t
 BATCH = _i("BATCH", 8)
 NUM_DOCS = _i("NUM_DOCS", 240)
 NUM_SHARDS = _i("NUM_SHARDS", 2)
+DEC_OWNERS = _i("DEC_OWNERS", 3)         # decentralized owner nodes (k-way replicated)
+DEC_K = _i("DEC_K", 3)                   # replication factor for the decentralized arm
+# Decentralized workers default to 1: with several workers the per-generation HRW
+# re-roll hands paths off constantly, so workers spend most of their time
+# "assignee of nothing" and back off -- that thrash is a *systems*/throughput
+# property (the WAN half), not the convergence question this arm measures. One
+# self-assigning worker still sees replication-lag staleness on its quorum reads,
+# so the decentralized *write*-path dynamics are exercised without the thrash.
+DEC_WORKERS = _i("DEC_WORKERS", 1)
+DEC_TIMEOUT = float(os.environ.get("DEC_TIMEOUT", "300"))  # per-path target safety bound
 WORKERS = _i("WORKERS", 0)               # 0 -> default to num_paths (full concurrency)
 SEED = _i("SEED", 0)
 DEVICE = os.environ.get("DEVICE", "cpu")
@@ -190,6 +219,89 @@ def train_async(config, diloco, corpus, *, compress="none", robustness="off",
     return merged
 
 
+def _path_generation(owner_by_id, topo, epoch, path) -> int:
+    """The path's current generation, read from its owner-coordinator."""
+    prim = path_primary(topo.path_module_keys(path), epoch)
+    ps = owner_by_id.get(prim["peer_id"]) if prim else None
+    if ps is None:
+        return 0
+    with ps._lock:
+        return ps._gen.get(path, [0])[0]
+
+
+def train_decentralized(config, diloco, corpus, *, n_owners=DEC_OWNERS, k=DEC_K) -> dict:
+    """The real in-process **decentralized** path (Phase 4): no scheduler. Workers
+    self-assign from a gossiped directory, quorum-read each path's bases, commit to
+    the path's owner-coordinator (which version-fences the generation and mints the
+    grant), and push to all ``k`` owners -- each path's primary applies, co-owners
+    converge by replication. Owners cold-start from a bootstrap epoch and run to a
+    per-path generation target. Returns the merged authoritative bank (each key
+    from its primary).
+
+    This exercises the push-to-all-``k`` WRITE path + quorum reads + owner-minted
+    grants + owner-coordinated generations end to end on one box -- the dynamics
+    half of §0f for decentralized mode. The WAN *systems* half still needs hardware,
+    and the read-side quorum primitive alone is in ``validate_decentralized.py``."""
+    auth = os.urandom(8).hex()
+    ids = [PeerIdentity.generate() for _ in range(n_owners)]
+    pubs = [i.public_key_hex for i in ids]
+    tracker = Tracker(host="127.0.0.1", port=0, open_enrollment=True, ttl=30.0, auth_key=auth)
+    tracker.start()
+    taddr = ("127.0.0.1", tracker.port)
+    weights = {p: corpus.shard_weight(p) for p in range(config.num_paths)}
+    owners = []
+    for i in range(n_owners):
+        ps = ParameterServer(
+            config, [], diloco, host="127.0.0.1", port=0, identity=ids[i],
+            schedule_mode="decentralized", k=k, read_quorum=(k // 2) + 1, salt="",
+            replicate_interval=0.2, corpus_weights=weights, auth_key=auth,
+            admitted_peers=[p for j, p in enumerate(pubs) if j != i])
+        ps.start()
+        owners.append(ps)
+    owner_by_id = {ps.peer_id: ps for ps in owners}
+    recs = [make_peer_record(ids[i], reachability="public",
+                             addr=("127.0.0.1", owners[i].port), roles=("owner",))
+            for i in range(n_owners)]
+    epoch0 = derive_epoch(recs, k=k, salt="", prev=None)
+    for ps in owners:
+        ps.apply_epoch(epoch0, bootstrap=True)
+        ps.start_tracker_heartbeat(taddr, "127.0.0.1", interval=1.0, auth_key=auth)
+    topo = config.build_topology()
+
+    stop = threading.Event()
+
+    def worker_target():
+        run_decentralized_worker(
+            config, diloco, taddr, corpus, identity=PeerIdentity.generate(), seed=SEED,
+            device=DEVICE, auth_key=auth, k=k, salt="", read_quorum=(k // 2) + 1,
+            lease_ttl=30.0, batch_size=BATCH, total_rounds=ROUNDS,
+            heartbeat_interval=1.0, stop_event=stop)
+
+    workers = [threading.Thread(target=worker_target, daemon=True) for _ in range(DEC_WORKERS)]
+    for w in workers:
+        w.start()
+    deadline = time.monotonic() + DEC_TIMEOUT
+    try:
+        while time.monotonic() < deadline:
+            if all(_path_generation(owner_by_id, topo, epoch0, p) >= ROUNDS
+                   for p in topo.paths()):
+                break
+            time.sleep(0.05)
+    finally:
+        stop.set()
+        for w in workers:
+            w.join(timeout=10)
+        # Merge each key from its primary (the authoritative copy), after workers
+        # are quiesced and before teardown.
+        merged = {key: owner_by_id[owners_for(key, epoch0)[0]["peer_id"]].bank[key]
+                  for key in topo.module_keys()
+                  if owners_for(key, epoch0)[0]["peer_id"] in owner_by_id}
+        for ps in owners:
+            ps.shutdown(graceful=True)
+        tracker.shutdown()
+    return merged
+
+
 def main() -> None:
     torch.manual_seed(SEED)
     config = _config()
@@ -236,15 +348,25 @@ def main() -> None:
         ("async + het-batch (W5)", dict(het_batch=True)),                # W5: per-path batch mix
     ]
     worst, all_learned = 1.0, True
-    for name, kw in variants:
-        ppl = best_path_ppl(config, train_async(config, diloco, corpus, **kw), val)
+
+    def _measure(name, modules):
+        nonlocal worst, all_learned
+        ppl = best_path_ppl(config, modules, val)
         ratio = ppl / anchor
         worst = max(worst, ratio)
         learned = ppl < learned_ceiling
         all_learned &= learned
         flag = "OFF-ANCHOR" if ratio > TOL else ("DIDN'T LEARN" if not learned else "ok")
-        print(f"  {name:<22} best-path val ppl = {ppl:8.3f}   "
+        print(f"  {name:<24} best-path val ppl = {ppl:8.3f}   "
               f"{ratio:4.2f}x anchor   [{flag}]")
+
+    for name, kw in variants:
+        _measure(name, train_async(config, diloco, corpus, **kw))
+
+    # The Phase 4 decentralized write path (no scheduler; push-to-all-k + quorum
+    # reads + owner-minted grants). Structurally different from the async sweep, so
+    # it runs through its own driver -- the §0f on-box verdict for decentralized.
+    _measure(f"decentralized (P4, k={DEC_K})", train_decentralized(config, diloco, corpus))
 
     print()
     if all_learned and worst <= TOL:
@@ -255,9 +377,9 @@ def main() -> None:
         print(f"WEAK: a variant didn't learn or landed >{TOL:.2f}x off the anchor "
               f"(worst {worst:.2f}x). Re-run with more ROUNDS/NUM_DOCS; if it persists, the "
               f"dynamics need a look BEFORE the WAN run.")
-    print("\nCaveat: small-scale, one box. Validates async/int8/robust *dynamics*, not "
-          "WAN systems behavior or the Phase 4 decentralized write path. See the module "
-          "docstring.")
+    print("\nCaveat: small-scale, one box. Validates async/int8/robust/decentralized "
+          "*dynamics*, not WAN systems behavior (latency/NAT/bandwidth/real churn). "
+          "See the module docstring.")
 
 
 if __name__ == "__main__":

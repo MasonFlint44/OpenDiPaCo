@@ -268,14 +268,19 @@ def test_quorum_fetch_raises_when_no_quorum_is_reachable():
 # -- push to all k owners (D6) -------------------------------------------------
 
 
-def test_push_lands_at_the_primary_and_co_owners_refuse():
+def test_push_applies_at_all_k_owners_and_they_agree():
+    """Push-to-all-k: *every* active owner of a key applies the granted push
+    independently (not just the primary), so a fresh write propagates without
+    quorum-gated replication (which can't carry a single-replica version to
+    quorum). All k owners reach the **same** version + bytes (deterministic outer
+    step from the same base + grant), which is what lets a quorum read confirm it
+    and keeps a worker's staleness bounded. The grant stays single-use per server."""
     epoch, recs, owners = _cluster()
     topo = _cfg().build_topology()
     try:
         path = topo.path_from_index(0)
         keys = topo.path_module_keys(path)
-        coord_id = path_primary(keys, epoch)["peer_id"]
-        coord = owners[coord_id]
+        coord = owners[path_primary(keys, epoch)["peer_id"]]
         link = _FakeLink(epoch, owners, caller="w")
         commit = coord._commit({"path": list(path), "generation": 0, "loss": 1.0,
                                 "base_versions": {k: coord._versions[k]
@@ -286,14 +291,19 @@ def test_push_lands_at_the_primary_and_co_owners_refuse():
         shared_payload = {k: [torch.ones_like(p) for p in owners[
             owners_for(k, epoch)[0]["peer_id"]].bank[k].parameters()]
             for k in routing if not is_private_key(k)}
-        # The push lands (the true primary of each key applied) -> nothing failed.
         failed = _push_all_owners(routing, grant, shared_payload, {}, link)
         assert failed == set()
-        # Each shared key's primary advanced past (0, 0); a backup did not.
+        # Every replica of each shared key advanced to the same version AND the
+        # same content-digest -- independent application converged, no laggard.
         for k in shared_payload:
-            ranked = owners_for(k, epoch)
-            assert owners[ranked[0]["peer_id"]]._versions[k] > (0, 0)
-            assert owners[ranked[-1]["peer_id"]]._versions[k] == (0, 0)
+            digs, vers = set(), set()
+            for o in owners_for(k, epoch):
+                ps = owners[o["peer_id"]]
+                assert ps._versions[k] > (0, 0)
+                vers.add(tuple(ps._versions[k]))
+                digs_ = ps._digests({"keys": [k]})["digests"][k]
+                digs.add(digs_[1])
+            assert len(vers) == 1 and len(digs) == 1   # all k agree (version + bytes)
         # The grant is single-use per server: a replay lands nowhere.
         assert _push_all_owners(routing, grant, shared_payload, {}, link) == set(shared_payload)
     finally:
