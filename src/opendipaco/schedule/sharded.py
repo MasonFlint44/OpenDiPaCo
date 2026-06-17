@@ -3181,6 +3181,22 @@ def _serve_decentralized(link, engine, worker, peer_id, corpus, directory_fn, *,
     backoff = poll_interval
     iters = 0
     cursor = 0  # rotates the scan origin so a multi-path worker serves all fairly
+
+    def _fresh_records():
+        """Verified directory records, falling back to the last set that named
+        owners when a fetch yields none. A tracker blip (or a not-yet-populated
+        directory) must not collapse the epoch -- deriving from an empty fetch
+        gives an owner-less epoch, so the worker would self-assign nothing AND the
+        push-retry below would route to no one (silently dropping the update). The
+        tracker is only a bootstrap seed (design D2); a brief outage is harmless,
+        a long one with churn is the systems/WAN frontier."""
+        nonlocal last_records
+        recs = _verified_peers(directory_fn())
+        if any(owner_eligible(r) for r in recs):
+            last_records = recs
+        elif last_records is not None:
+            recs = last_records
+        return recs
     while True:
         if stop_event is not None and stop_event.is_set():
             return True
@@ -3189,16 +3205,7 @@ def _serve_decentralized(link, engine, worker, peer_id, corpus, directory_fn, *,
         if max_iters is not None and iters >= max_iters:
             return False
         iters += 1
-        records = _verified_peers(directory_fn())
-        # A tracker blip (or a directory with no owners yet) must not collapse the
-        # epoch: deriving from an empty fetch yields an owner-less epoch and the
-        # worker self-assigns nothing. Keep the last directory that named owners
-        # alive instead -- the tracker is only a bootstrap seed (design D2). A brief
-        # outage is harmless (no churn); a long one is the systems/WAN frontier.
-        if any(owner_eligible(r) for r in records):
-            last_records = records
-        elif last_records is not None:
-            records = last_records
+        records = _fresh_records()
         epoch = derive_epoch(records, k=k, salt=salt, prev=epoch_prev)
         epoch_prev = epoch
         workers = _worker_directory_ids(records)
@@ -3243,9 +3250,9 @@ def _serve_decentralized(link, engine, worker, peer_id, corpus, directory_fn, *,
             # The epoch moved under this task: re-derive and retry the failed keys
             # once against the current owners (the grant is single-use per server,
             # so a fresh primary accepts it). A second miss drops the update -- the
-            # documented bounded-loss window, same as the central retry.
-            epoch2 = derive_epoch(_verified_peers(directory_fn()), k=k, salt=salt,
-                                  prev=epoch_prev)
+            # documented bounded-loss window, same as the central retry. Uses the
+            # cache-aware fetch so a tracker blip here doesn't route to no one.
+            epoch2 = derive_epoch(_fresh_records(), k=k, salt=salt, prev=epoch_prev)
             epoch_prev = epoch2
             retry = {kk: rr for kk, rr in
                      _decentralized_routing(topology, path, epoch2, link).items()

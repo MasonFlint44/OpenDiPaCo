@@ -313,7 +313,7 @@ def test_push_applies_at_all_k_owners_and_they_agree():
 # -- one full iteration end to end ---------------------------------------------
 
 
-def _run_iters(epoch, recs, owners, n_iters, *, max_tasks=None, directory_fn=None):
+def _run_iters(epoch, recs, owners, n_iters, *, max_tasks=None):
     cfg = _cfg()
     topo = cfg.build_topology()
     engine = _build_worker_engine(cfg, _diloco(), "cpu", 0)
@@ -324,8 +324,7 @@ def _run_iters(epoch, recs, owners, n_iters, *, max_tasks=None, directory_fn=Non
     directory = list(recs) + [_worker_rec(wident)]
     state = {"done": 0}
     clean = _serve_decentralized(
-        link, engine, worker, wident.peer_id, _corpus(cfg),
-        directory_fn or (lambda: directory),
+        link, engine, worker, wident.peer_id, _corpus(cfg), lambda: directory,
         k=3, salt="", read_quorum=2, lease_ttl=LEASE_TTL, batch_size=8,
         total_rounds=n_iters, max_tasks=max_tasks, poll_interval=0.0, state=state,
         warm=set(), max_iters=n_iters)
