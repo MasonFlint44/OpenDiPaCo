@@ -19,6 +19,7 @@ import torch
 from .config import dipaco_config
 from .manifest import manifest_fingerprint, manifest_to_config, verify_manifest
 from .roles import run_worker_role
+from ..schedule import PeerIdentity
 from ..schedule.throttle import TokenBucket, rate_from_mbps
 from ..schedule.tracker import tracker_rpc
 
@@ -42,12 +43,25 @@ def resolve_device(config, *, requested=None, batch_size: int, seq_len: int):
     the W3 fit levers in order (autocast -> activation checkpoint -> chunked
     logits) before falling back to CPU. ``requested="cuda"`` forced past a
     shortfall raises rather than silently downgrading."""
+    def _mps_available():
+        return (getattr(torch.backends, "mps", None) is not None
+                and torch.backends.mps.is_available())
+
     forced = requested not in (None, "auto")
     if forced:
         dev = requested
+        # A forced accelerator that isn't present must fail early + clearly, not
+        # be accepted and blow up mid-training (the fit-check below only runs when
+        # the device is actually available, so it would otherwise slip through).
+        if dev.startswith("cuda") and not torch.cuda.is_available():
+            raise SystemExit("--device cuda requested but no CUDA device is available "
+                             "(use --device cpu, or drop --device to autodetect)")
+        if dev.startswith("mps") and not _mps_available():
+            raise SystemExit("--device mps requested but MPS is unavailable "
+                             "(use --device cpu, or drop --device to autodetect)")
     elif torch.cuda.is_available():
         dev = "cuda"
-    elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+    elif _mps_available():
         dev = "mps"
     else:
         dev = "cpu"
@@ -182,7 +196,12 @@ def run_join(*, scheduler=None, tracker=None, auth_key=None, identity_key=None,
     if (scheduler is None) == (tracker is None):
         raise SystemExit("join needs exactly one of --scheduler / --tracker")
     source = scheduler or tracker
-    manifest = fetch_manifest(source, auth_key=auth_key, tls=tls)
+    # The fetch must present the SAME credential the worker will use to train:
+    # in per-peer-auth deployments (admitted_peers, no shared auth_key) the server
+    # only honors the Ed25519 identity, so a fetch sending the (absent) HMAC key
+    # would be rejected before the worker ever reaches the training loop.
+    cred = PeerIdentity.load(identity_key) if identity_key else auth_key
+    manifest = fetch_manifest(source, auth_key=cred, tls=tls)
     if not verify_manifest(manifest, server_pub=server_pub):
         raise SystemExit("manifest verification failed (bad signature, or --server-pub mismatch)")
     fp = manifest_fingerprint(manifest)

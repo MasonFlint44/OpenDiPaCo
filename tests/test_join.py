@@ -129,6 +129,18 @@ def test_resolve_device_autodetect_falls_to_cpu_without_gpu():
     assert dev == "cpu"
 
 
+def test_forced_unavailable_accelerator_errors_early():
+    import torch
+    cfg = dipaco_config(_cfg().model)
+    if not torch.cuda.is_available():
+        with pytest.raises(SystemExit, match="cuda"):
+            resolve_device(cfg, requested="cuda", batch_size=8, seq_len=16)
+    mps = getattr(torch.backends, "mps", None)
+    if mps is None or not mps.is_available():
+        with pytest.raises(SystemExit, match="mps"):
+            resolve_device(cfg, requested="mps", batch_size=8, seq_len=16)
+
+
 # -- the manifest RPC, served by a real scheduler ------------------------------
 
 
@@ -145,6 +157,30 @@ def _start_sharded(cfg):
                       batch_size=8, host="127.0.0.1", port=0, auth_key="shh")
     sched.start()
     return sched, pss
+
+
+def test_manifest_fetch_authenticates_with_identity():
+    """Per-peer-auth deployment (admitted_peers, no shared auth_key): the manifest
+    fetch must present the worker's Ed25519 identity, not the (absent) HMAC key --
+    otherwise an identity-auth volunteer can never even fetch the manifest."""
+    cfg = _cfg()
+    model, diloco = dipaco_config(cfg.model), diloco_config(cfg.diloco)
+    corpus = build_corpus(cfg, model, build_documents(cfg))
+    worker_id, sched_id = PeerIdentity.generate(), PeerIdentity.generate()
+    sched = Scheduler(model, corpus, [("127.0.0.1", 1)], diloco, batch_size=8,
+                      host="127.0.0.1", port=0, identity=sched_id,
+                      admitted_peers=[worker_id])           # identity-gated, no auth_key
+    sched.start()
+    try:
+        sched.serve_manifest(build_manifest(cfg, identity=sched_id))
+        # The admitted identity fetches successfully...
+        m = fetch_manifest(("127.0.0.1", sched.port), auth_key=worker_id)
+        assert verify_manifest(m, server_pub=sched_id.public_key_hex)
+        # ...while the HMAC/None credential (what join sent before the fix) is refused.
+        with pytest.raises((OSError, SystemExit)):
+            fetch_manifest(("127.0.0.1", sched.port), auth_key=None)
+    finally:
+        sched.shutdown()
 
 
 def test_manifest_rpc_roundtrips_through_the_scheduler():
