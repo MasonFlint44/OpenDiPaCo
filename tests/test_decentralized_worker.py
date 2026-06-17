@@ -313,7 +313,7 @@ def test_push_applies_at_all_k_owners_and_they_agree():
 # -- one full iteration end to end ---------------------------------------------
 
 
-def _run_iters(epoch, recs, owners, n_iters, *, max_tasks=None):
+def _run_iters(epoch, recs, owners, n_iters, *, max_tasks=None, directory_fn=None):
     cfg = _cfg()
     topo = cfg.build_topology()
     engine = _build_worker_engine(cfg, _diloco(), "cpu", 0)
@@ -324,11 +324,44 @@ def _run_iters(epoch, recs, owners, n_iters, *, max_tasks=None):
     directory = list(recs) + [_worker_rec(wident)]
     state = {"done": 0}
     clean = _serve_decentralized(
-        link, engine, worker, wident.peer_id, _corpus(cfg), lambda: directory,
+        link, engine, worker, wident.peer_id, _corpus(cfg),
+        directory_fn or (lambda: directory),
         k=3, salt="", read_quorum=2, lease_ttl=LEASE_TTL, batch_size=8,
         total_rounds=n_iters, max_tasks=max_tasks, poll_interval=0.0, state=state,
         warm=set(), max_iters=n_iters)
     return state, clean, topo
+
+
+def test_tracker_blip_keeps_the_last_directory_alive():
+    """A tracker that goes silent (directory_fn -> []) must not collapse the epoch:
+    the worker keeps the last directory that named owners and keeps self-assigning
+    (the tracker is only a bootstrap seed -- design D2)."""
+    epoch, recs, owners = _cluster()
+    calls = {"n": 0}
+    wident = PeerIdentity.generate()
+    full = list(recs) + [_worker_rec(wident)]   # owners + this worker, for is_assignee
+
+    def directory_fn():
+        calls["n"] += 1
+        return full if calls["n"] == 1 else []   # one good fetch, then the tracker is silent
+
+    cfg = _cfg()
+    engine = _build_worker_engine(cfg, _diloco(), "cpu", 0)
+    worker = AsyncScheduler(engine, num_workers=1)
+    worker.seed = 0
+    link = _FakeLink(epoch, owners, caller=wident.peer_id)
+    state = {"done": 0}
+    try:
+        _serve_decentralized(
+            link, engine, worker, wident.peer_id, _corpus(cfg), directory_fn,
+            k=3, salt="", read_quorum=2, lease_ttl=LEASE_TTL, batch_size=8,
+            total_rounds=4, max_tasks=None, poll_interval=0.0, state=state,
+            warm=set(), max_iters=4)
+        # Without the cache, iters 2-4 would derive an owner-less epoch and stall at
+        # done==1; with it, the worker keeps training on the last good view.
+        assert state["done"] == 4
+    finally:
+        _shutdown(owners)
 
 
 def test_one_iteration_commits_and_advances_the_generation():

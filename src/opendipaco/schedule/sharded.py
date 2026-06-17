@@ -75,6 +75,7 @@ from .ownership import (
     epoch_newer,
     make_epoch_record,
     owner_addr,
+    owner_eligible,
     owners_for,
     verify_epoch_record,
 )
@@ -3176,6 +3177,7 @@ def _serve_decentralized(link, engine, worker, peer_id, corpus, directory_fn, *,
     engine.total_rounds = total_rounds
     n_paths = len(list(topology.paths()))
     epoch_prev = None
+    last_records = None  # last directory that named owners: kept alive across a tracker blip
     backoff = poll_interval
     iters = 0
     cursor = 0  # rotates the scan origin so a multi-path worker serves all fairly
@@ -3188,6 +3190,15 @@ def _serve_decentralized(link, engine, worker, peer_id, corpus, directory_fn, *,
             return False
         iters += 1
         records = _verified_peers(directory_fn())
+        # A tracker blip (or a directory with no owners yet) must not collapse the
+        # epoch: deriving from an empty fetch yields an owner-less epoch and the
+        # worker self-assigns nothing. Keep the last directory that named owners
+        # alive instead -- the tracker is only a bootstrap seed (design D2). A brief
+        # outage is harmless (no churn); a long one is the systems/WAN frontier.
+        if any(owner_eligible(r) for r in records):
+            last_records = records
+        elif last_records is not None:
+            records = last_records
         epoch = derive_epoch(records, k=k, salt=salt, prev=epoch_prev)
         epoch_prev = epoch
         workers = _worker_directory_ids(records)

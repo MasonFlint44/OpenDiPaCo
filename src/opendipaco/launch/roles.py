@@ -554,7 +554,7 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
         run_decentralized_worker(
             model, diloco, tuple(cfg.tracker_connect_addr()), corpus,
             identity=_node_identity(cfg, generate=True), device=cfg.run.device,
-            seed=cfg.run.seed, auth_key=cfg.transport.auth_key, k=own.k, salt=own.salt,
+            seed=cfg.run.seed, auth_key=_worker_auth(cfg), k=own.k, salt=own.salt,
             read_quorum=cfg.schedule.read_quorum, lease_ttl=cfg.schedule.lease_ttl,
             batch_size=cfg.run.batch_size, total_rounds=cfg.run.generations,
             max_tasks=mt, heartbeat_interval=own.heartbeat_interval,
