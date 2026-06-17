@@ -19,6 +19,9 @@ def test_tailor_encoding_ladder():
     assert tailor_encoding(8, base_compress="none", base_density=1.0) == ("int8", 1.0)
     # Tight budget -> int4 + sparser top-k.
     assert tailor_encoding(2, base_compress="none", base_density=1.0) == ("int4", 0.5)
+    # Non-finite budget is ignored (base), mirroring rate_from_mbps -- not a tier.
+    assert tailor_encoding(float("nan"), base_compress="none", base_density=1.0) == ("none", 1.0)
+    assert tailor_encoding(float("inf"), base_compress="none", base_density=1.0) == ("none", 1.0)
 
 
 def test_tailor_encoding_never_lighter_than_base():

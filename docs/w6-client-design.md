@@ -101,7 +101,23 @@ a VRAM budget by hand.
   compression capability to the `capabilities` it already sends; the scheduler
   tailors *that worker's* task `compress`/`down`/`up_density` to fit, so less
   data hits the throttle. Server-side per-worker tailoring is the one server
-  change; it defaults off and is a no-op when unset.
+  change; it defaults off and is a no-op when unset. **As built it tailors the
+  uplink only** (`compress`/`up_density`) — `down` (delta) needs the owner
+  keyframe ring and can't be toggled per worker.
+
+  **Unvalidated §0f dynamics (why it's opt-in, stated plainly).** Tailoring makes
+  a shared module's lossy encoding depend on *which* worker fed it, two effects
+  no test yet covers: (1) workers push differently-quantized/sparsified
+  pseudo-gradients to the same owner — mixed lossy levers per path, like the W2
+  arms but *heterogeneous*; (2) the W2b error-feedback residual is **per-worker,
+  per-path**, so when a path fails over from a capped (sparse) worker to an
+  uncapped (dense) one, the capped worker's accumulated dropped-mass is **dropped,
+  not compensated** — a small *biased* (worker-correlated, not zero-mean) error on
+  shared modules. The audit still holds (the digest is the raw pre-compression
+  delta), but *what lands in the bank* differs per worker. This rides the §0f run;
+  the de-risking step is a `validate_dynamics` **het-compress** arm (half the
+  workers tailored), analogous to the het-batch arm — owed, not yet built. Hence
+  off by default.
 
 ### D5. Sleep / resume (laptop reality)
 

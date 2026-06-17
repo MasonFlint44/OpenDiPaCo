@@ -71,6 +71,21 @@ def test_tailors_a_budget_constrained_worker_when_on():
         sched.shutdown()
 
 
+def test_bad_advertised_budget_does_not_crash_and_falls_back():
+    cfg = _cfg()
+    sched = _serving(cfg, tailor_bandwidth=True)
+    try:
+        # A hostile/old worker sends a non-numeric or non-finite budget: the lease
+        # handler must not raise, and the task gets the global encoding. (<=3
+        # distinct leases so we don't exhaust the 4-path budget into idle.)
+        for bad in ("fast", float("nan"), None):
+            t = _task(sched, f"w-{bad}", {"max_mbps": bad})
+            assert t["type"] == "task"
+            assert t["compress"] == "none" and t["density"] == 1.0
+    finally:
+        sched.shutdown()
+
+
 def test_tailoring_never_undercuts_the_global_compress():
     cfg = _cfg()
     sched = _serving(cfg, compress="int4", tailor_bandwidth=True)

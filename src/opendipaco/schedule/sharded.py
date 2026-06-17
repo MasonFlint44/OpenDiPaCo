@@ -2104,8 +2104,14 @@ class Scheduler(_ReactorServer):
         # the owner keyframe ring). The shard cast is mode-agnostic + lossless, so
         # the audit's raw-delta digest is unaffected by a per-worker compress.
         comp, dens = self.compress, self.up_density
-        if self.tailor_bandwidth and caps.get("max_mbps") is not None:
-            comp, dens = tailor_encoding(caps["max_mbps"], base_compress=self.compress,
+        # Skip checks (their stamped encoding is inert -- the check path never
+        # pushes; tailoring it would only mislead) and validate the worker-supplied
+        # budget is a real number before comparing it (a hostile/old worker could
+        # send a non-numeric caps value -- don't crash the lease handler).
+        mbps = caps.get("max_mbps")
+        if (self.tailor_bandwidth and not check_only
+                and isinstance(mbps, (int, float)) and not isinstance(mbps, bool)):
+            comp, dens = tailor_encoding(mbps, base_compress=self.compress,
                                          base_density=self.up_density)
         task = {
             "type": "task",

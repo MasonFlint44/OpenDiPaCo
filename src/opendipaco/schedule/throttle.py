@@ -31,16 +31,18 @@ def tailor_encoding(max_mbps: float | None, *, base_compress: str = "none",
     shard (lossless int32 cast) and the redundant-execution digest (taken on the
     raw delta, pre-compression) are unaffected. ``down`` is left at the global:
     delta-down needs the owner's keyframe ring, so it can't be turned on per
-    worker. ``max_mbps=None`` (no advertised cap) returns the base unchanged."""
-    if max_mbps is None or max_mbps >= hi:
+    worker. ``max_mbps`` ``None`` / non-finite (NaN/inf) returns the base
+    unchanged -- mirrors ``rate_from_mbps`` so a bad advertised budget can't pick
+    a tier (or crash) instead of being ignored."""
+    if max_mbps is None or not math.isfinite(max_mbps) or max_mbps >= hi:
         comp, dens = base_compress, base_density
     elif max_mbps >= lo:
         comp, dens = "int8", base_density
-    else:
+    else:  # tight budget (a degenerate <=0 lands here too: heaviest tier)
         comp, dens = "int4", min(base_density, 0.5)
     if _COMPRESS_RANK.get(base_compress, 0) > _COMPRESS_RANK.get(comp, 0):
         comp = base_compress                       # don't undercut the operator's base
-    return comp, min(dens, base_density)
+    return comp, dens                              # dens already clamped <= base_density
 
 
 def rate_from_mbps(max_mbps: float | None) -> float | None:
