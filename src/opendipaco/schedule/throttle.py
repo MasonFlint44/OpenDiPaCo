@@ -11,13 +11,16 @@ bytes for the health line. ``None`` bucket = no throttle, byte-identical to befo
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 
 
 def rate_from_mbps(max_mbps: float | None) -> float | None:
-    """Megabits/sec -> bytes/sec, or ``None`` for "no cap"."""
-    if max_mbps is None or max_mbps <= 0:
+    """Megabits/sec -> bytes/sec, or ``None`` for "no cap". A non-positive or
+    non-finite value (NaN/inf, e.g. ``--max-mbps nan``) is treated as no cap
+    rather than silently producing a NaN rate that disables the throttle."""
+    if max_mbps is None or not math.isfinite(max_mbps) or max_mbps <= 0:
         return None
     return max_mbps * 1e6 / 8.0
 
@@ -34,7 +37,11 @@ class TokenBucket:
         self._tokens = self.capacity
         self._ts = time.monotonic()
         self._lock = threading.Lock()
-        self.sent_bytes = 0   # cumulative, for the health surface (GIL-atomic increments)
+        # Cumulative byte tallies for the health surface only. Updated with `+=`
+        # from multiple worker threads without a lock: a rare lost update just
+        # makes the displayed total drift slightly -- it never affects throttling
+        # (take() is locked) and never crashes.
+        self.sent_bytes = 0
         self.recv_bytes = 0
 
     def take(self, n: int) -> None:

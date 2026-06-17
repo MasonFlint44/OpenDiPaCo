@@ -12,6 +12,7 @@ a minimal file (even ``{}``) is valid and you only override what you need.
 """
 
 import dataclasses
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -385,6 +386,11 @@ class LaunchConfig:
         if not 0.0 < kw["transport"].up_density <= 1.0:
             raise ValueError("transport.up_density must be in (0, 1], got "
                              f"{kw['transport'].up_density!r}")
+        mbps = kw["transport"].max_mbps
+        if mbps is not None and not (isinstance(mbps, (int, float))
+                                     and math.isfinite(mbps) and mbps > 0):
+            raise ValueError("transport.max_mbps must be a positive number (megabits/sec) "
+                             f"or null for no cap, got {mbps!r}")
         if kw["transport"].up_density < 1.0 and kw["mode"] != "sharded":
             raise ValueError("transport.up_density < 1.0 requires mode: sharded "
                              "(it is stamped on sharded tasks)")

@@ -557,6 +557,10 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
         # single-coordinator path has no libp2p worker loop.
         if cfg.mode != "sharded":
             raise ValueError("transport.kind: libp2p is supported for sharded mode only")
+        if bucket is not None:
+            print("WARNING: --max-mbps / transport.max_mbps is NOT enforced on the libp2p "
+                  "transport yet (the cap throttles the TCP path only); your bandwidth is "
+                  "uncapped on this run.", flush=True)
         target = scheduler_addr or cfg.transport.connect_libp2p
         if not target:
             raise ValueError("libp2p worker needs transport.connect_libp2p (scheduler multiaddr)")
@@ -594,6 +598,10 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch,
             stop_event=stop_event or _wait_for_signal(), bucket=bucket)
     else:
+        if bucket is not None:
+            print("WARNING: transport.max_mbps is NOT enforced in coordinator mode (the "
+                  "single-node worker path is not throttle-wired); your bandwidth is "
+                  "uncapped. Use sharded/decentralized mode for the cap.", flush=True)
         host, port = addr or cfg.connect_addr()
         run_worker(
             model, diloco, host, port, device=cfg.run.device, seed=cfg.run.seed,

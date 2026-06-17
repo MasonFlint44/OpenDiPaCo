@@ -56,6 +56,24 @@ def test_build_manifest_strips_secrets_keeps_public():
     assert m["config"]["data"]["cache_path"] is None
 
 
+def test_manifest_strips_max_mbps():
+    # max_mbps is the volunteer's own --max-mbps, not a run property; carrying the
+    # operator's value would silently cap joiners.
+    m = build_manifest(_cfg(transport={"host": "127.0.0.1", "port": 0, "auth_key": "s",
+                                        "max_mbps": 5.0}))
+    assert m["config"]["transport"]["max_mbps"] is None
+
+
+def test_config_rejects_bad_max_mbps():
+    base = {"mode": "sharded",
+            "sharded": {"num_shards": 2, "parameter_servers": [["127.0.0.1", 1], ["127.0.0.1", 2]]}}
+    for bad in (0, -5, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="max_mbps"):
+            LaunchConfig.from_dict({**base, "transport": {"max_mbps": bad}})
+    ok = LaunchConfig.from_dict({**base, "transport": {"max_mbps": 5.0}})
+    assert ok.transport.max_mbps == 5.0
+
+
 def test_verify_manifest_signed_unsigned_and_pinned():
     cfg = _cfg()
     idn = PeerIdentity.generate()

@@ -14,6 +14,11 @@ def test_rate_from_mbps():
     assert rate_from_mbps(8) == 1e6          # 8 Mbit/s = 1 MB/s
     assert rate_from_mbps(None) is None
     assert rate_from_mbps(0) is None
+    assert rate_from_mbps(-5) is None
+    # Non-finite (e.g. `--max-mbps nan`/inf) must not yield a NaN rate that
+    # silently disables the throttle -- treated as no cap.
+    assert rate_from_mbps(float("nan")) is None
+    assert rate_from_mbps(float("inf")) is None
 
 
 def test_token_bucket_enforces_rate():

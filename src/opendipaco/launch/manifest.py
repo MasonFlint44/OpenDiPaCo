@@ -44,8 +44,11 @@ MANIFEST_KIND = "run_manifest"
 # ``torch.save``/cache at an attacker-chosen path (a write sink). The joiner
 # supplies its own cache via ``--data-dir``.
 _STRIP = {
+    # Credentials + a volunteer-local resource knob (max_mbps is the joiner's own
+    # `--max-mbps`, not a run property -- carrying the operator's value would
+    # silently cap volunteers).
     "transport": ("auth_key", "grant_key", "identity_key", "accept_keys",
-                  "admitted_peers"),
+                  "admitted_peers", "max_mbps"),
     "tls": ("certfile", "keyfile", "cafile"),
     "data": ("cache_path", "shard_cache_dir"),
 }

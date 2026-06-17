@@ -2583,15 +2583,24 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
     backoff = 0.05
     while True:
         try:
+            # The scheduler *control* socket is deliberately NOT throttled: a
+            # throttle sleep there runs while the link lock is held (sch_rpc/
+            # sch_send serialize on it), which would starve the heartbeat thread
+            # under a low cap -- the shared token debt from a big PS fetch makes
+            # even a tiny control send sleep, and a missed heartbeat loses the
+            # lease + fences committed work. Control traffic is tiny; the cap
+            # covers the bulk fetch/push on the PS sockets below. (In bytes-mode
+            # data shipping the shard also rides this socket and is thus uncapped;
+            # use data.ship: spec for a fully-capped run.)
             sch = _ps_connect(tuple(scheduler_addr), auth_key, max_msg_bytes,
                               connect_timeout if first else reconnect_timeout,
-                              tls=tls, server_hostname=tls_hostname or scheduler_addr[0],
-                              bucket=bucket)
+                              tls=tls, server_hostname=tls_hostname or scheduler_addr[0])
         except ConnectionError:
             return  # scheduler unreachable
         first = False
         # One link per scheduler connection: it owns the PS connection cache, so
-        # a reconnect naturally drops stale PS sockets (fresh link next loop).
+        # a reconnect naturally drops stale PS sockets (fresh link next loop). The
+        # bucket throttles the PS (fetch/push) sockets -- the bulk of the traffic.
         link = _WorkerLink(sch, auth_key=auth_key, max_msg_bytes=max_msg_bytes,
                            connect_timeout=connect_timeout, tls=tls, bucket=bucket)
         clean = False
