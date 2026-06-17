@@ -81,7 +81,7 @@ from .ownership import (
 )
 from .reactor import DEFAULT_MAX_MSG_BYTES, _ReactorServer
 from .scheduler import AsyncScheduler
-from .throttle import throttled
+from .throttle import tailor_encoding, throttled
 from .wire import _key_bytes, client_handshake, recv_msg, send_msg
 
 
@@ -1725,7 +1725,8 @@ class Scheduler(_ReactorServer):
                  reputation=None, rate_limiter=None, min_owner_reputation=0.25,
                  redundancy=3, redundancy_rate=0.0, audit_timeout=60.0,
                  private_policy="overwrite", down="full", up_density=1.0,
-                 task_seconds=None, park_factor=3.0, min_task_rate=None, **reactor_kw):
+                 task_seconds=None, park_factor=3.0, min_task_rate=None,
+                 tailor_bandwidth=False, **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         # W5b: target wall-time per task. None (default) -> no sizing, every task
         # is the configured (batch_size, inner_steps) -> byte-identical anchor.
@@ -1786,6 +1787,12 @@ class Scheduler(_ReactorServer):
         if not 0.0 < up_density <= 1.0:
             raise ValueError(f"up_density must be in (0, 1], got {up_density!r}")
         self.up_density = float(up_density)
+        # W6c: when True, a worker that advertises a max_mbps budget gets a lighter
+        # per-task UPLINK encoding (compress/up_density) from tailor_encoding, never
+        # lighter than the base. Off (default) -> every task uses the global
+        # encoding -> byte-identical. It mixes lossy uplink levers across a path's
+        # workers, a §0f dynamics property like the W2 levers, so it is opt-in.
+        self.tailor_bandwidth = bool(tailor_bandwidth)
         self.idle_backoff = idle_backoff      # server-paced idle polling (retry_in)
         self._worker_caps: dict = {}          # worker_id -> advertised capabilities
         self.config = config
@@ -2091,16 +2098,25 @@ class Scheduler(_ReactorServer):
                               "spec": self.corpus.spec}
             else:
                 shard = self.corpus.shard(self.topology.path_index(path))
+        # W6c: tailor THIS worker's uplink encoding to its advertised budget (never
+        # lighter than the global). Off / no budget advertised -> the global
+        # (compress, up_density) -> byte-identical. down stays global (delta needs
+        # the owner keyframe ring). The shard cast is mode-agnostic + lossless, so
+        # the audit's raw-delta digest is unaffected by a per-worker compress.
+        comp, dens = self.compress, self.up_density
+        if self.tailor_bandwidth and caps.get("max_mbps") is not None:
+            comp, dens = tailor_encoding(caps["max_mbps"], base_compress=self.compress,
+                                         base_density=self.up_density)
         task = {
             "type": "task",
             "gen_id": generation,
             "lease": lease,
             "path": path,
             "routing": routing,
-            "compress": self.compress,  # uplink encoding the worker should use
-            "density": self.up_density,  # uplink top-k sparsification (W2b); 1.0 = dense
+            "compress": comp,           # uplink encoding the worker should use
+            "density": dens,            # uplink top-k sparsification (W2b); 1.0 = dense
             "down": self.down,          # downlink policy: keep keyframes for deltas (W2a)
-            "shard": compress_shard(shard, self.compress),
+            "shard": compress_shard(shard, comp),
             "shard_spec": shard_spec,
             "batch_size": batch,
             "total_rounds": self.total_rounds,
@@ -2544,6 +2560,11 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
     caps = {"device": str(device)}
     if max_batch_size is not None:
         caps["max_batch"] = int(max_batch_size)
+    if bucket is not None:
+        # W6c: advertise the bandwidth budget so a tailoring scheduler can pick a
+        # lighter per-task uplink encoding for this worker (no-op unless the
+        # scheduler opts in; the worker decodes whatever the task stamps).
+        caps["max_mbps"] = bucket.rate * 8 / 1e6
     state = {"done": 0}
 
     if transport == "libp2p":

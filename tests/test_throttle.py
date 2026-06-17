@@ -6,8 +6,28 @@ from opendipaco.schedule.throttle import (
     ThrottledSocket,
     TokenBucket,
     rate_from_mbps,
+    tailor_encoding,
     throttled,
 )
+
+
+def test_tailor_encoding_ladder():
+    # Ample / no budget -> base, unchanged.
+    assert tailor_encoding(None, base_compress="none", base_density=1.0) == ("none", 1.0)
+    assert tailor_encoding(50, base_compress="none", base_density=1.0) == ("none", 1.0)
+    # Moderate budget -> int8, dense.
+    assert tailor_encoding(8, base_compress="none", base_density=1.0) == ("int8", 1.0)
+    # Tight budget -> int4 + sparser top-k.
+    assert tailor_encoding(2, base_compress="none", base_density=1.0) == ("int4", 0.5)
+
+
+def test_tailor_encoding_never_lighter_than_base():
+    # An int4 run stays int4 even at an ample budget (don't undercut the operator).
+    assert tailor_encoding(100, base_compress="int4", base_density=1.0)[0] == "int4"
+    # A run already sparser than the tier keeps the tighter density.
+    assert tailor_encoding(2, base_compress="none", base_density=0.25)[1] == 0.25
+    # int8 base + tight budget escalates to int4.
+    assert tailor_encoding(2, base_compress="int8", base_density=1.0)[0] == "int4"
 
 
 def test_rate_from_mbps():

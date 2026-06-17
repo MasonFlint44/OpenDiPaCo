@@ -1,6 +1,18 @@
 # W6 — a consumer client (volunteer-grade `join`)
 
-Status: **design.** The `opendipaco` CLI drives every role, but there is no
+Status: **landed (a, b, c ✅).** All three slices are built and tested. Notable
+deltas from this design, found while building: the bandwidth cap throttles the
+worker's **PS sockets only** — the scheduler *control* socket is exempt so a
+throttle sleep can't starve the heartbeat under the link lock (a low cap would
+otherwise lose the lease), and bytes-mode shard download then rides that
+unthrottled socket (use `data.ship: spec` for a fully-capped run); per-worker
+tailoring adjusts the **uplink** (`compress`/`up_density`) only, not `down`
+(delta-down needs the owner keyframe ring). libp2p/coordinator paths warn that
+the cap isn't enforced rather than silently ignore it. Manifest trust is TOFU by
+default (channel-dependent) with `--server-pub` pinning; operator-local paths and
+the volunteer's own `max_mbps` are stripped.
+
+Original design follows. The `opendipaco` CLI drives every role, but there is no
 volunteer-grade client: today "consumer hardware" means "people who can write a
 YAML config, know the model architecture, and open a port"
 (`docs/viability-roadmap.md` W6). This adds a one-command **`opendipaco join`**

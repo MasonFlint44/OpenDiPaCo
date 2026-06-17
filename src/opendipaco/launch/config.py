@@ -162,6 +162,11 @@ class TransportCfg:
     # aggregate across its sockets). None = no cap. A volunteer-side knob; servers
     # ignore it. Mainly set via `opendipaco join --max-mbps`.
     max_mbps: float | None = None
+    # W6c: scheduler-side. When True, a worker that advertises a max_mbps budget
+    # gets a lighter per-task UPLINK encoding (compress/up_density), never lighter
+    # than the base. Off (default) = byte-identical. Mixes lossy levers per path
+    # (§0f dynamics), so opt-in. Central sharded scheduler only.
+    tailor_bandwidth: bool = False
     # When set, idle replies tell workers to wait this many seconds before
     # polling again (server-paced; otherwise workers use their own tight poll).
     idle_backoff: float | None = None
@@ -391,6 +396,13 @@ class LaunchConfig:
                                      and math.isfinite(mbps) and mbps > 0):
             raise ValueError("transport.max_mbps must be a positive number (megabits/sec) "
                              f"or null for no cap, got {mbps!r}")
+        # Per-worker uplink tailoring is a central-scheduler lease feature (it
+        # stamps the task encoding); inert without a central sharded scheduler, so
+        # fail fast rather than silently do nothing (as down/up_density/task_seconds).
+        if kw["transport"].tailor_bandwidth and not (
+                kw["mode"] == "sharded" and kw["schedule"].mode == "central"):
+            raise ValueError("transport.tailor_bandwidth requires mode: sharded with "
+                             "schedule.mode: central (it is a central-scheduler feature)")
         if kw["transport"].up_density < 1.0 and kw["mode"] != "sharded":
             raise ValueError("transport.up_density < 1.0 requires mode: sharded "
                              "(it is stamped on sharded tasks)")

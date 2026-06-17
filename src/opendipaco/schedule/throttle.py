@@ -16,6 +16,33 @@ import threading
 import time
 
 
+# Uplink compression ordered by how much it shrinks the pseudo-gradient, so
+# tailoring is never *lighter* than the run's configured base.
+_COMPRESS_RANK = {"none": 0, "bf16": 1, "int8": 2, "int4": 3}
+
+
+def tailor_encoding(max_mbps: float | None, *, base_compress: str = "none",
+                    base_density: float = 1.0, hi: float = 20.0, lo: float = 5.0):
+    """Per-worker uplink ``(compress, up_density)`` for a worker advertising a
+    ``max_mbps`` budget (W6c, design D4b). Monotone in the budget and **never
+    lighter than the run's base**: a worker with an ample (or no) budget gets the
+    base; a tighter one gets int8, then int4 + sparser top-k. Only the *uplink*
+    (pseudo-gradient) is tailored -- it's owner-decodable regardless -- so the
+    shard (lossless int32 cast) and the redundant-execution digest (taken on the
+    raw delta, pre-compression) are unaffected. ``down`` is left at the global:
+    delta-down needs the owner's keyframe ring, so it can't be turned on per
+    worker. ``max_mbps=None`` (no advertised cap) returns the base unchanged."""
+    if max_mbps is None or max_mbps >= hi:
+        comp, dens = base_compress, base_density
+    elif max_mbps >= lo:
+        comp, dens = "int8", base_density
+    else:
+        comp, dens = "int4", min(base_density, 0.5)
+    if _COMPRESS_RANK.get(base_compress, 0) > _COMPRESS_RANK.get(comp, 0):
+        comp = base_compress                       # don't undercut the operator's base
+    return comp, min(dens, base_density)
+
+
 def rate_from_mbps(max_mbps: float | None) -> float | None:
     """Megabits/sec -> bytes/sec, or ``None`` for "no cap". A non-positive or
     non-finite value (NaN/inf, e.g. ``--max-mbps nan``) is treated as no cap
