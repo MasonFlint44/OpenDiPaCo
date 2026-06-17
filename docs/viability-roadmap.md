@@ -50,17 +50,25 @@ robust-agg deltas **converge comparably to the anchor** (within ~1× — they
 track, sometimes beat it), and the harness self-reports `INCONCLUSIVE` rather
 than a vacuous pass when the anchor itself doesn't train at the chosen scale.
 This **de-risks the dynamics deltas** that the DiPaCo paper (synchronous) does
-not cover. *Still owed:* the same comparison at real scale, and the one delta
-this harness can't reach — Phase 4's decentralized **push-to-all-`k`** write
-path, which needs the worker loop below.
+not cover. The harness now also includes a **decentralized arm** (Phase 4's
+scheduler-less **push-to-all-`k`** write path: self-assign + quorum reads +
+owner-minted grants + independent per-owner application), driven by the
+now-landed worker loop below — it converges to ~0.98× the anchor for a **single
+writer** on one box. *Still owed (the systems half, below):* the same comparison
+at real scale, and specifically **multi-writer** convergence on a shared module
+(concurrent pushes interleave per-owner and the SGD+Nesterov step is
+order-dependent → needs order-free, generation-keyed aggregation), epoch-skew
+version stamping, and partial-push repair under churn.
 
 ### 0f-systems · *does it work over real consumer links?* · B0 · [research + eng]
 
 The half that genuinely needs **distributed hardware**: a real WAN run (e.g.
 three homes + a VPS) measuring convergence and behavior under real latency, NAT,
 asymmetric bandwidth, and real churn — and exercising the **decentralized worker
-loop** (self-assign → quorum-read bases → commit → **push to all `k` owners**,
-plus a single-process `run_local` for it; today it refuses decentralized mode).
+loop** (self-assign → quorum-read bases → commit → **push to all `k` owners**).
+The loop and a single-process `run_local` for it are **landed** (it trains on-box;
+`run_local` no longer refuses decentralized mode); only the at-scale convergence
+verdict and real-WAN behavior still need this hardware.
 Closing this also lands the three Phase 4 residuals in
 [phase4-design.md](phase4-design.md): convergent/Byzantine-robust **epoch
 numbering** across joins, **owner-side α shard-size weighting** (uniform today),
@@ -224,11 +232,13 @@ needs a reason to contribute. These are research-shaped, not just unbuilt.
 ## Sequencing
 
 ```
-   0f-dynamics ✅ on-box (validate_dynamics.py: deltas converge at toy scale)
+   0f-dynamics ✅ on-box (validate_dynamics.py: async/int8/robust + decentralized
+                          push-to-all-k deltas converge at toy scale)
         │
         ▼
         ┌──────────────────── 0f-systems: WAN verdict (deferred / assumed) ────────────┐
-        │  (decentralized worker loop + real multi-node run)  GATES EVERYTHING BELOW    │
+        │  (decentralized worker loop landed on-box; real multi-node run owed)          │
+        │  GATES EVERYTHING BELOW                                                        │
         └──────────────────────────────────────┬──────────────────────────────────────┘
                                                 ▼
                         ┌───────────────────────┴───────────────────────┐

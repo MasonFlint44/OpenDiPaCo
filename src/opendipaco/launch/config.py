@@ -397,6 +397,14 @@ class LaunchConfig:
             raise ValueError(
                 "schedule.mode: decentralized requires ownership.mode: rendezvous "
                 "(it builds on the replicated owner tier)")
+        # Decentralized reads confirm a key by cross-replica byte-digest agreement
+        # (quorum reads); lossy downlink compression breaks that (the fetched
+        # bytes never match the raw-fp32 digest), so reject it at load rather than
+        # let every worker silently stall (the owner also rejects it, defensively).
+        if kw["schedule"].mode == "decentralized" and kw["transport"].compress != "none":
+            raise ValueError(
+                "schedule.mode: decentralized requires transport.compress: none "
+                "(quorum reads need byte-exact agreement across replicas)")
         return cls(**kw)
 
     def connect_addr(self) -> tuple[str, int]:

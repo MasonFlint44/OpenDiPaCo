@@ -17,20 +17,25 @@ one-paragraph Phase 4 sketch in [internet-scale-plan.md](internet-scale-plan.md)
 §2. Decisions D1–D9 state the options and the chosen path; §4 slices it 4a–4d;
 §5 records the operator decisions.
 
-**The remaining 0f-gated piece (stated plainly).** What is *not* yet runnable in
-one process is the **decentralized worker loop** — self-assign → quorum-read
-bases → commit to the coordinator → **push to all `k` owners** — and therefore a
-single-process `run_local` for `schedule: decentralized` (it raises with a
-pointer to the validation script and per-role launch). This is deliberate and
-consistent with the 4c boundary: a backup defending against a Byzantine
-*primary* needs that push-to-all-`k` path so each owner recomputes rather than
-trusts the primary's bytes, and whether `k` independent aggregations converge
-comparably to one-primary replication is a **dynamics** property unit tests
-can't settle — it is a 0f WAN acceptance item, like Phase 3's convergence
-verdict. Everything the defense *is built on* (assignment, grants, fence,
-digests, quorum reads, divergence detection, eviction, deterministic epochs,
-gossip import) is landed and unit/integration-tested; the end-to-end runtime
-that ties them into a converging swarm is the final integration, owed to 0f.
+**The worker loop (now landed on-box).** The **decentralized worker loop** —
+self-assign → quorum-read bases → commit to the coordinator → **push to all `k`
+owners** — and a single-process `run_local` for `schedule: decentralized` are
+**built** (`run_decentralized_worker`/`_serve_decentralized`, `_run_local_decentralized`;
+design `docs/decentralized-worker-loop-design.md`), with a `validate_dynamics.py`
+arm that trains the scheduler-less write path vs. the synchronous anchor on one
+box. This was deliberate and consistent with the 4c boundary: a backup defending
+against a Byzantine *primary* needs that push-to-all-`k` path so each owner
+recomputes rather than trusts the primary's bytes. Everything the defense *is
+built on* (assignment, grants, fence, digests, quorum reads, divergence
+detection, eviction, deterministic epochs, gossip import) is landed and
+unit/integration-tested; the swarm converges on one box for a **single writer**
+(`validate_dynamics` decentralized arm, ~0.98× the anchor). What still rides the
+0f **WAN** run: **multi-writer** convergence on a shared module — concurrent
+pushes interleave per-owner and the outer step is order-dependent, so it needs
+order-free generation-keyed aggregation — plus epoch-skew version stamping and
+partial-push repair under real latency/NAT/bandwidth/churn (the **systems** half,
+like Phase 3's end-to-end verdict). See the *convergence scope* note in
+`docs/decentralized-worker-loop-design.md`.
 
 **4d amendments (discovered while building):**
 - *No per-owner `EpochManager` in decentralized mode — directory TTL provides

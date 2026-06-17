@@ -33,6 +33,7 @@ from .sharded import (
     assign_shards,
     grant_signed_by,
     make_grant,
+    run_decentralized_worker,
     run_sharded_worker,
     verify_grant,
 )
@@ -59,6 +60,7 @@ __all__ = [
     "Scheduler",
     "ParameterServer",
     "run_sharded_worker",
+    "run_decentralized_worker",
     "assign_shards",
     "make_grant",
     "verify_grant",
