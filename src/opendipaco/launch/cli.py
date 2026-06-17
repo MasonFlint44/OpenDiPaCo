@@ -7,6 +7,7 @@ Subcommands (each reads a cluster config; see ``init-config``):
     opendipaco scheduler   --config c.yaml          # sharded scheduler (no weights)
     opendipaco ps          --config c.yaml --shard-id N
     opendipaco worker      --config c.yaml [--max-tasks N]
+    opendipaco join        --scheduler HOST:PORT [--auth S]   # volunteer worker, no config file
     opendipaco ingest      --config c.yaml --shard-id N   # sharded resumable ingest
     opendipaco tracker     --config c.yaml           # rendezvous directory (Phase 1)
     opendipaco relay       --config c.yaml           # libp2p Circuit Relay v2 (NAT traversal)
@@ -71,6 +72,14 @@ def cmd_ps(args) -> int:
 
 def cmd_worker(args) -> int:
     run_worker_role(load_config(args.config), max_tasks=args.max_tasks)
+    return 0
+
+
+def cmd_join(args) -> int:
+    from .client import run_join
+    run_join(scheduler=args.scheduler, tracker=args.tracker, auth_key=args.auth,
+             identity_key=args.identity, device=args.device, max_tasks=args.max_tasks,
+             server_pub=args.server_pub, data_dir=args.data_dir, quiet=args.quiet)
     return 0
 
 
@@ -169,6 +178,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_w = with_config("worker", "run a worker")
     p_w.add_argument("--max-tasks", type=int, default=None)
     p_w.set_defaults(func=cmd_worker)
+
+    p_join = sub.add_parser("join", help="join a run as a volunteer worker (no config file)")
+    src = p_join.add_mutually_exclusive_group(required=True)
+    src.add_argument("--scheduler", help="scheduler host:port (sharded run)")
+    src.add_argument("--tracker", help="tracker host:port (decentralized run)")
+    p_join.add_argument("--auth", default=None, help="shared HMAC secret, if the run uses one")
+    p_join.add_argument("--identity", default=None, help="Ed25519 key PEM (per-peer auth runs)")
+    p_join.add_argument("--device", default=None, help="cuda/mps/cpu (default: autodetect)")
+    p_join.add_argument("--max-tasks", type=int, default=None)
+    p_join.add_argument("--server-pub", default=None,
+                        help="pin the manifest signer's pubkey (else trust-on-first-use)")
+    p_join.add_argument("--data-dir", default=None, help="cache dir for spec-materialized shards")
+    p_join.add_argument("--quiet", action="store_true", help="silence the health line")
+    p_join.set_defaults(func=cmd_join)
 
     p_in = with_config("ingest", "resumably ingest a data shard")
     p_in.add_argument("--shard-id", type=int, required=True)

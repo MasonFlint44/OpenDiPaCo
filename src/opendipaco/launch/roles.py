@@ -51,6 +51,7 @@ from ..schedule import (
 )
 from ..train import DiPaCoEngine
 from .config import LaunchConfig, dipaco_config, diloco_config
+from .manifest import build_manifest
 
 
 # -- shared builders ---------------------------------------------------------
@@ -408,6 +409,7 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None, identity=N
         min_task_rate=cfg.run.min_task_rate,
         **_scheduler_robustness_kw(cfg), **_server_kw(cfg, extra_admitted))
     scheduler.start()
+    scheduler.serve_manifest(build_manifest(cfg, identity=ident))  # W6: flags-only `join`
     lp = _serve_libp2p(scheduler, cfg, ident) if _libp2p_routes(cfg) else None
     if lp is not None:
         print(f"scheduler libp2p addrs: {lp.addrs}", flush=True)
@@ -897,6 +899,9 @@ def run_tracker(cfg: LaunchConfig, *, on_start=None, stop_event=None):
                       open_enrollment=t.open_enrollment,
                       enroll_peers=list(t.enroll_peers), **_server_kw(cfg))
     tracker.start()
+    # W6: serve the run manifest so a decentralized volunteer can `opendipaco join`
+    # with just this tracker's address (signed by the node identity when set).
+    tracker.serve_manifest(build_manifest(cfg, identity=_node_identity(cfg)))
     _attach_metrics(tracker, cfg)
     if on_start:
         on_start(tracker)

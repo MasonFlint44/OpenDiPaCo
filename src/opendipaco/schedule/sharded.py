@@ -1800,6 +1800,9 @@ class Scheduler(_ReactorServer):
         )
         self.heartbeat_timeout = heartbeat_timeout
         self.total_rounds = None
+        # Optional run manifest (W6): the operator's launch config minus secrets,
+        # served to flags-only `opendipaco join` clients via the `manifest` RPC.
+        self._run_manifest: dict | None = None
 
         # key -> (host, port) of the owning parameter server.
         self.ps_addrs = [_addr_key(a) for a in ps_addrs]
@@ -1843,7 +1846,13 @@ class Scheduler(_ReactorServer):
         if kind == "epoch":
             with self._lock:
                 return {"type": "epoch", "record": self._epoch_record}
+        if kind == "manifest":   # W6: serve the run manifest to a joining worker
+            return {"type": "manifest", "manifest": self._run_manifest}
         return None
+
+    def serve_manifest(self, manifest: dict | None) -> None:
+        """Publish the run manifest this scheduler serves to joining workers (W6)."""
+        self._run_manifest = manifest
 
     def publish_epoch(self, owner_records, *, k=3, salt="", bootstrap=None) -> dict:
         """Build, sign, and serve the next owner-set epoch.

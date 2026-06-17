@@ -107,6 +107,14 @@ class Tracker(_ReactorServer):
         # or any enrolled peer could race to pin its own "epochs").
         self._epoch: dict | None = None
         self._epoch_signer: str | None = self._pub(epoch_signer) if epoch_signer else None
+        # Optional run manifest (W6): the operator's launch config minus secrets,
+        # served to flags-only `opendipaco join` clients so they can build their
+        # worker without a config file. Set via `serve_manifest`; None = unset.
+        self._manifest: dict | None = None
+
+    def serve_manifest(self, manifest: dict | None) -> None:
+        """Publish the run manifest this tracker serves to joining workers (W6)."""
+        self._manifest = manifest
 
     @staticmethod
     def _pub(p) -> str:
@@ -147,6 +155,8 @@ class Tracker(_ReactorServer):
         if kind == "epoch_get":
             with self._dir_lock:
                 return {"type": "epoch", "record": self._epoch}
+        if kind == "manifest":   # W6: serve the run manifest to a joining worker
+            return {"type": "manifest", "manifest": self._manifest}
         return None
 
     def _epoch_put(self, record) -> dict:
