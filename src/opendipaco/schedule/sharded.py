@@ -81,6 +81,7 @@ from .ownership import (
 )
 from .reactor import DEFAULT_MAX_MSG_BYTES, _ReactorServer
 from .scheduler import AsyncScheduler
+from .throttle import throttled
 from .wire import _key_bytes, client_handshake, recv_msg, send_msg
 
 
@@ -2518,7 +2519,7 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
                        fault_hook=None, tls=None, tls_hostname=None,
                        data_dir=None, data_source=None, data_tokenizer=None,
                        max_batch_size=None, transport="tcp", identity=None,
-                       stop_event=None):
+                       stop_event=None, bucket=None):
     """Train path-tasks for a sharded scheduler + parameter servers.
 
     Per task: lease from the scheduler, fetch the path's modules from the owning
@@ -2584,14 +2585,15 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
         try:
             sch = _ps_connect(tuple(scheduler_addr), auth_key, max_msg_bytes,
                               connect_timeout if first else reconnect_timeout,
-                              tls=tls, server_hostname=tls_hostname or scheduler_addr[0])
+                              tls=tls, server_hostname=tls_hostname or scheduler_addr[0],
+                              bucket=bucket)
         except ConnectionError:
             return  # scheduler unreachable
         first = False
         # One link per scheduler connection: it owns the PS connection cache, so
         # a reconnect naturally drops stale PS sockets (fresh link next loop).
         link = _WorkerLink(sch, auth_key=auth_key, max_msg_bytes=max_msg_bytes,
-                           connect_timeout=connect_timeout, tls=tls)
+                           connect_timeout=connect_timeout, tls=tls, bucket=bucket)
         clean = False
         try:
             clean = _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions,
@@ -2899,7 +2901,8 @@ def _push_group(routing, grant, shared_payload, private_payload, link) -> set:
     return failed
 
 
-def _ps_connect(addr, auth_key, max_msg_bytes, timeout, *, tls=None, server_hostname=None):
+def _ps_connect(addr, auth_key, max_msg_bytes, timeout, *, tls=None, server_hostname=None,
+                bucket=None):
     import socket as _socket
     deadline = time.monotonic() + timeout
     last = None
@@ -2912,7 +2915,9 @@ def _ps_connect(addr, auth_key, max_msg_bytes, timeout, *, tls=None, server_host
             if not client_handshake(s, auth_key):
                 s.close()
                 raise PermissionError(f"auth rejected by {addr}")
-            return s
+            # W6b: wrap *after* the (tiny) handshake so only the bulk
+            # fetch/push traffic is metered against the bandwidth cap.
+            return throttled(s, bucket)
         except ssl.SSLError:  # handshake/cert failure is fatal -- don't retry-to-timeout
             s.close()
             raise
@@ -2946,13 +2951,15 @@ class _WorkerLink:
     implementation (W1b step 3) swaps the byte pipe without touching the worker
     loop, which now speaks only to this seam."""
 
-    def __init__(self, sch_sock, *, auth_key, max_msg_bytes, connect_timeout, tls=None):
+    def __init__(self, sch_sock, *, auth_key, max_msg_bytes, connect_timeout, tls=None,
+                 bucket=None):
         self._sch = sch_sock
         self._lock = threading.Lock()
         self._auth = auth_key
         self._max = max_msg_bytes
         self._timeout = connect_timeout
         self._tls = tls
+        self._bucket = bucket   # W6b bandwidth throttle (None = no cap); wraps PS sockets
         self._ps: dict = {}   # addr_key -> connected socket
 
     def sch_send(self, msg) -> None:
@@ -2976,7 +2983,7 @@ class _WorkerLink:
         sock = self._ps.get(addr)
         if sock is None:
             sock = _ps_connect(addr, self._auth, self._max, self._timeout,
-                               tls=self._tls, server_hostname=addr[0])
+                               tls=self._tls, server_hostname=addr[0], bucket=self._bucket)
             self._ps[addr] = sock
         try:
             return _rpc(sock, msg, self._max)
@@ -3284,7 +3291,7 @@ def run_decentralized_worker(config, diloco, tracker_addr, corpus, *, identity,
                              total_rounds=0, max_tasks=None, reachability="nat",
                              heartbeat_interval=3.0, poll_interval=0.05,
                              max_msg_bytes=DEFAULT_MAX_MSG_BYTES, connect_timeout=10.0,
-                             tls=None, stop_event=None, fault_hook=None):
+                             tls=None, stop_event=None, fault_hook=None, bucket=None):
     """Self-assigning worker for a decentralized swarm (``schedule.mode:
     decentralized``): no scheduler, no central grant signer. It registers with
     the rendezvous tracker (role ``worker``), then loops :func:`_serve_decentralized`
@@ -3328,7 +3335,7 @@ def run_decentralized_worker(config, diloco, tracker_addr, corpus, *, identity,
             return []  # tracker blip: a previous epoch persists until it answers
 
     link = _WorkerLink(None, auth_key=auth_key, max_msg_bytes=max_msg_bytes,
-                       connect_timeout=connect_timeout, tls=tls)
+                       connect_timeout=connect_timeout, tls=tls, bucket=bucket)
     try:
         _serve_decentralized(
             link, engine, worker, identity.peer_id, corpus, directory_fn,

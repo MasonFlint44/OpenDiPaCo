@@ -157,6 +157,10 @@ class TransportCfg:
     # and error-feeds the dropped mass. 1.0 (default) = dense = byte-identical.
     # Changes numerics -> validate with examples/validate_dynamics.py. Sharded only.
     up_density: float = 1.0
+    # W6b: a worker's hard bandwidth ceiling in megabits/sec (bytes sent+received,
+    # aggregate across its sockets). None = no cap. A volunteer-side knob; servers
+    # ignore it. Mainly set via `opendipaco join --max-mbps`.
+    max_mbps: float | None = None
     # When set, idle replies tell workers to wait this many seconds before
     # polling again (server-paced; otherwise workers use their own tight poll).
     idle_backoff: float | None = None

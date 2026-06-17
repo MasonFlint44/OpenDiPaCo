@@ -49,6 +49,7 @@ from ..schedule import (
     run_worker,
     server_context,
 )
+from ..schedule.throttle import TokenBucket, rate_from_mbps
 from ..train import DiPaCoEngine
 from .config import LaunchConfig, dipaco_config, diloco_config
 from .manifest import build_manifest
@@ -531,12 +532,20 @@ def run_parameter_server(cfg: LaunchConfig, shard_id: int = 0, *, port=None,
 
 
 def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_tasks=None,
-                    stop_event=None):
-    """A worker: connect to the coordinator (or scheduler in sharded mode) and train."""
+                    stop_event=None, bucket=None):
+    """A worker: connect to the coordinator (or scheduler in sharded mode) and train.
+
+    ``bucket`` (W6b) is a shared bandwidth :class:`TokenBucket` throttling the
+    worker's sockets; when not passed it is built from ``transport.max_mbps`` (so
+    `opendipaco worker` honors the cap too). ``opendipaco join`` passes its own so
+    the health line can read the byte counters."""
     model, diloco = dipaco_config(cfg.model), diloco_config(cfg.diloco)
     mt = max_tasks if max_tasks is not None else cfg.run.max_tasks
     data_dir = cfg.data.shard_cache_dir  # spec mode: cache materialized shards here
     auth = _worker_auth(cfg)
+    if bucket is None and cfg.transport.max_mbps:
+        rate = rate_from_mbps(cfg.transport.max_mbps)
+        bucket = TokenBucket(rate) if rate else None
     # SIGTERM/SIGINT -> graceful leave (W4d): the sharded worker nacks its in-flight
     # lease so the path re-leases at once instead of waiting out the lease timeout.
     # Only installed on the sharded paths that *consume* the event -- the
@@ -572,7 +581,8 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             read_quorum=cfg.schedule.read_quorum, lease_ttl=cfg.schedule.lease_ttl,
             batch_size=cfg.run.batch_size, total_rounds=cfg.run.generations,
             max_tasks=mt, heartbeat_interval=own.heartbeat_interval,
-            tls=build_tls_client(cfg), stop_event=stop_event or _wait_for_signal())
+            tls=build_tls_client(cfg), stop_event=stop_event or _wait_for_signal(),
+            bucket=bucket)
         return
     if cfg.mode == "sharded":
         target = scheduler_addr or cfg.connect_addr()
@@ -582,7 +592,7 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             heartbeat_interval=cfg.transport.heartbeat_interval,
             tls=build_tls_client(cfg), tls_hostname=cfg.tls.server_hostname,
             data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch,
-            stop_event=stop_event or _wait_for_signal())
+            stop_event=stop_event or _wait_for_signal(), bucket=bucket)
     else:
         host, port = addr or cfg.connect_addr()
         run_worker(

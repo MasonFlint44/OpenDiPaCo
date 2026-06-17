@@ -160,6 +160,34 @@ def test_fetch_manifest_raises_when_none_published():
 # -- end to end: join a run with no config file --------------------------------
 
 
+def test_bandwidth_bucket_meters_the_worker_traffic():
+    """The W6b throttle is wired into the worker's real sockets: training through
+    run_worker_role with a shared bucket tallies bytes sent AND received."""
+    from opendipaco.launch.roles import run_worker_role
+    from opendipaco.schedule.throttle import TokenBucket
+    cfg = _cfg()
+    sched, pss = _start_sharded(cfg)
+    fit = threading.Thread(target=lambda: sched.fit(num_generations=2, total_generations=2),
+                           daemon=True)
+    fit.start()
+    bucket = TokenBucket(1e9)                                   # huge rate: meter, don't slow
+    wcfg = manifest_to_config(build_manifest(cfg), overrides={
+        "transport": {"connect_host": "127.0.0.1", "port": sched.port, "auth_key": "shh"},
+        "run": {"device": "cpu"}})
+    worker = threading.Thread(target=run_worker_role,
+                              kwargs=dict(cfg=wcfg, max_tasks=16, bucket=bucket), daemon=True)
+    worker.start()
+    try:
+        fit.join(timeout=60)
+        assert not fit.is_alive()
+        assert bucket.sent_bytes > 0 and bucket.recv_bytes > 0  # both directions metered
+    finally:
+        sched.shutdown()
+        for ps in pss:
+            ps.shutdown()
+        worker.join(timeout=10)
+
+
 def test_run_join_trains_against_an_in_process_run():
     """A flags-only `join` fetches the manifest, autodetects cpu, builds its
     config, and trains real tasks against the scheduler -- no config file."""

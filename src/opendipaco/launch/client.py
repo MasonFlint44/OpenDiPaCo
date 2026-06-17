@@ -19,6 +19,7 @@ import torch
 from .config import dipaco_config
 from .manifest import manifest_fingerprint, manifest_to_config, verify_manifest
 from .roles import run_worker_role
+from ..schedule.throttle import TokenBucket, rate_from_mbps
 from ..schedule.tracker import tracker_rpc
 
 
@@ -123,8 +124,10 @@ class HealthReporter:
     per-task metrics (tasks, accept rate, tokens/sec, Mbps) ride a worker progress
     hook + the W6b byte accounting."""
 
-    def __init__(self, *, target, device, interval: float = 10.0, quiet: bool = False):
+    def __init__(self, *, target, device, interval: float = 10.0, quiet: bool = False,
+                 bucket=None, cap_mbps=None):
         self.target, self.device, self.interval, self.quiet = target, device, interval, quiet
+        self.bucket, self.cap_mbps = bucket, cap_mbps
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -134,10 +137,22 @@ class HealthReporter:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
+    def _bandwidth_note(self, dt: float, prev: tuple[int, int]) -> tuple[str, tuple[int, int]]:
+        """Current Mbps (over the last tick) + cumulative MB, from the bucket's
+        byte counters. Returns ``(note, new_prev_counters)``."""
+        if self.bucket is None or dt <= 0:
+            return "", prev
+        sent, recv = self.bucket.sent_bytes, self.bucket.recv_bytes
+        mbps = ((sent + recv) - (prev[0] + prev[1])) * 8 / 1e6 / dt
+        cap = f"/{self.cap_mbps:g}" if self.cap_mbps else ""
+        return (f"  {mbps:.2f}{cap} Mbps  ({(sent + recv) / 1e6:.1f} MB total)",
+                (sent, recv))
+
     def _loop(self) -> None:
         # Wall clock (time.time): it jumps across an OS suspend, whereas
         # time.monotonic does not advance during one (so it can't see the sleep).
         start = last = time.time()
+        prev = (self.bucket.sent_bytes, self.bucket.recv_bytes) if self.bucket else (0, 0)
         # A wall gap much larger than the tick is a suspend, not a slow tick.
         gap_threshold = max(self.interval * 3, 30.0)
         while not self._stop.wait(self.interval):
@@ -145,9 +160,10 @@ class HealthReporter:
             if now - last > gap_threshold:
                 print(f"[join] resumed after ~{now - last:.0f}s suspended; reconnecting "
                       f"(stale work is refused by the lease fence)", flush=True)
+            bw, prev = self._bandwidth_note(now - last, prev)
             last = now
             print(f"[join] training on {self.device} -> {self.target}  "
-                  f"up {now - start:.0f}s", flush=True)
+                  f"up {now - start:.0f}s{bw}", flush=True)
 
     def stop(self) -> None:
         self._stop.set()
@@ -156,7 +172,7 @@ class HealthReporter:
 
 
 def run_join(*, scheduler=None, tracker=None, auth_key=None, identity_key=None,
-             device=None, max_tasks=None, server_pub=None, data_dir=None,
+             device=None, max_tasks=None, server_pub=None, data_dir=None, max_mbps=None,
              quiet: bool = False, tls=None, stop_event=None) -> None:
     """Join a run from connection flags + the fetched manifest (W6 slice a).
 
@@ -212,9 +228,16 @@ def run_join(*, scheduler=None, tracker=None, auth_key=None, identity_key=None,
         overrides["tracker"] = {"connect_host": host, "port": port}
     cfg = manifest_to_config(manifest, overrides=overrides)
 
-    reporter = HealthReporter(target=f"{host}:{port}", device=dev, quiet=quiet)
+    # One shared bandwidth bucket for the whole worker (hard --max-mbps ceiling on
+    # bytes sent+received); the reporter reads its counters for the live Mbps line.
+    rate = rate_from_mbps(max_mbps)
+    bucket = TokenBucket(rate) if rate else None
+    if bucket is not None:
+        print(f"[join] bandwidth cap: {max_mbps:g} Mbps (hard ceiling on send+recv)")
+    reporter = HealthReporter(target=f"{host}:{port}", device=dev, quiet=quiet,
+                              bucket=bucket, cap_mbps=max_mbps)
     reporter.start()
     try:
-        run_worker_role(cfg, max_tasks=max_tasks, stop_event=stop_event)
+        run_worker_role(cfg, max_tasks=max_tasks, stop_event=stop_event, bucket=bucket)
     finally:
         reporter.stop()

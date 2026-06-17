@@ -79,7 +79,8 @@ def cmd_join(args) -> int:
     from .client import run_join
     run_join(scheduler=args.scheduler, tracker=args.tracker, auth_key=args.auth,
              identity_key=args.identity, device=args.device, max_tasks=args.max_tasks,
-             server_pub=args.server_pub, data_dir=args.data_dir, quiet=args.quiet)
+             server_pub=args.server_pub, data_dir=args.data_dir, max_mbps=args.max_mbps,
+             quiet=args.quiet)
     return 0
 
 
@@ -186,6 +187,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_join.add_argument("--auth", default=None, help="shared HMAC secret, if the run uses one")
     p_join.add_argument("--identity", default=None, help="Ed25519 key PEM (per-peer auth runs)")
     p_join.add_argument("--device", default=None, help="cuda/mps/cpu (default: autodetect)")
+    p_join.add_argument("--max-mbps", type=float, default=None,
+                        help="hard bandwidth cap in megabits/sec (send+recv)")
     p_join.add_argument("--max-tasks", type=int, default=None)
     p_join.add_argument("--server-pub", default=None,
                         help="pin the manifest signer's pubkey (else trust-on-first-use)")
