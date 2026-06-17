@@ -10,10 +10,17 @@ locally, overlaying only the connection flags it was given.
 
 Trust: the manifest is :func:`~opendipaco.schedule.identity.sign_record`-signed
 by the run's identity when the operator runs with one. A joiner may **pin** the
-key (``--server-pub``, verify-or-refuse) or accept it **TOFU** and print the
-fingerprint. A manifest only selects *what the worker computes*; the weight path
-stays grant/quorum-gated, so a wrong manifest wastes the volunteer's compute but
-cannot poison the run.
+key (``--server-pub``, verify-or-refuse) or accept it **TOFU**.
+
+TOFU is genuinely weak on an unauthenticated/unencrypted channel: a MITM (or a
+malicious tracker) can rewrite an unsigned manifest, or even strip the signature
+off a signed one — the joiner can't tell a sig-stripped manifest from a
+genuinely-unsigned run. So TOFU is *use-at-your-own-risk*; **pin with
+``--server-pub`` or run over TLS on an untrusted network.** A wrong manifest
+can't poison the *weights* (those stay grant/quorum-gated), but it can waste the
+volunteer's compute and steer side-effects the worker config controls (which data
+to materialize, which relays to dial) — which is why operator-local paths are
+stripped (see ``_STRIP``) and pinning is the safe default to recommend.
 """
 
 from __future__ import annotations
@@ -29,17 +36,19 @@ from .config import LaunchConfig
 
 MANIFEST_KIND = "run_manifest"
 
-# Operator-only / secret config the manifest must never carry. Public keys a
-# worker *needs* (``transport.scheduler_pub`` to verify grants) are deliberately
-# kept; only credentials and local file paths are stripped.
+# Operator-only / secret / operator-local config the manifest must never carry.
+# Public keys a worker *needs* (``transport.scheduler_pub`` to verify grants) are
+# deliberately kept. Beyond credentials and TLS key material, **operator-local
+# filesystem paths** are stripped too: they are meaningless on a volunteer's box,
+# and under TOFU an attacker-served manifest could otherwise point the joiner's
+# ``torch.save``/cache at an attacker-chosen path (a write sink). The joiner
+# supplies its own cache via ``--data-dir``.
 _STRIP = {
     "transport": ("auth_key", "grant_key", "identity_key", "accept_keys",
                   "admitted_peers"),
     "tls": ("certfile", "keyfile", "cafile"),
+    "data": ("cache_path", "shard_cache_dir"),
 }
-# Sections/keys a joiner always supplies itself (its own connection + hardware),
-# overlaid onto the manifest at apply time rather than taken from it.
-_JOINER_OWNED = ("auth_key", "identity_key")
 
 
 def build_manifest(cfg: LaunchConfig, *, identity=None) -> dict:
@@ -92,8 +101,3 @@ def manifest_to_config(manifest: dict, *, overrides: dict | None = None) -> Laun
     for section, vals in (overrides or {}).items():
         body.setdefault(section, {}).update({k: v for k, v in vals.items() if v is not None})
     return LaunchConfig.from_dict(body)
-
-
-def joiner_owned_keys() -> tuple[str, ...]:
-    """Transport keys a joiner always provides itself (never from the manifest)."""
-    return _JOINER_OWNED

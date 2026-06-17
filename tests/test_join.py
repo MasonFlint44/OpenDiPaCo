@@ -42,12 +42,18 @@ def _cfg(**over):
 
 def test_build_manifest_strips_secrets_keeps_public():
     cfg = _cfg(transport={"host": "127.0.0.1", "port": 0, "auth_key": "shh",
-                          "grant_key": "g", "scheduler_pub": "abcd"})
+                          "grant_key": "g", "scheduler_pub": "abcd"},
+               data={"source": "synthetic", "num_documents": 32,
+                     "shard_cache_dir": "/home/operator/shards", "cache_path": "/op/c4.pt"})
     m = build_manifest(cfg)
     t = m["config"]["transport"]
     assert t["auth_key"] is None and t["grant_key"] is None        # secrets stripped
     assert t["scheduler_pub"] == "abcd"                            # public key kept (grants)
     assert m["config"]["model"]["hidden_size"] == 32               # model carried
+    # Operator-local filesystem paths stripped (meaningless off-box + a TOFU
+    # write-sink); the joiner supplies its own via --data-dir.
+    assert m["config"]["data"]["shard_cache_dir"] is None
+    assert m["config"]["data"]["cache_path"] is None
 
 
 def test_verify_manifest_signed_unsigned_and_pinned():

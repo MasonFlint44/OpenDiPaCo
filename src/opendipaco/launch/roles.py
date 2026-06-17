@@ -133,6 +133,18 @@ def _decentralized_owner_kw(cfg: LaunchConfig) -> dict:
         min_owner_reputation=r.min_owner_reputation)
 
 
+def _publish_manifest(server, cfg: LaunchConfig, identity) -> None:
+    """Build + serve the W6 run manifest, warning the operator when it is
+    unsigned (no identity) -- joiners then can't pin it (``--server-pub``), so the
+    run is TOFU-only. Signing needs ``transport.identity_key``."""
+    manifest = build_manifest(cfg, identity=identity)
+    if "sig" not in manifest:
+        print("NOTE: serving an UNSIGNED run manifest (this node has no identity); "
+              "`opendipaco join` clients cannot pin it with --server-pub. Set "
+              "transport.identity_key to sign it.", flush=True)
+    server.serve_manifest(manifest)
+
+
 def _advertise_host(cfg: LaunchConfig) -> str:
     """The address other peers dial for this owner: the explicit
     ``ownership.advertise_host``, else ``transport.connect_host``, else the
@@ -409,7 +421,7 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None, identity=N
         min_task_rate=cfg.run.min_task_rate,
         **_scheduler_robustness_kw(cfg), **_server_kw(cfg, extra_admitted))
     scheduler.start()
-    scheduler.serve_manifest(build_manifest(cfg, identity=ident))  # W6: flags-only `join`
+    _publish_manifest(scheduler, cfg, ident)  # W6: flags-only `join`
     lp = _serve_libp2p(scheduler, cfg, ident) if _libp2p_routes(cfg) else None
     if lp is not None:
         print(f"scheduler libp2p addrs: {lp.addrs}", flush=True)
@@ -901,7 +913,7 @@ def run_tracker(cfg: LaunchConfig, *, on_start=None, stop_event=None):
     tracker.start()
     # W6: serve the run manifest so a decentralized volunteer can `opendipaco join`
     # with just this tracker's address (signed by the node identity when set).
-    tracker.serve_manifest(build_manifest(cfg, identity=_node_identity(cfg)))
+    _publish_manifest(tracker, cfg, _node_identity(cfg))
     _attach_metrics(tracker, cfg)
     if on_start:
         on_start(tracker)

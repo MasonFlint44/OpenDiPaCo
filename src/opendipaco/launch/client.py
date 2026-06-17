@@ -54,7 +54,19 @@ def resolve_device(config, *, requested=None, batch_size: int, seq_len: int):
     diloco_overrides: dict = {}
     if dev.startswith("cuda") and torch.cuda.is_available():
         from ..train.memory import fits, vram_breakdown
-        free = torch.cuda.mem_get_info()[0]
+        # mem_get_info can raise on a quirky build/driver (no current device, MIG,
+        # ROCm) even when is_available() is True. The whole point of the ladder is
+        # to degrade, not crash -- so a probe failure falls back to cpu (unless the
+        # user forced cuda, in which case surface the real error).
+        try:
+            free_total = torch.cuda.mem_get_info()[0]
+        except Exception as e:  # noqa: BLE001
+            if forced:
+                raise SystemExit(f"--device {dev} but CUDA memory probe failed: {e}") from e
+            return "cpu", {}, notes + [f"CUDA memory probe failed ({e}); using cpu"]
+        # Leave headroom: the activation term is a coarse estimate and a consumer
+        # GPU also feeds a desktop, so budgeting 100% of free OOMs in practice.
+        free = int(free_total * 0.9)
         # Engage fit levers in increasing-cost order; stop at the first that fits.
         ladder = [
             ({}, "no levers"),
@@ -72,7 +84,7 @@ def resolve_device(config, *, requested=None, batch_size: int, seq_len: int):
                 diloco_overrides = over
                 if over:
                     notes.append(f"VRAM fit: enabled {label} (~{bd['total'] / 1e9:.1f} GB "
-                                 f"vs {free / 1e9:.1f} GB free)")
+                                 f"vs {free / 1e9:.1f} GB budget)")
                 break
         else:
             need = vram_breakdown(config, batch_size=batch_size, seq_len=seq_len,
@@ -80,10 +92,11 @@ def resolve_device(config, *, requested=None, batch_size: int, seq_len: int):
             if forced:
                 raise SystemExit(
                     f"path won't fit {dev}: needs ~{need / 1e9:.1f} GB even with all fit "
-                    f"levers, only {free / 1e9:.1f} GB free. Use a smaller batch or --device cpu.")
+                    f"levers, only ~{free / 1e9:.1f} GB usable. Use a smaller batch or "
+                    f"--device cpu.")
             dev = "cpu"
-            notes.append(f"VRAM too small (~{need / 1e9:.1f} GB needed, {free / 1e9:.1f} GB "
-                         f"free) -> falling back to cpu")
+            notes.append(f"VRAM too small (~{need / 1e9:.1f} GB needed, ~{free / 1e9:.1f} GB "
+                         f"usable) -> falling back to cpu")
     return dev, diloco_overrides, notes
 
 
@@ -102,11 +115,13 @@ def fetch_manifest(addr, *, auth_key=None, tls=None, timeout: float = 10.0) -> d
 
 
 class HealthReporter:
-    """Periodic one-line health surface (D6), to stderr, plus a monotonic-gap
-    **sleep detector** (D5): a wall-clock jump means the process was suspended
-    (laptop lid). Lean for now -- device / target / uptime / sleep events; rich
-    per-task metrics (tasks, accept rate, tokens/sec, Mbps) ride a worker
-    progress hook + the W6b byte accounting."""
+    """Periodic one-line health surface (D6), to stderr, plus a **sleep detector**
+    (D5): a *wall-clock* jump between ticks means the process was suspended (laptop
+    lid). It must use ``time.time()``, not ``time.monotonic()`` -- on Linux the
+    monotonic clock does **not** advance across a suspend, so a monotonic gap would
+    never fire. Lean for now -- device / target / uptime / sleep events; rich
+    per-task metrics (tasks, accept rate, tokens/sec, Mbps) ride a worker progress
+    hook + the W6b byte accounting."""
 
     def __init__(self, *, target, device, interval: float = 10.0, quiet: bool = False):
         self.target, self.device, self.interval, self.quiet = target, device, interval, quiet
@@ -120,11 +135,13 @@ class HealthReporter:
         self._thread.start()
 
     def _loop(self) -> None:
-        start = last = time.monotonic()
-        # A gap much larger than the tick is a suspend, not a slow tick.
+        # Wall clock (time.time): it jumps across an OS suspend, whereas
+        # time.monotonic does not advance during one (so it can't see the sleep).
+        start = last = time.time()
+        # A wall gap much larger than the tick is a suspend, not a slow tick.
         gap_threshold = max(self.interval * 3, 30.0)
         while not self._stop.wait(self.interval):
-            now = time.monotonic()
+            now = time.time()
             if now - last > gap_threshold:
                 print(f"[join] resumed after ~{now - last:.0f}s suspended; reconnecting "
                       f"(stale work is refused by the lease fence)", flush=True)
@@ -154,15 +171,27 @@ def run_join(*, scheduler=None, tracker=None, auth_key=None, identity_key=None,
         raise SystemExit("manifest verification failed (bad signature, or --server-pub mismatch)")
     fp = manifest_fingerprint(manifest)
     if server_pub is not None:
-        print(f"[join] manifest verified against pinned key (fingerprint {fp})")
+        print(f"[join] manifest verified against pinned --server-pub (content {fp})")
     elif "sig" in manifest:
-        print(f"[join] accepting signed manifest from {manifest.get('peer_id', '?')[:12]}… "
-              f"(fingerprint {fp}); pass --server-pub to pin it.")
+        # Show the actual signer pubkey -- that's what --server-pub pins (NOT the
+        # peer_id or the content fingerprint). TOFU here is only as strong as the
+        # channel: a MITM could have re-signed or stripped the signature.
+        print(f"[join] TOFU: trusting manifest signer pub={manifest.get('pub', '?')} "
+              f"(content {fp}). Re-run with --server-pub <that key> to pin it; "
+              f"on an untrusted network, pin or use TLS.")
     else:
-        print(f"[join] accepting UNSIGNED manifest (fingerprint {fp}); the operator ran "
-              f"without an identity -- verify out-of-band or require --server-pub.")
+        print(f"[join] TOFU: accepting an UNSIGNED manifest (content {fp}). The channel "
+              f"is the only protection -- a tampered or sig-stripped manifest is "
+              f"indistinguishable here. Prefer a signed run + --server-pub, or TLS.")
 
     base = manifest_to_config(manifest)
+    # join has no TLS-client wiring yet; refuse loudly rather than fail with an
+    # opaque socket/SSL error against a TLS-only run (volunteer-internet runs that
+    # mandate TLS need `opendipaco worker` with a config until join grows --tls).
+    if base.tls.enabled and tls is None:
+        raise SystemExit(
+            "this run requires TLS, which `opendipaco join` does not configure yet; "
+            "use `opendipaco worker --config <file>` with the TLS settings for now.")
     dev, diloco_overrides, notes = resolve_device(
         dipaco_config(base.model), requested=device,
         batch_size=base.run.batch_size, seq_len=base.model.sequence_length)
