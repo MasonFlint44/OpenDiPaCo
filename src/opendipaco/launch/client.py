@@ -50,6 +50,10 @@ def resolve_device(config, *, requested=None, batch_size: int, seq_len: int):
     forced = requested not in (None, "auto")
     if forced:
         dev = requested
+        # Reject a device we don't recognize (a typo like "gpu", or "CUDA") early
+        # rather than hand torch a bad string mid-training. cuda:N / mps:N are fine.
+        if not (dev == "cpu" or dev.startswith("cuda") or dev.startswith("mps")):
+            raise SystemExit(f"--device {dev!r} not recognized (use cpu, cuda[:N], or mps)")
         # A forced accelerator that isn't present must fail early + clearly, not
         # be accepted and blow up mid-training (the fit-check below only runs when
         # the device is actually available, so it would otherwise slip through).
@@ -200,7 +204,10 @@ def run_join(*, scheduler=None, tracker=None, auth_key=None, identity_key=None,
     # in per-peer-auth deployments (admitted_peers, no shared auth_key) the server
     # only honors the Ed25519 identity, so a fetch sending the (absent) HMAC key
     # would be rejected before the worker ever reaches the training loop.
-    cred = PeerIdentity.load(identity_key) if identity_key else auth_key
+    try:
+        cred = PeerIdentity.load(identity_key) if identity_key else auth_key
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"could not load --identity {identity_key!r}: {e}") from e
     manifest = fetch_manifest(source, auth_key=cred, tls=tls)
     if not verify_manifest(manifest, server_pub=server_pub):
         raise SystemExit("manifest verification failed (bad signature, or --server-pub mismatch)")

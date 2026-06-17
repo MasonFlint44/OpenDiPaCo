@@ -139,6 +139,14 @@ def test_forced_unavailable_accelerator_errors_early():
     if mps is None or not mps.is_available():
         with pytest.raises(SystemExit, match="mps"):
             resolve_device(cfg, requested="mps", batch_size=8, seq_len=16)
+    # An unrecognized device (typo) is rejected up front, not handed to torch.
+    with pytest.raises(SystemExit, match="not recognized"):
+        resolve_device(cfg, requested="gpu", batch_size=8, seq_len=16)
+
+
+def test_join_rejects_a_bad_identity_path():
+    with pytest.raises(SystemExit, match="could not load --identity"):
+        run_join(scheduler="127.0.0.1:1", identity_key="/no/such/key.pem", quiet=True)
 
 
 # -- the manifest RPC, served by a real scheduler ------------------------------
