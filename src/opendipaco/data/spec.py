@@ -134,6 +134,43 @@ def kmeans_routing(centroids: torch.Tensor, *, vocab_size: int, feature_dim: int
                            "feature_dim": feature_dim, "seed": seed}}
 
 
+def fit_routing_from_source(source: dict, *, num_paths: int, vocab_size: int,
+                            seq_len: int, sample: int, feature_dim: int,
+                            router_seed: int = 0, feat_seed: int = 0,
+                            doc_source=None, tokenizer=None) -> dict:
+    """Fit the k-means router on a bounded, **deterministic** sample of the public
+    source (the first ``sample`` documents) and return a :func:`kmeans_routing`
+    dict (W7b, ``docs/w7-data-decentralization-design.md``).
+
+    The point: the operator builds the shard spec **without ever holding the whole
+    corpus** -- it streams at most ``sample`` document prefixes to fit, then
+    :meth:`SpecCorpus.build` streams again for the token counts. The fit matches
+    the in-hand one (:func:`~opendipaco.launch.roles.build_spec_corpus`): a
+    ``BagOfTokensFeaturizer`` over ``doc[:seq_len]`` prefixes, k-means at
+    ``router_seed``. Fully determined by ``(source, sample, seq_len, feature_dim,
+    feat_seed, router_seed)``, so any peer streaming the same public source
+    reproduces byte-identical centroids -- the basis for slice c's
+    ``verify_routing``.
+
+    Because it fits on a *sample* (not every document), the centroids -- and hence
+    the assignments -- differ from fitting on the full corpus; this path is opt-in
+    (``data.router_sample``) and not byte-identical to the unsampled run.
+    ``sample`` must yield at least ``num_paths`` documents (k-means needs one
+    seed per cluster), else :meth:`KMeansRouter.fit` raises.
+    """
+    if sample < 1:
+        raise ValueError(f"router sample must be >= 1, got {sample}")
+    feat = BagOfTokensFeaturizer(vocab_size, feature_dim=feature_dim, seed=feat_seed)
+    prefixes: list[torch.Tensor] = []
+    for doc in iter_spec_documents({"source": source}, source=doc_source, tokenizer=tokenizer):
+        prefixes.append(doc[:seq_len])
+        if len(prefixes) >= sample:
+            break
+    router = KMeansRouter(num_paths, seed=router_seed).fit(feat(prefixes))
+    return kmeans_routing(router.centroids, vocab_size=vocab_size,
+                          feature_dim=feature_dim, seed=feat_seed)
+
+
 def _build_predictor(spec: dict):
     """Return ``predict(prefixes) -> LongTensor`` for a spec, or None (round-robin)."""
     routing = spec["routing"]

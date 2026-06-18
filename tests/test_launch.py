@@ -68,6 +68,16 @@ def test_from_dict_rejects_nonpositive_max_shards():
     assert LaunchConfig.from_dict({"run": {"worker_max_shards": 1}}).run.worker_max_shards == 1
 
 
+def test_from_dict_validates_router_sample():
+    # W7b: sampled router fit is spec-mode only and must be positive.
+    with pytest.raises(ValueError, match="router_sample"):
+        LaunchConfig.from_dict({"data": {"ship": "spec", "router_sample": 0}})
+    with pytest.raises(ValueError, match="router_sample requires"):
+        LaunchConfig.from_dict({"data": {"ship": "bytes", "router_sample": 16}})
+    assert LaunchConfig.from_dict(
+        {"data": {"ship": "spec", "router_sample": 16}}).data.router_sample == 16
+
+
 def test_transport_kind_parses_and_validates():
     """W1d: transport.kind selects the substrate (tcp default, libp2p opt-in)."""
     assert LaunchConfig.from_dict({}).transport.kind == "tcp"

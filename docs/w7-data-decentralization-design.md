@@ -39,7 +39,7 @@ memory is **bounded** regardless of how many paths it churns through.
 
 ## Slices
 
-### Slice a — Bound the worker shard cache (RAM)
+### Slice a — Bound the worker shard cache (RAM) — **landed**
 
 Replace the unbounded `shard_cache` dict with a small LRU keyed by path, capped
 by entry count (default a handful; one is the common case). On eviction we drop
@@ -55,7 +55,7 @@ conservative.
 - Test: eviction re-materializes byte-identically; cap respected; one-path
   worker never evicts.
 
-### Slice b — Bounded-memory, streaming router fit + token counts
+### Slice b — Bounded-memory, streaming router fit + token counts — **landed**
 
 The operator must build the spec corpus **without holding the whole corpus**.
 

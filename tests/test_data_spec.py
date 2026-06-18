@@ -22,6 +22,7 @@ from opendipaco import (
 from opendipaco.data import ShardedCorpus, SpecCorpus, materialize_shard, spec_fingerprint
 from opendipaco.data.spec import (
     c4_source,
+    fit_routing_from_source,
     iter_spec_documents,
     kmeans_routing,
     make_shard_spec,
@@ -128,6 +129,73 @@ def test_spec_corpus_build_streams_counts():
     a = SpecCorpus.from_documents(spec, docs)
     b = SpecCorpus.build(spec)            # streams from the spec's source
     assert a.token_counts == b.token_counts
+
+
+def test_fit_routing_from_source_is_deterministic():
+    """W7b: a sampled router fit reproduces byte-identical centroids from the same
+    public source + params -- the basis for slice c's verification."""
+    kw = dict(num_paths=PATHS, vocab_size=VOCAB, seq_len=SEQ, sample=24,
+              feature_dim=VOCAB, router_seed=0)
+    a = fit_routing_from_source(_source_spec(), **kw)
+    b = fit_routing_from_source(_source_spec(), **kw)
+    assert a["kind"] == "kmeans"
+    assert torch.equal(a["centroids"], b["centroids"])
+
+
+def test_fit_routing_from_source_matches_full_fit_when_sample_covers_corpus():
+    """With sample >= corpus size the streamed fit sees every doc in stream order,
+    so it equals the in-hand fit (the unsampled path) bit-for-bit."""
+    docs = _docs()
+    full = fit_routing_from_source(_source_spec(), num_paths=PATHS, vocab_size=VOCAB,
+                                   seq_len=SEQ, sample=10_000, feature_dim=VOCAB)
+    feat = BagOfTokensFeaturizer(VOCAB, feature_dim=VOCAB)
+    router = KMeansRouter(PATHS, seed=0).fit(feat([d[:SEQ] for d in docs]))
+    assert torch.equal(full["centroids"], router.centroids)
+
+
+def test_build_server_corpus_streams_with_router_sample():
+    """``build_server_corpus`` with data.router_sample set builds a SpecCorpus by
+    streaming -- a valid kmeans recipe + normalized counts, never holding the
+    corpus."""
+    from opendipaco.launch import LaunchConfig
+    from opendipaco.launch.config import dipaco_config
+    from opendipaco.launch.roles import build_server_corpus
+
+    cfg = LaunchConfig.from_dict({
+        "model": {"vocab_size": VOCAB, "hidden_size": 32, "num_attention_heads": 4,
+                  "intermediate_size": 64, "layers_per_level": [1, 1],
+                  "level_sizes": [2, 2], "sequence_length": SEQ,
+                  "max_position_embeddings": 64},
+        "data": {"source": "synthetic", "num_documents": 32, "ship": "spec",
+                 "synthetic_topics": 4, "synthetic_doc_len": 48, "router_sample": 24},
+    })
+    model = dipaco_config(cfg.model)
+    corpus = build_server_corpus(cfg, model)
+    assert isinstance(corpus, SpecCorpus)
+    assert corpus.spec["routing"]["kind"] == "kmeans"
+    assert abs(sum(corpus.shard_weight(p) for p in range(model.num_paths)) - 1.0) < 1e-6
+
+
+def test_build_server_corpus_unset_router_sample_is_unchanged():
+    """Default (no router_sample) routes through the in-hand build -- identical
+    token counts to the existing path (byte-identical baseline preserved)."""
+    from opendipaco.launch import LaunchConfig
+    from opendipaco.launch.config import dipaco_config
+    from opendipaco.launch.roles import build_corpus, build_documents, build_server_corpus
+
+    spec_cfg = {
+        "model": {"vocab_size": VOCAB, "hidden_size": 32, "num_attention_heads": 4,
+                  "intermediate_size": 64, "layers_per_level": [1, 1],
+                  "level_sizes": [2, 2], "sequence_length": SEQ,
+                  "max_position_embeddings": 64},
+        "data": {"source": "synthetic", "num_documents": 32, "ship": "spec",
+                 "synthetic_topics": 4, "synthetic_doc_len": 48},
+    }
+    cfg = LaunchConfig.from_dict(spec_cfg)
+    model = dipaco_config(cfg.model)
+    streamed = build_server_corpus(cfg, model)
+    in_hand = build_corpus(cfg, model, build_documents(cfg))
+    assert streamed.token_counts == in_hand.token_counts
 
 
 def test_spec_corpus_refuses_to_serve_bytes():

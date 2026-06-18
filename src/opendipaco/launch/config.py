@@ -77,6 +77,11 @@ class DataCfg:
     shard_cache_dir: str | None = None # directory for sharded resumable ingestion
     routing: str = "kmeans"            # "kmeans" | "round_robin"
     router_seed: int = 0
+    # W7b: fit the router on the first N streamed documents instead of the whole
+    # corpus, so the server (spec mode) never holds every document in RAM. None
+    # (default) = off, byte-identical (fit on all docs in hand). Sampling changes
+    # the centroids -> the shards differ from the unsampled run; spec mode only.
+    router_sample: int | None = None
     # "bytes": the server holds the corpus and ships packed shards (default).
     # "spec": the server ships a shard *recipe*; workers materialize shards
     # locally from the public source (data/spec.py). No per-path val split.
@@ -425,6 +430,16 @@ class LaunchConfig:
         wms = kw["run"].worker_max_shards
         if wms is not None and wms < 1:
             raise ValueError(f"run.worker_max_shards must be >= 1, got {wms}")
+        # W7b: sampled router fitting only saves memory in spec mode (bytes mode
+        # holds every document anyway to ship it), and it changes the shards, so
+        # gate it to spec mode and require a positive sample.
+        rs = kw["data"].router_sample
+        if rs is not None:
+            if rs < 1:
+                raise ValueError(f"data.router_sample must be >= 1, got {rs}")
+            if kw["data"].ship != "spec":
+                raise ValueError("data.router_sample requires data.ship: spec "
+                                 "(it only saves memory when the server ships recipes)")
         # Decentralized scheduling is built on the replicated owner tier, so it
         # requires rendezvous ownership (Phase 4 D9). Catch the mismatch at load
         # rather than half-wiring a run with no owners to mint grants.
