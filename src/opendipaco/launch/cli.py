@@ -80,7 +80,7 @@ def cmd_join(args) -> int:
     run_join(scheduler=args.scheduler, tracker=args.tracker, auth_key=args.auth,
              identity_key=args.identity, device=args.device, max_tasks=args.max_tasks,
              server_pub=args.server_pub, data_dir=args.data_dir, max_mbps=args.max_mbps,
-             quiet=args.quiet)
+             max_shards=args.max_shards, quiet=args.quiet)
     return 0
 
 
@@ -190,6 +190,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_join.add_argument("--max-mbps", type=float, default=None,
                         help="hard bandwidth cap in megabits/sec (send+recv)")
     p_join.add_argument("--max-tasks", type=int, default=None)
+    p_join.add_argument("--max-shards", type=int, default=None,
+                        help="materialized shards kept resident (bounded LRU; default 4)")
     p_join.add_argument("--server-pub", default=None,
                         help="pin the manifest signer's pubkey (else trust-on-first-use)")
     p_join.add_argument("--data-dir", default=None, help="cache dir for spec-materialized shards")

@@ -62,6 +62,12 @@ def test_from_dict_rejects_bad_mode():
         LaunchConfig.from_dict({"mode": "potato"})
 
 
+def test_from_dict_rejects_nonpositive_max_shards():
+    with pytest.raises(ValueError, match="worker_max_shards"):
+        LaunchConfig.from_dict({"run": {"worker_max_shards": 0}})
+    assert LaunchConfig.from_dict({"run": {"worker_max_shards": 1}}).run.worker_max_shards == 1
+
+
 def test_transport_kind_parses_and_validates():
     """W1d: transport.kind selects the substrate (tcp default, libp2p opt-in)."""
     assert LaunchConfig.from_dict({}).transport.kind == "tcp"

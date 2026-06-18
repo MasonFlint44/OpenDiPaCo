@@ -55,6 +55,7 @@ from .compress import (
     state_digest,
 )
 from .distributed import (
+    _ShardCache,
     _build_worker_engine,
     _commit_residuals,
     _compress_contribution,
@@ -2541,7 +2542,7 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
                        fault_hook=None, tls=None, tls_hostname=None,
                        data_dir=None, data_source=None, data_tokenizer=None,
                        max_batch_size=None, transport="tcp", identity=None,
-                       stop_event=None, bucket=None):
+                       stop_event=None, bucket=None, max_shards=4):
     """Train path-tasks for a sharded scheduler + parameter servers.
 
     Per task: lease from the scheduler, fetch the path's modules from the owning
@@ -2558,7 +2559,7 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
     worker = AsyncScheduler(engine, num_workers=1)
     wid = uuid.uuid4().hex
     warm: set = set()
-    shard_cache: dict = {}
+    shard_cache = _ShardCache(max_shards)   # bounded LRU of materialized shards (W7a)
     versions: dict = {}          # shared key -> held (trained-against / nominal) version
     keyframes: dict = {}         # shared key -> (version, exact state) baseline for deltas (W2a)
     residuals: dict = {}         # path -> {key: [tensors]}: compression error feedback

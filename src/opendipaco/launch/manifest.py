@@ -44,11 +44,15 @@ MANIFEST_KIND = "run_manifest"
 # ``torch.save``/cache at an attacker-chosen path (a write sink). The joiner
 # supplies its own cache via ``--data-dir``.
 _STRIP = {
-    # Credentials + a volunteer-local resource knob (max_mbps is the joiner's own
-    # `--max-mbps`, not a run property -- carrying the operator's value would
-    # silently cap volunteers).
+    # Credentials + volunteer-local resource knobs. These describe the *joiner's
+    # own* hardware budget (its bandwidth, VRAM, RAM), not a property of the run,
+    # so carrying the operator's value would silently constrain volunteers --
+    # max_mbps -> the joiner's `--max-mbps`; worker_max_batch -> its VRAM batch
+    # cap; worker_max_shards -> its resident-shard RAM cap (the joiner sets these
+    # via flags/config, falling back to the library default, never the operator's).
     "transport": ("auth_key", "grant_key", "identity_key", "accept_keys",
                   "admitted_peers", "max_mbps"),
+    "run": ("worker_max_batch", "worker_max_shards"),
     "tls": ("certfile", "keyfile", "cafile"),
     "data": ("cache_path", "shard_cache_dir"),
 }

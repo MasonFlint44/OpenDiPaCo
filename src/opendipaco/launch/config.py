@@ -332,6 +332,14 @@ class RunCfg:
     # Worker-advertised batch cap: the server clamps this worker's task batch
     # size to it (small-VRAM volunteers train smaller batches instead of OOMing).
     worker_max_batch: int | None = None
+    # W7a: how many materialized shards a worker keeps resident (bounded LRU). A
+    # worker that fails over across many paths would otherwise hold every shard;
+    # the LRU drops the least-recently-used and re-materializes on the next lease.
+    # The one-path common case holds a single entry. Byte-identical to training.
+    # None -> the worker's library default; like worker_max_batch this is a
+    # volunteer-local knob, stripped from the published manifest so a joiner never
+    # inherits the operator's value (see manifest._STRIP).
+    worker_max_shards: int | None = None
     # W5 task sizing (sharded mode; docs/w5-task-sizing-design.md). None (default)
     # = off, byte-identical: every task is the configured size. When set, the
     # scheduler sizes each task from the worker's measured rate so its lease lands
@@ -412,6 +420,11 @@ class LaunchConfig:
         if kw["run"].task_seconds is not None and kw["mode"] != "sharded":
             raise ValueError("run.task_seconds requires mode: sharded "
                              "(throughput-measured sizing is a scheduler lease feature)")
+        # W7a: the shard cache must hold at least the in-flight shard (None ->
+        # the worker's library default, so only an explicit value is checked).
+        wms = kw["run"].worker_max_shards
+        if wms is not None and wms < 1:
+            raise ValueError(f"run.worker_max_shards must be >= 1, got {wms}")
         # Decentralized scheduling is built on the replicated owner tier, so it
         # requires rendezvous ownership (Phase 4 D9). Catch the mismatch at load
         # rather than half-wiring a run with no owners to mint grants.

@@ -569,6 +569,7 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             max_tasks=mt, reconnect=True,
             heartbeat_interval=cfg.transport.heartbeat_interval,
             data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch,
+            max_shards=cfg.run.worker_max_shards,
             transport="libp2p", identity=_node_identity(cfg, generate=True),
             stop_event=stop_event or _wait_for_signal())
         return
@@ -596,6 +597,7 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             heartbeat_interval=cfg.transport.heartbeat_interval,
             tls=build_tls_client(cfg), tls_hostname=cfg.tls.server_hostname,
             data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch,
+            max_shards=cfg.run.worker_max_shards,
             stop_event=stop_event or _wait_for_signal(), bucket=bucket)
     else:
         if bucket is not None:
@@ -608,7 +610,8 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             auth_key=auth, max_tasks=mt,
             heartbeat_interval=cfg.transport.heartbeat_interval,
             tls=build_tls_client(cfg), tls_hostname=cfg.tls.server_hostname,
-            data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch)
+            data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch,
+            max_shards=cfg.run.worker_max_shards)
 
 
 def run_local(cfg: LaunchConfig):

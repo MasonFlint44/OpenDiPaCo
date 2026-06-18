@@ -191,7 +191,7 @@ class HealthReporter:
 
 def run_join(*, scheduler=None, tracker=None, auth_key=None, identity_key=None,
              device=None, max_tasks=None, server_pub=None, data_dir=None, max_mbps=None,
-             quiet: bool = False, tls=None, stop_event=None) -> None:
+             max_shards=None, quiet: bool = False, tls=None, stop_event=None) -> None:
     """Join a run from connection flags + the fetched manifest (W6 slice a).
 
     Exactly one of ``scheduler`` / ``tracker`` is the dial target (and the
@@ -240,8 +240,11 @@ def run_join(*, scheduler=None, tracker=None, auth_key=None, identity_key=None,
     for n in notes:
         print(f"[join] {n}")
 
+    run_over = {"device": dev, "max_tasks": max_tasks}
+    if max_shards is not None:
+        run_over["worker_max_shards"] = max_shards
     overrides: dict = {
-        "run": {"device": dev, "max_tasks": max_tasks},
+        "run": run_over,
         "transport": {"auth_key": auth_key, "identity_key": identity_key},
         "diloco": diloco_overrides,
     }

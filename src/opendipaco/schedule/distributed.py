@@ -41,6 +41,7 @@ import ssl
 import threading
 import time
 import uuid
+from collections import OrderedDict
 
 import torch
 
@@ -475,6 +476,7 @@ def run_worker(
     data_source=None,
     data_tokenizer=None,
     max_batch_size: int | None = None,
+    max_shards: int = 4,
 ):
     """Connect to a coordinator and train leased path-tasks until told to stop.
 
@@ -510,7 +512,7 @@ def run_worker(
     worker = AsyncScheduler(engine, num_workers=1)
     wid = uuid.uuid4().hex
     warm: set = set()        # paths whose private modules + Adam state are held warm
-    shard_cache: dict = {}   # path -> shard tensor (fetched once)
+    shard_cache = _ShardCache(max_shards)   # bounded LRU of materialized shards (W7a)
     versions: dict = {}      # shared key -> version currently held
     attempts: dict = {}
     residuals: dict = {}     # path -> {key: [tensors]}: compression error feedback
@@ -687,6 +689,54 @@ def _commit_residuals(residuals, path, pending) -> None:
     """Adopt a contribution's error-feedback residuals after the server applied it."""
     if pending:  # per-key update: an empty contribution must not wipe the carry
         residuals.setdefault(path, {}).update(pending)
+
+
+class _ShardCache:
+    """Bounded LRU of materialized shards (``path -> tensor``), W7a.
+
+    A long-lived worker that fails over / is re-assigned across many paths would
+    otherwise keep *every* shard it ever leased resident (the plain dict it
+    replaces never evicts). This caps how many it holds; the least-recently-used
+    shard is dropped on overflow and re-built on its next lease -- from the spec
+    (cheap when the on-disk cache is warm) or from the shipped bytes. Training is
+    **byte-identical**: eviction changes only *when* a shard is rebuilt, never its
+    contents. The common one-path worker holds a single entry and never evicts.
+
+    Supports exactly the dict operations the worker loops use: ``path in cache``,
+    ``cache[path]`` (get marks most-recently-used), ``cache[path] = shard``, and
+    ``list(cache)`` for the ``cached_shards`` advertisement.
+    """
+
+    def __init__(self, maxsize: int | None = 4):
+        maxsize = 4 if maxsize is None else int(maxsize)   # None -> library default
+        if maxsize < 1:
+            raise ValueError(f"shard cache maxsize must be >= 1, got {maxsize}")
+        self._max = maxsize
+        self._d: OrderedDict = OrderedDict()
+
+    def __contains__(self, path) -> bool:
+        return path in self._d
+
+    def __getitem__(self, path):
+        self._d.move_to_end(path)          # touched -> most-recently-used
+        return self._d[path]
+
+    def __setitem__(self, path, shard) -> None:
+        self._d[path] = shard
+        self._d.move_to_end(path)
+        while len(self._d) > self._max:
+            self._d.popitem(last=False)    # evict least-recently-used
+
+    def __iter__(self):
+        # The worker drives the cache from a single serve thread (get/set and the
+        # `list(cache)` advertisement never overlap), so iteration is already safe;
+        # the cheap tuple() snapshot just keeps it that way if a future caller ever
+        # iterates while a get reorders the mapping. It is not a substitute for a
+        # lock -- a second *writer* thread would need real synchronization.
+        return iter(tuple(self._d))
+
+    def __len__(self) -> int:
+        return len(self._d)
 
 
 def _apply_task(engine, msg, shard_cache, versions, warm, residuals,
