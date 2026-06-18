@@ -12,6 +12,7 @@ a minimal file (even ``{}``) is valid and you only override what you need.
 """
 
 import dataclasses
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -157,6 +158,15 @@ class TransportCfg:
     # and error-feeds the dropped mass. 1.0 (default) = dense = byte-identical.
     # Changes numerics -> validate with examples/validate_dynamics.py. Sharded only.
     up_density: float = 1.0
+    # W6b: a worker's hard bandwidth ceiling in megabits/sec (bytes sent+received,
+    # aggregate across its sockets). None = no cap. A volunteer-side knob; servers
+    # ignore it. Mainly set via `opendipaco join --max-mbps`.
+    max_mbps: float | None = None
+    # W6c: scheduler-side. When True, a worker that advertises a max_mbps budget
+    # gets a lighter per-task UPLINK encoding (compress/up_density), never lighter
+    # than the base. Off (default) = byte-identical. Mixes lossy levers per path
+    # (§0f dynamics), so opt-in. Central sharded scheduler only.
+    tailor_bandwidth: bool = False
     # When set, idle replies tell workers to wait this many seconds before
     # polling again (server-paced; otherwise workers use their own tight poll).
     idle_backoff: float | None = None
@@ -381,6 +391,18 @@ class LaunchConfig:
         if not 0.0 < kw["transport"].up_density <= 1.0:
             raise ValueError("transport.up_density must be in (0, 1], got "
                              f"{kw['transport'].up_density!r}")
+        mbps = kw["transport"].max_mbps
+        if mbps is not None and not (isinstance(mbps, (int, float))
+                                     and math.isfinite(mbps) and mbps > 0):
+            raise ValueError("transport.max_mbps must be a positive number (megabits/sec) "
+                             f"or null for no cap, got {mbps!r}")
+        # Per-worker uplink tailoring is a central-scheduler lease feature (it
+        # stamps the task encoding); inert without a central sharded scheduler, so
+        # fail fast rather than silently do nothing (as down/up_density/task_seconds).
+        if kw["transport"].tailor_bandwidth and not (
+                kw["mode"] == "sharded" and kw["schedule"].mode == "central"):
+            raise ValueError("transport.tailor_bandwidth requires mode: sharded with "
+                             "schedule.mode: central (it is a central-scheduler feature)")
         if kw["transport"].up_density < 1.0 and kw["mode"] != "sharded":
             raise ValueError("transport.up_density < 1.0 requires mode: sharded "
                              "(it is stamped on sharded tasks)")

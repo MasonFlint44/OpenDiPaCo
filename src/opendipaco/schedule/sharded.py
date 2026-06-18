@@ -81,6 +81,7 @@ from .ownership import (
 )
 from .reactor import DEFAULT_MAX_MSG_BYTES, _ReactorServer
 from .scheduler import AsyncScheduler
+from .throttle import tailor_encoding, throttled
 from .wire import _key_bytes, client_handshake, recv_msg, send_msg
 
 
@@ -1724,7 +1725,8 @@ class Scheduler(_ReactorServer):
                  reputation=None, rate_limiter=None, min_owner_reputation=0.25,
                  redundancy=3, redundancy_rate=0.0, audit_timeout=60.0,
                  private_policy="overwrite", down="full", up_density=1.0,
-                 task_seconds=None, park_factor=3.0, min_task_rate=None, **reactor_kw):
+                 task_seconds=None, park_factor=3.0, min_task_rate=None,
+                 tailor_bandwidth=False, **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         # W5b: target wall-time per task. None (default) -> no sizing, every task
         # is the configured (batch_size, inner_steps) -> byte-identical anchor.
@@ -1785,6 +1787,12 @@ class Scheduler(_ReactorServer):
         if not 0.0 < up_density <= 1.0:
             raise ValueError(f"up_density must be in (0, 1], got {up_density!r}")
         self.up_density = float(up_density)
+        # W6c: when True, a worker that advertises a max_mbps budget gets a lighter
+        # per-task UPLINK encoding (compress/up_density) from tailor_encoding, never
+        # lighter than the base. Off (default) -> every task uses the global
+        # encoding -> byte-identical. It mixes lossy uplink levers across a path's
+        # workers, a §0f dynamics property like the W2 levers, so it is opt-in.
+        self.tailor_bandwidth = bool(tailor_bandwidth)
         self.idle_backoff = idle_backoff      # server-paced idle polling (retry_in)
         self._worker_caps: dict = {}          # worker_id -> advertised capabilities
         self.config = config
@@ -1800,6 +1808,9 @@ class Scheduler(_ReactorServer):
         )
         self.heartbeat_timeout = heartbeat_timeout
         self.total_rounds = None
+        # Optional run manifest (W6): the operator's launch config minus secrets,
+        # served to flags-only `opendipaco join` clients via the `manifest` RPC.
+        self._run_manifest: dict | None = None
 
         # key -> (host, port) of the owning parameter server.
         self.ps_addrs = [_addr_key(a) for a in ps_addrs]
@@ -1843,7 +1854,13 @@ class Scheduler(_ReactorServer):
         if kind == "epoch":
             with self._lock:
                 return {"type": "epoch", "record": self._epoch_record}
+        if kind == "manifest":   # W6: serve the run manifest to a joining worker
+            return {"type": "manifest", "manifest": self._run_manifest}
         return None
+
+    def serve_manifest(self, manifest: dict | None) -> None:
+        """Publish the run manifest this scheduler serves to joining workers (W6)."""
+        self._run_manifest = manifest
 
     def publish_epoch(self, owner_records, *, k=3, salt="", bootstrap=None) -> dict:
         """Build, sign, and serve the next owner-set epoch.
@@ -2081,16 +2098,31 @@ class Scheduler(_ReactorServer):
                               "spec": self.corpus.spec}
             else:
                 shard = self.corpus.shard(self.topology.path_index(path))
+        # W6c: tailor THIS worker's uplink encoding to its advertised budget (never
+        # lighter than the global). Off / no budget advertised -> the global
+        # (compress, up_density) -> byte-identical. down stays global (delta needs
+        # the owner keyframe ring). The shard cast is mode-agnostic + lossless, so
+        # the audit's raw-delta digest is unaffected by a per-worker compress.
+        comp, dens = self.compress, self.up_density
+        # Skip checks (their stamped encoding is inert -- the check path never
+        # pushes; tailoring it would only mislead) and validate the worker-supplied
+        # budget is a real number before comparing it (a hostile/old worker could
+        # send a non-numeric caps value -- don't crash the lease handler).
+        mbps = caps.get("max_mbps")
+        if (self.tailor_bandwidth and not check_only
+                and isinstance(mbps, (int, float)) and not isinstance(mbps, bool)):
+            comp, dens = tailor_encoding(mbps, base_compress=self.compress,
+                                         base_density=self.up_density)
         task = {
             "type": "task",
             "gen_id": generation,
             "lease": lease,
             "path": path,
             "routing": routing,
-            "compress": self.compress,  # uplink encoding the worker should use
-            "density": self.up_density,  # uplink top-k sparsification (W2b); 1.0 = dense
+            "compress": comp,           # uplink encoding the worker should use
+            "density": dens,            # uplink top-k sparsification (W2b); 1.0 = dense
             "down": self.down,          # downlink policy: keep keyframes for deltas (W2a)
-            "shard": compress_shard(shard, self.compress),
+            "shard": compress_shard(shard, comp),
             "shard_spec": shard_spec,
             "batch_size": batch,
             "total_rounds": self.total_rounds,
@@ -2509,7 +2541,7 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
                        fault_hook=None, tls=None, tls_hostname=None,
                        data_dir=None, data_source=None, data_tokenizer=None,
                        max_batch_size=None, transport="tcp", identity=None,
-                       stop_event=None):
+                       stop_event=None, bucket=None):
     """Train path-tasks for a sharded scheduler + parameter servers.
 
     Per task: lease from the scheduler, fetch the path's modules from the owning
@@ -2534,6 +2566,11 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
     caps = {"device": str(device)}
     if max_batch_size is not None:
         caps["max_batch"] = int(max_batch_size)
+    if bucket is not None:
+        # W6c: advertise the bandwidth budget so a tailoring scheduler can pick a
+        # lighter per-task uplink encoding for this worker (no-op unless the
+        # scheduler opts in; the worker decodes whatever the task stamps).
+        caps["max_mbps"] = bucket.rate * 8 / 1e6
     state = {"done": 0}
 
     if transport == "libp2p":
@@ -2573,6 +2610,15 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
     backoff = 0.05
     while True:
         try:
+            # The scheduler *control* socket is deliberately NOT throttled: a
+            # throttle sleep there runs while the link lock is held (sch_rpc/
+            # sch_send serialize on it), which would starve the heartbeat thread
+            # under a low cap -- the shared token debt from a big PS fetch makes
+            # even a tiny control send sleep, and a missed heartbeat loses the
+            # lease + fences committed work. Control traffic is tiny; the cap
+            # covers the bulk fetch/push on the PS sockets below. (In bytes-mode
+            # data shipping the shard also rides this socket and is thus uncapped;
+            # use data.ship: spec for a fully-capped run.)
             sch = _ps_connect(tuple(scheduler_addr), auth_key, max_msg_bytes,
                               connect_timeout if first else reconnect_timeout,
                               tls=tls, server_hostname=tls_hostname or scheduler_addr[0])
@@ -2580,9 +2626,10 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
             return  # scheduler unreachable
         first = False
         # One link per scheduler connection: it owns the PS connection cache, so
-        # a reconnect naturally drops stale PS sockets (fresh link next loop).
+        # a reconnect naturally drops stale PS sockets (fresh link next loop). The
+        # bucket throttles the PS (fetch/push) sockets -- the bulk of the traffic.
         link = _WorkerLink(sch, auth_key=auth_key, max_msg_bytes=max_msg_bytes,
-                           connect_timeout=connect_timeout, tls=tls)
+                           connect_timeout=connect_timeout, tls=tls, bucket=bucket)
         clean = False
         try:
             clean = _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions,
@@ -2890,7 +2937,8 @@ def _push_group(routing, grant, shared_payload, private_payload, link) -> set:
     return failed
 
 
-def _ps_connect(addr, auth_key, max_msg_bytes, timeout, *, tls=None, server_hostname=None):
+def _ps_connect(addr, auth_key, max_msg_bytes, timeout, *, tls=None, server_hostname=None,
+                bucket=None):
     import socket as _socket
     deadline = time.monotonic() + timeout
     last = None
@@ -2903,7 +2951,9 @@ def _ps_connect(addr, auth_key, max_msg_bytes, timeout, *, tls=None, server_host
             if not client_handshake(s, auth_key):
                 s.close()
                 raise PermissionError(f"auth rejected by {addr}")
-            return s
+            # W6b: wrap *after* the (tiny) handshake so only the bulk
+            # fetch/push traffic is metered against the bandwidth cap.
+            return throttled(s, bucket)
         except ssl.SSLError:  # handshake/cert failure is fatal -- don't retry-to-timeout
             s.close()
             raise
@@ -2937,13 +2987,15 @@ class _WorkerLink:
     implementation (W1b step 3) swaps the byte pipe without touching the worker
     loop, which now speaks only to this seam."""
 
-    def __init__(self, sch_sock, *, auth_key, max_msg_bytes, connect_timeout, tls=None):
+    def __init__(self, sch_sock, *, auth_key, max_msg_bytes, connect_timeout, tls=None,
+                 bucket=None):
         self._sch = sch_sock
         self._lock = threading.Lock()
         self._auth = auth_key
         self._max = max_msg_bytes
         self._timeout = connect_timeout
         self._tls = tls
+        self._bucket = bucket   # W6b bandwidth throttle (None = no cap); wraps PS sockets
         self._ps: dict = {}   # addr_key -> connected socket
 
     def sch_send(self, msg) -> None:
@@ -2967,7 +3019,7 @@ class _WorkerLink:
         sock = self._ps.get(addr)
         if sock is None:
             sock = _ps_connect(addr, self._auth, self._max, self._timeout,
-                               tls=self._tls, server_hostname=addr[0])
+                               tls=self._tls, server_hostname=addr[0], bucket=self._bucket)
             self._ps[addr] = sock
         try:
             return _rpc(sock, msg, self._max)
@@ -3275,7 +3327,7 @@ def run_decentralized_worker(config, diloco, tracker_addr, corpus, *, identity,
                              total_rounds=0, max_tasks=None, reachability="nat",
                              heartbeat_interval=3.0, poll_interval=0.05,
                              max_msg_bytes=DEFAULT_MAX_MSG_BYTES, connect_timeout=10.0,
-                             tls=None, stop_event=None, fault_hook=None):
+                             tls=None, stop_event=None, fault_hook=None, bucket=None):
     """Self-assigning worker for a decentralized swarm (``schedule.mode:
     decentralized``): no scheduler, no central grant signer. It registers with
     the rendezvous tracker (role ``worker``), then loops :func:`_serve_decentralized`
@@ -3319,7 +3371,7 @@ def run_decentralized_worker(config, diloco, tracker_addr, corpus, *, identity,
             return []  # tracker blip: a previous epoch persists until it answers
 
     link = _WorkerLink(None, auth_key=auth_key, max_msg_bytes=max_msg_bytes,
-                       connect_timeout=connect_timeout, tls=tls)
+                       connect_timeout=connect_timeout, tls=tls, bucket=bucket)
     try:
         _serve_decentralized(
             link, engine, worker, identity.peer_id, corpus, directory_fn,
