@@ -12,7 +12,7 @@ reports the probe-loss delta + the screen verdict for each. The clean update sho
 pass (delta <= the margin); the poisoned one should be flagged.
 
     python examples/validate_poisoning.py
-    POISON=randtok HIDDEN=64 INNER=8 PROBE_DOCS=16 python examples/validate_poisoning.py
+    INNER=150 PROBE_DOCS=24 HIDDEN=96 python examples/validate_poisoning.py
 
 HONEST CAVEAT: this shows the screen catches *crude* poisoning (random/garbage
 data that hurts clean-data loss). A *targeted* backdoor tuned to leave clean-probe
@@ -47,23 +47,23 @@ DOCS = _i("DOCS", 32)
 DOC_LEN = _i("DOC_LEN", 48)
 SEQ = _i("SEQ", 16)
 SEED = _i("SEED", 0)
-POISON = os.environ.get("POISON", "randtok")   # randtok = uniform-random tokens
 
 
 def _topic_docs(n, gen):
-    """Structured 'clean' docs: each is drawn from one narrow token band, so the
-    model can actually learn next-token structure (and a poisoned update visibly
-    hurts it)."""
+    """``n`` structured 'clean' docs: each drawn from one narrow token band, so the
+    model can learn next-token structure (and a poisoned update visibly hurts it)."""
     span = max(1, VOCAB // 4)
-    return [torch.randint(t * span, min((t + 1) * span, VOCAB), (DOC_LEN,), generator=gen)
-            for t in range(4) for _ in range(max(1, n // 4))]
+    return [torch.randint((t % 4) * span, min((t % 4 + 1) * span, VOCAB), (DOC_LEN,),
+                          generator=gen)
+            for t in range(n)]
 
 
 def _poison_shard(gen):
-    if POISON == "randtok":                    # uniform noise over the whole vocab
-        return torch.randint(0, VOCAB, (DOCS, SEQ), generator=gen)
-    # "flip": shift every token -> train to predict the wrong next token
-    return (_clean_shard(gen) + VOCAB // 2) % VOCAB
+    # Uniform-random tokens: training drags the model toward predicting noise, which
+    # raises loss on the structured clean probe. (A structure-preserving relabel --
+    # e.g. shifting every token -- would NOT poison: the model just learns the
+    # shifted structure, so the screen wouldn't flag it.)
+    return torch.randint(0, VOCAB, (DOCS, SEQ), generator=gen)
 
 
 def _clean_shard(gen):
@@ -98,15 +98,16 @@ def main() -> None:
     clean_b, clean_a = _probe_delta(_clean_shard(g))
     pois_b, pois_a = _probe_delta(_poison_shard(g))
 
-    print(f"poison={POISON} inner={INNER} probe_docs={PROBE_DOCS} hidden={HIDDEN}")
+    print(f"inner={INNER} probe_docs={PROBE_DOCS} hidden={HIDDEN}")
     print(f"  clean shard:    probe {clean_b:.4f} -> {clean_a:.4f} "
           f"(delta {clean_a - clean_b:+.4f})  harmful={is_harmful(clean_b, clean_a)}")
     print(f"  poisoned shard: probe {pois_b:.4f} -> {pois_a:.4f} "
           f"(delta {pois_a - pois_b:+.4f})  harmful={is_harmful(pois_b, pois_a)}")
     ok = (not is_harmful(clean_b, clean_a)) and is_harmful(pois_b, pois_a)
-    print(f"  screen verdict: {'PASS' if ok else 'INCONCLUSIVE'} "
-          f"(clean accepted, poisoned flagged)" if ok else
-          "  screen verdict: INCONCLUSIVE (tune INNER/PROBE_DOCS; small toy models are noisy)")
+    if ok:
+        print("  screen verdict: PASS (clean accepted, poisoned flagged)")
+    else:
+        print("  screen verdict: INCONCLUSIVE (tune INNER/PROBE_DOCS; small toy models are noisy)")
 
 
 if __name__ == "__main__":

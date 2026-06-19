@@ -91,21 +91,38 @@ def _server_kw(cfg: LaunchConfig, extra_admitted=None) -> dict:
 
 def _build_probe(cfg: LaunchConfig, model):
     """The W8 trusted probe: the first ``robustness.probe_docs`` documents streamed
-    from the public source, packed to the model's seq_len. A clean slice of the
-    public corpus -- a poisoned contribution still raises loss on it. Streamed
+    from the public source, packed to the model's seq_len. A clean **in-distribution
+    slice** of the public corpus (not a separate held-out set -- a poisoned update
+    still raises loss on it; held-out curation is an operator refinement). Streamed
     (bounded), deterministic. Returns a ``[N, seq_len]`` long tensor, or None when
-    the screen is off."""
+    the screen is off / the source can't be read.
+
+    Reading the source can fail transiently (a C4 stream at scheduler startup); that
+    degrades to None + a warning (run without the screen) rather than aborting the
+    scheduler. An *empty* probe from a too-small/too-short source is a deterministic
+    misconfiguration and raises -- a silently-inert screen is worse than a clear error.
+    """
     if not cfg.robustness.probe_docs:
         return None
     from ..data.sharding import pack_sequences
     from ..data.spec import iter_spec_documents
     source = _spec_source(cfg)
     docs = []
-    for doc in iter_spec_documents({"source": source}):
-        docs.append(doc)
-        if len(docs) >= cfg.robustness.probe_docs:
-            break
-    return pack_sequences(docs, model.sequence_length)
+    try:
+        for doc in iter_spec_documents({"source": source}):
+            docs.append(doc)
+            if len(docs) >= cfg.robustness.probe_docs:
+                break
+    except Exception as e:   # transient source/stream failure -> degrade, don't crash
+        print(f"WARNING: could not read the public source to build the data-poisoning "
+              f"probe ({e}); running WITHOUT the screen.", flush=True)
+        return None
+    probe = pack_sequences(docs, model.sequence_length)
+    if probe.numel() == 0:
+        raise ValueError(
+            f"robustness.probe_docs={cfg.robustness.probe_docs} yielded an empty probe "
+            "(the source returned too few/too-short documents); the screen would be inert")
+    return probe
 
 
 def _scheduler_robustness_kw(cfg: LaunchConfig, model=None) -> dict:

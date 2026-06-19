@@ -60,21 +60,27 @@ composes and trains the full path** on the pinned base — so it can, at margina
 cost, also measure the probe-loss effect of the update it just reproduced and
 report it.
 
-- **Trusted probe.** A small, clean, operator-curated held-out batch (like a val
-  split), shipped with the run config / manifest. Trust model: operator-curated,
-  pinned/TOFU like the manifest (W6). Decentralized probe-trust (quorum-curated)
-  is harder — owed, noted below.
+- **Trusted probe.** A small, clean batch the operator curates. *As implemented*
+  (`_build_probe`) it is an **in-distribution slice** of the public source (the
+  first `probe_docs` documents), not a separate held-out set — a poisoned update
+  still raises loss on it (it can't overfit a probe it never trained on), so the
+  signal holds, but the probe measures "corruption on clean in-distribution data,"
+  not generalization to unseen data. A genuinely held-out / curated probe is an
+  operator refinement (owed). Trust model: operator-curated, pinned/TOFU like the
+  manifest (W6); decentralized probe-trust (quorum-curated) is harder — owed.
 - **Signal.** The checker reports `probe_delta = probe_loss(trained_local) −
   probe_loss(base)` for the path it reproduced (both on the trusted probe). An
   honest update drives this ≤ ~0 (or within a margin); a poisoned update drives
   it clearly positive.
 - **Verdict.** Separate from the digest-agreement reputation tally (which stays
-  Phase 3c's). Probe screening is a **contribution-quality gate**: when a quorum
-  of checkers report `probe_delta` above a margin, the audited contribution is
-  **rejected** (not aggregated) and recorded. Reputation impact is threat-model
-  aware — debit the worker only where it *chose* its data; for server-supplied
-  data the contribution is rejected and surfaced (a corpus-quality alarm), not
-  blamed on the worker.
+  Phase 3c's). When a quorum of checkers report `probe_delta` above a margin, the
+  audit records a `poison_flagged` metric. *Post-hoc, like the digest audit* — the
+  audit resolves after the primary already committed + pushed, so this **surfaces
+  and deters; it does not roll back** the applied update (matching how digest
+  disagreement debits-but-doesn't-unapply). Reputation impact is threat-model
+  aware: `probe_debit` (off by default) debits the primary only where it *chose*
+  its data; in the sharded path data is server-supplied, so a harmful verdict is a
+  **corpus-quality alarm**, not worker blame.
 
 ## Slices
 
@@ -155,6 +161,15 @@ checkers (aborted/empty-shard) lower detection power in the *safe* direction
 - Roadmap + `remaining-gaps.md` updated.
 
 ## Honest limitations (state them, don't paper over)
+- **The probe is an in-distribution slice, not held-out.** `_build_probe` uses the
+  first `probe_docs` documents of the public source, which overlap training data.
+  The screen still works (a poison-trained update raises loss on clean
+  in-distribution data), but it measures corruption, not generalization; a curated
+  held-out probe is an operator refinement (owed).
+- **The screen rides redundancy, not robust aggregation.** It is gated on
+  `redundancy_rate > 0` (audits), independent of `robustness.mode` — an operator
+  can run the poisoning screen without robust aggregation, and `mode: on` is not
+  required to enable it.
 - **The probe must be trusted.** A poisoned probe inverts the defense; trust
   rides the manifest pinning (W6), and decentralized quorum-curation is owed.
 - **Heuristic, not a proof.** Clean-probe loss catches crude poisoning
