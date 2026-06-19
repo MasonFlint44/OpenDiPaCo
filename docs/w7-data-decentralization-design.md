@@ -64,9 +64,14 @@ The operator must build the spec corpus **without holding the whole corpus**.
   prefix sample** (first N docs / reservoir at fixed seed), fits k-means, and
   returns the `kmeans_routing(...)` dict. Deterministic in `(source, sample,
   seed)` → reproducible anywhere.
-- `SpecCorpus.build` already streams counts (no doc retention); route
-  `build_spec_corpus` through `fit_routing_from_source` + `SpecCorpus.build` so
-  the operator never materializes the full doc list.
+- `SpecCorpus.build` already streams counts (no doc retention); a new
+  `build_server_corpus` routes the scheduler/coordinator through
+  `fit_routing_from_source` + `SpecCorpus.build` (when `router_sample` is set) so
+  the operator never materializes the full doc list. Determinism note: k-means++
+  seeds off `randperm(n)` where `n` is the streamed doc count, so reproducibility
+  rests on bit-identical stream replay (synthetic regenerates exactly; pin the C4
+  revision). If the sample yields `< num_paths` docs the fit degrades to
+  round-robin, mirroring the in-hand builder rather than crashing at startup.
 - Bit-for-bit caveat: fitting on a *sample* changes the centroids vs. fitting on
   all docs, so the resulting assignments differ from today's `ship: spec` run.
   This is a **dynamics-adjacent** change (different shards) → gated behind a

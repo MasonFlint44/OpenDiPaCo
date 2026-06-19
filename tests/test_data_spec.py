@@ -142,6 +142,14 @@ def test_fit_routing_from_source_is_deterministic():
     assert torch.equal(a["centroids"], b["centroids"])
 
 
+def test_fit_routing_from_source_falls_back_to_round_robin_when_sample_too_small():
+    """Fewer streamed docs than num_paths can't seed k-means; degrade to round-robin
+    (mirroring the in-hand builder) instead of crashing at server startup."""
+    routing = fit_routing_from_source(_source_spec(), num_paths=PATHS, vocab_size=VOCAB,
+                                      seq_len=SEQ, sample=PATHS - 1, feature_dim=VOCAB)
+    assert routing == round_robin_routing()
+
+
 def test_fit_routing_from_source_matches_full_fit_when_sample_covers_corpus():
     """With sample >= corpus size the streamed fit sees every doc in stream order,
     so it equals the in-hand fit (the unsampled path) bit-for-bit."""

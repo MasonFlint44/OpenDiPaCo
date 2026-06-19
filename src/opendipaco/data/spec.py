@@ -136,39 +136,48 @@ def kmeans_routing(centroids: torch.Tensor, *, vocab_size: int, feature_dim: int
 
 def fit_routing_from_source(source: dict, *, num_paths: int, vocab_size: int,
                             seq_len: int, sample: int, feature_dim: int,
-                            router_seed: int = 0, feat_seed: int = 0,
-                            doc_source=None, tokenizer=None) -> dict:
+                            router_seed: int = 0, doc_source=None,
+                            tokenizer=None) -> dict:
     """Fit the k-means router on a bounded, **deterministic** sample of the public
     source (the first ``sample`` documents) and return a :func:`kmeans_routing`
-    dict (W7b, ``docs/w7-data-decentralization-design.md``).
+    dict -- or :func:`round_robin_routing` if the sample is too small to fit
+    (W7b, ``docs/w7-data-decentralization-design.md``).
 
     The point: the operator builds the shard spec **without ever holding the whole
     corpus** -- it streams at most ``sample`` document prefixes to fit, then
     :meth:`SpecCorpus.build` streams again for the token counts. The fit matches
     the in-hand one (:func:`~opendipaco.launch.roles.build_spec_corpus`): a
-    ``BagOfTokensFeaturizer`` over ``doc[:seq_len]`` prefixes, k-means at
-    ``router_seed``. Fully determined by ``(source, sample, seq_len, feature_dim,
-    feat_seed, router_seed)``, so any peer streaming the same public source
-    reproduces byte-identical centroids -- the basis for slice c's
-    ``verify_routing``.
+    ``BagOfTokensFeaturizer`` (seed 0) over ``doc[:seq_len]`` prefixes, k-means at
+    ``router_seed``.
 
-    Because it fits on a *sample* (not every document), the centroids -- and hence
-    the assignments -- differ from fitting on the full corpus; this path is opt-in
+    **Determinism / reproducibility:** the centroids are a pure function of the
+    *exact prefix sequence* the source yields (k-means++ seeds off ``randperm(n)``
+    where ``n`` is the number of docs actually streamed, so the count itself is an
+    input). A synthetic source regenerates bit-identically; a C4 source is only
+    reproducible if the stream replays the same rows (pin the dataset revision).
+    Under that assumption any peer reproduces byte-identical centroids -- the basis
+    for slice c's ``verify_routing``. Because it fits on a *sample* (not every
+    document) the assignments differ from the full-corpus fit; this path is opt-in
     (``data.router_sample``) and not byte-identical to the unsampled run.
-    ``sample`` must yield at least ``num_paths`` documents (k-means needs one
-    seed per cluster), else :meth:`KMeansRouter.fit` raises.
+
+    If the sample yields fewer than ``num_paths`` documents (a tiny corpus, an
+    over-small ``sample``, or aggressive C4 filtering), k-means cannot seed one
+    centroid per cluster, so this degrades to round-robin -- mirroring the in-hand
+    builder's ``len(docs) < num_paths`` fallback rather than crashing at startup.
     """
     if sample < 1:
         raise ValueError(f"router sample must be >= 1, got {sample}")
-    feat = BagOfTokensFeaturizer(vocab_size, feature_dim=feature_dim, seed=feat_seed)
+    feat = BagOfTokensFeaturizer(vocab_size, feature_dim=feature_dim)
     prefixes: list[torch.Tensor] = []
     for doc in iter_spec_documents({"source": source}, source=doc_source, tokenizer=tokenizer):
         prefixes.append(doc[:seq_len])
         if len(prefixes) >= sample:
             break
+    if len(prefixes) < num_paths:
+        return round_robin_routing()
     router = KMeansRouter(num_paths, seed=router_seed).fit(feat(prefixes))
     return kmeans_routing(router.centroids, vocab_size=vocab_size,
-                          feature_dim=feature_dim, seed=feat_seed)
+                          feature_dim=feature_dim)
 
 
 def _build_predictor(spec: dict):
