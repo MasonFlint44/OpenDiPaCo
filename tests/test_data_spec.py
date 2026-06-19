@@ -226,6 +226,25 @@ def test_verify_routing_detects_tampered_centroids():
     assert verify_routing(spec) is False
 
 
+def test_verify_routing_detects_tampered_featurizer_seed():
+    # Keep the legit centroids but flip ONLY the featurizer seed: materialization
+    # routes through a different projection (different shards), so verification
+    # must reproduce with the shipped seed and refuse the mismatch -- not pass
+    # because the centroids are unchanged.
+    spec = _sampled_spec()
+    spec["routing"]["featurizer"]["seed"] = 7
+    assert verify_routing(spec) is False
+
+
+def test_verify_routing_cant_verify_unknown_featurizer_kind():
+    # A future / tampered featurizer kind can't be reproduced by the bag-of-tokens
+    # re-fit -> report can't-verify, don't falsely reject by fitting the wrong one.
+    spec = _sampled_spec()
+    spec["routing"]["featurizer"]["kind"] = "ngram_hash"
+    with pytest.raises(ValueError, match="featurizer kind"):
+        verify_routing(spec)
+
+
 def test_verify_routing_trivial_for_round_robin():
     spec = make_shard_spec(source=_source_spec(), routing=round_robin_routing(),
                            num_paths=PATHS, seq_len=SEQ)

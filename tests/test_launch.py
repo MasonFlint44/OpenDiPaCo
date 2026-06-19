@@ -69,11 +69,14 @@ def test_from_dict_rejects_nonpositive_max_shards():
 
 
 def test_from_dict_validates_router_sample():
-    # W7b: sampled router fit is spec-mode only and must be positive.
+    # W7b: sampled router fit is spec-mode + kmeans only and must be positive.
     with pytest.raises(ValueError, match="router_sample"):
         LaunchConfig.from_dict({"data": {"ship": "spec", "router_sample": 0}})
     with pytest.raises(ValueError, match="router_sample requires"):
         LaunchConfig.from_dict({"data": {"ship": "bytes", "router_sample": 16}})
+    with pytest.raises(ValueError, match="router_sample requires data.routing"):
+        LaunchConfig.from_dict({"data": {"ship": "spec", "routing": "round_robin",
+                                         "router_sample": 16}})
     assert LaunchConfig.from_dict(
         {"data": {"ship": "spec", "router_sample": 16}}).data.router_sample == 16
 
@@ -326,6 +329,15 @@ def test_decentralized_requires_rendezvous_ownership():
     ok = LaunchConfig.from_dict({**_tiny_dict(), "ownership": {"mode": "rendezvous"},
                                  "schedule": {"mode": "decentralized"}})
     assert ok.schedule.mode == "decentralized"
+
+
+def test_decentralized_rejects_spec_corpus():
+    # The decentralized worker materializes via corpus.shard(), which a SpecCorpus
+    # can't serve -> reject at load instead of crashing on the first lease.
+    with pytest.raises(ValueError, match="does not support data.ship: spec"):
+        LaunchConfig.from_dict({**_tiny_dict(), "ownership": {"mode": "rendezvous"},
+                                "schedule": {"mode": "decentralized"},
+                                "data": {"ship": "spec"}})
 
 
 def test_run_local_sharded_with_robustness_on():

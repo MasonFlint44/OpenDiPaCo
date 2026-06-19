@@ -136,8 +136,8 @@ def kmeans_routing(centroids: torch.Tensor, *, vocab_size: int, feature_dim: int
 
 def fit_routing_from_source(source: dict, *, num_paths: int, vocab_size: int,
                             seq_len: int, sample: int, feature_dim: int,
-                            router_seed: int = 0, doc_source=None,
-                            tokenizer=None) -> dict:
+                            router_seed: int = 0, feat_seed: int = 0,
+                            doc_source=None, tokenizer=None) -> dict:
     """Fit the k-means router on a bounded, **deterministic** sample of the public
     source (the first ``sample`` documents) and return a :func:`kmeans_routing`
     dict -- or :func:`round_robin_routing` if the sample is too small to fit
@@ -147,8 +147,11 @@ def fit_routing_from_source(source: dict, *, num_paths: int, vocab_size: int,
     corpus** -- it streams at most ``sample`` document prefixes to fit, then
     :meth:`SpecCorpus.build` streams again for the token counts. The fit matches
     the in-hand one (:func:`~opendipaco.launch.roles.build_spec_corpus`): a
-    ``BagOfTokensFeaturizer`` (seed 0) over ``doc[:seq_len]`` prefixes, k-means at
-    ``router_seed``.
+    ``BagOfTokensFeaturizer`` (``feat_seed``, default 0) over ``doc[:seq_len]``
+    prefixes, k-means at ``router_seed``. ``feat_seed`` is recorded in the routing
+    dict's featurizer block; ``verify_routing`` passes the *shipped* seed so a
+    spec that flips only the featurizer seed (same centroids, different routing
+    projection) reproduces different centroids and is refused.
 
     **Determinism / reproducibility:** the centroids are a pure function of the
     *exact prefix sequence* the source yields (k-means++ seeds off ``randperm(n)``
@@ -167,7 +170,7 @@ def fit_routing_from_source(source: dict, *, num_paths: int, vocab_size: int,
     """
     if sample < 1:
         raise ValueError(f"router sample must be >= 1, got {sample}")
-    feat = BagOfTokensFeaturizer(vocab_size, feature_dim=feature_dim)
+    feat = BagOfTokensFeaturizer(vocab_size, feature_dim=feature_dim, seed=feat_seed)
     prefixes: list[torch.Tensor] = []
     for doc in iter_spec_documents({"source": source}, source=doc_source, tokenizer=tokenizer):
         prefixes.append(doc[:seq_len])
@@ -177,7 +180,7 @@ def fit_routing_from_source(source: dict, *, num_paths: int, vocab_size: int,
         return round_robin_routing()
     router = KMeansRouter(num_paths, seed=router_seed).fit(feat(prefixes))
     routing = kmeans_routing(router.centroids, vocab_size=vocab_size,
-                             feature_dim=feature_dim)
+                             feature_dim=feature_dim, seed=feat_seed)
     # Record the fit inputs so a peer can reproduce the centroids from the public
     # source alone (W7c verify_routing). seq_len / num_paths already live on the
     # spec; only sample + router_seed are unique to the fit.
@@ -232,10 +235,17 @@ def verify_routing(spec: dict, *, source=None, tokenizer=None,
         raise ValueError("spec has no reproducible fit metadata (built without "
                          "data.router_sample); routing verification needs a sampled fit")
     feat = routing["featurizer"]
+    if feat.get("kind") != "bag_of_tokens":
+        # fit_routing_from_source only rebuilds the bag-of-tokens featurizer
+        # (matching _build_predictor's guard); a different kind can't be
+        # reproduced here, so report can't-verify rather than re-fit the wrong
+        # featurizer and falsely reject.
+        raise ValueError(f"cannot verify featurizer kind {feat.get('kind')!r}")
     recomputed = fit_routing_from_source(
         spec["source"], num_paths=spec["num_paths"], vocab_size=feat["vocab_size"],
         seq_len=spec["seq_len"], sample=fit["sample"], feature_dim=feat["feature_dim"],
-        router_seed=fit["router_seed"], doc_source=source, tokenizer=tokenizer)
+        router_seed=fit["router_seed"], feat_seed=feat.get("seed", 0),
+        doc_source=source, tokenizer=tokenizer)
     if recomputed.get("kind") != "kmeans":
         # The honest re-fit couldn't even seed k-means (the live source yields
         # fewer than num_paths docs right now). That's an inability to reproduce

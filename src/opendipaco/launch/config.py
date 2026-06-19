@@ -445,6 +445,10 @@ class LaunchConfig:
             if kw["data"].ship != "spec":
                 raise ValueError("data.router_sample requires data.ship: spec "
                                  "(it only saves memory when the server ships recipes)")
+            if kw["data"].routing != "kmeans":
+                raise ValueError("data.router_sample requires data.routing: kmeans "
+                                 "(round-robin routing fits no router, so the sample "
+                                 "would be silently ignored)")
         # Decentralized scheduling is built on the replicated owner tier, so it
         # requires rendezvous ownership (Phase 4 D9). Catch the mismatch at load
         # rather than half-wiring a run with no owners to mint grants.
@@ -452,6 +456,16 @@ class LaunchConfig:
             raise ValueError(
                 "schedule.mode: decentralized requires ownership.mode: rendezvous "
                 "(it builds on the replicated owner tier)")
+        # The decentralized worker materializes its shard via corpus.shard(), which
+        # a SpecCorpus cannot serve (it holds recipes, not bytes). Reject spec mode
+        # here at load rather than crash mid-training on the first lease. (Central
+        # sharded / rendezvous ownership DO support spec -- the scheduler ships the
+        # recipe -- so this gate is specific to schedule.mode: decentralized.)
+        if kw["schedule"].mode == "decentralized" and kw["data"].ship == "spec":
+            raise ValueError(
+                "schedule.mode: decentralized does not support data.ship: spec "
+                "(the decentralized worker materializes via corpus.shard(), which a "
+                "spec corpus can't serve); use data.ship: bytes")
         # Decentralized reads confirm a key by cross-replica byte-digest agreement
         # (quorum reads); lossy downlink compression breaks that (the fetched
         # bytes never match the raw-fp32 digest), so reject it at load rather than
