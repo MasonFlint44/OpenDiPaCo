@@ -78,6 +78,18 @@ def is_harmful(before: float, after: float, *, abs_margin: float = 0.05,
     return after - before > abs_margin + rel_margin * abs(before)
 
 
+def as_finite_float(x) -> float | None:
+    """A finite ``float`` from an **untrusted wire value**, or None for anything
+    else (non-numeric, bool, NaN, inf). Checker-reported probe losses cross the
+    wire from an assigned worker, so a Byzantine/buggy checker can send a string or
+    NaN; validate at ingestion before it reaches the screen, or a single bad report
+    crashes audit resolution (``math.isfinite`` raises on a non-number) -- the very
+    failure the screen is supposed to be robust to."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    return float(x) if math.isfinite(x) else None
+
+
 def safe_probe_loss(probe, model: nn.Module) -> float | None:
     """``probe.loss(model)`` for the audit checker, but never raising: the screen
     is an auxiliary measurement on a verification replica, so a malformed probe

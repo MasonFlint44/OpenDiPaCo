@@ -277,7 +277,7 @@ def test_probe_config_is_validated():
     checker punishes an honest primary)."""
     import pytest
     cfg = _cfg()
-    common = dict(batch_size=BATCH, host="127.0.0.1", port=0)
+    common = dict(batch_size=BATCH, host="127.0.0.1", port=0, redundancy_rate=1.0)
     with pytest.raises(ValueError, match="exceeds the available checkers"):
         Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1)], DiLoCoConfig(inner_steps=4),
                   redundancy=3, probe_quorum=3, **common)        # only 2 checkers
@@ -286,11 +286,44 @@ def test_probe_config_is_validated():
                   redundancy=2, probe_quorum=1, probe_debit=True, **common)
 
 
+def test_probe_screen_ignores_malformed_reports():
+    """A Byzantine checker sending a non-numeric probe is dropped at ingestion, not
+    crashed on during resolution -- the valid checkers' quorum still decides."""
+    sched = _serving(redundancy=4, redundancy_rate=1.0, probe_quorum=2,
+                     probe=torch.randint(0, 48, (4, 16)), probe_debit=True)
+    try:
+        key = _audit_primary(sched, "P", "X")
+        _check(sched, key, "BAD", "X", probe=("nan", "boom"))   # non-numeric -> dropped
+        _check(sched, key, "C1", "X", probe=(1.0, 2.0))         # harmful
+        _check(sched, key, "C2", "X", probe=(1.0, 2.0))         # harmful -> quorum 2
+        assert sched.metrics.poison_flagged == 1                # survived + valid quorum decided
+        assert sched.reputation.get("P") < 0.5
+    finally:
+        sched.shutdown()
+
+
+def test_probe_config_rejects_no_checkers():
+    """redundancy=1 means no audits/checkers ever, so a positive probe_quorum could
+    never be reached -- reject it instead of silently disabling the screen."""
+    import pytest
+    cfg = _cfg()
+    common = dict(batch_size=BATCH, host="127.0.0.1", port=0)
+    # redundancy=1: no checkers (rate>0 so the rate guard passes first).
+    with pytest.raises(ValueError, match="exceeds the available checkers"):
+        Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1)], DiLoCoConfig(inner_steps=4),
+                  redundancy=1, redundancy_rate=1.0, probe_quorum=1, **common)
+    # redundancy_rate=0: no audits ever -> screen inert (must match the config-level
+    # guard so a direct Scheduler caller can't silently get an inert screen).
+    with pytest.raises(ValueError, match="needs redundancy_rate > 0"):
+        Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1)], DiLoCoConfig(inner_steps=4),
+                  redundancy=3, redundancy_rate=0.0, probe_quorum=2, **common)
+
+
 def test_probe_screen_skips_uncommitted_primary():
     """A contribution the primary never committed (audit timed out before its
     commit) is neither flagged nor debited, even with harmful checker probes --
     the update never landed."""
-    sched = _serving(redundancy=3, redundancy_rate=0.0, probe_quorum=2,
+    sched = _serving(redundancy=3, redundancy_rate=1.0, probe_quorum=2,
                      probe=torch.randint(0, 48, (4, 16)), probe_debit=True)
     try:
         key = (list(sched.paths)[0], 0)

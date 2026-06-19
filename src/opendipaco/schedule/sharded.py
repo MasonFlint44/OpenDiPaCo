@@ -65,7 +65,7 @@ from .distributed import (
 )
 from .aggregate import check_aggregate, robust_delta
 from .guard import all_finite, clip_norm_, loss_ok
-from .probe import TrustedProbe, is_harmful
+from .probe import TrustedProbe, as_finite_float, is_harmful
 from .ratelimit import RateLimiter
 from .reputation import Reputation
 from .assignment import coordinator_key, is_assignee, path_primary, version_lag
@@ -1778,14 +1778,22 @@ class Scheduler(_ReactorServer):
                              "rel_margin": float(probe_rel_margin)}
         self.probe_debit = bool(probe_debit)
         if self.probe_quorum:
-            # Probes come only from checkers (at most redundancy-1 of them); a quorum
-            # it can never reach silently disables the screen (the Phase 3
-            # private_quorum<=redundancy footgun), so fail fast.
-            max_checkers = max(1, self.redundancy - 1)
+            # These mirror RobustnessCfg.__post_init__ (launch/config.py) so a
+            # direct Scheduler caller gets the same guards as a config-driven run;
+            # keep the two in sync.
+            # No audits -> no checkers -> no probe reports ever: the screen would be
+            # silently inert (the Phase 3 private_quorum footgun).
+            if self.redundancy_rate <= 0:
+                raise ValueError("the probe screen needs redundancy_rate > 0 "
+                                 "(it rides audited tasks; with no audits it never runs)")
+            # Probes come only from checkers (redundancy-1 of them; redundancy=1
+            # means no checkers at all), so a quorum above that can never be reached.
+            max_checkers = self.redundancy - 1
             if self.probe_quorum > max_checkers:
                 raise ValueError(
                     f"probe_quorum {self.probe_quorum} exceeds the available checkers "
-                    f"(redundancy-1 = {max_checkers}); the screen could never reach quorum")
+                    f"(redundancy-1 = {max_checkers}); raise redundancy (>= 2) or the "
+                    "screen could never reach quorum")
             # Debiting a peer is the digest tally's job, and it demands a >=2 agreeing
             # majority. The screen must corroborate the same way before it debits, or
             # one Byzantine checker can punish an honest primary.
@@ -2175,6 +2183,9 @@ class Scheduler(_ReactorServer):
             # W8: hand the checker the trusted probe so it screens the reproduced
             # update for data poisoning (only checks carry it -- the primary's own
             # probe would be self-reported and untrusted).
+            # TODO(W8): the probe is session-constant; re-shipping it on every check
+            # is redundant bandwidth -- advertise + cache it per checker (cf. W7a
+            # cached_shards) instead. Tracked in docs/remaining-gaps.md.
             if self._probe is not None and not self._probe.empty:
                 task["probe"] = self._probe.sequences
                 task["probe_batch"] = self._probe.batch_size
@@ -2229,8 +2240,12 @@ class Scheduler(_ReactorServer):
                     and member not in a.setdefault("checked", set())):
                 a["checked"].add(member)  # one vote per assigned checker
                 a["checks"].append((peer_id, msg.get("digest")))
-                if msg.get("probe_before") is not None and msg.get("probe_after") is not None:
-                    a["probes"].append((peer_id, msg["probe_before"], msg["probe_after"]))
+                # Validate the wire-supplied probe losses: a Byzantine checker
+                # mustn't be able to inject a non-numeric value that crashes audit
+                # resolution. Only finite numbers count as a probe report.
+                pb, pa = as_finite_float(msg.get("probe_before")), as_finite_float(msg.get("probe_after"))
+                if pb is not None and pa is not None:
+                    a["probes"].append((peer_id, pb, pa))
                 self._maybe_resolve_audit_locked(key, time.monotonic())
         return {"type": "commit_ack", "check": True}
 

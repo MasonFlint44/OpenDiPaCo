@@ -12,7 +12,13 @@ import pytest
 import torch
 from torch import nn
 
-from opendipaco.schedule.probe import TrustedProbe, is_harmful, probe_loss, safe_probe_loss
+from opendipaco.schedule.probe import (
+    TrustedProbe,
+    as_finite_float,
+    is_harmful,
+    probe_loss,
+    safe_probe_loss,
+)
 from opendipaco.train.loop import token_loss_sum
 
 VOCAB = 8
@@ -128,6 +134,15 @@ class _BoomLM(nn.Module):
 
     def forward(self, x):
         raise RuntimeError("bad probe")
+
+
+def test_as_finite_float_rejects_untrusted_junk():
+    # Wire-supplied probe losses must be coerced to finite floats (a Byzantine
+    # checker mustn't inject a value that later crashes math.isfinite).
+    assert as_finite_float(1.5) == 1.5
+    assert as_finite_float(3) == 3.0
+    for bad in ("x", None, float("nan"), float("inf"), True, [1.0]):
+        assert as_finite_float(bad) is None
 
 
 def test_safe_probe_loss_degrades_instead_of_raising():

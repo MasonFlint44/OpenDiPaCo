@@ -299,7 +299,8 @@ class RobustnessCfg:
                     f"private_quorum ({self.private_quorum}) > redundancy "
                     f"({self.redundancy}): a private proposal could never reach quorum")
         # W8 probe screen: catch the disabled-by-misconfig and lone-checker-debit
-        # cases at load (the Scheduler re-checks, but a clear error here is kinder).
+        # cases at load (the Scheduler re-checks the same invariants in its __init__
+        # for direct callers -- keep the two in sync; a clear error here is kinder).
         if self.probe_docs or self.probe_quorum:
             if self.probe_docs < 1 or self.probe_quorum < 1:
                 raise ValueError("the probe screen needs both probe_docs >= 1 and "
