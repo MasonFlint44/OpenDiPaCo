@@ -137,6 +137,21 @@ production deployment. Mostly **deliberate scope decisions**, documented here.
 - **Routing/featurizer at scale** — `P2 · partly exercised.` `ModelFeaturizer` + k-means +
   discriminative routing now run **on GPU on real C4** in the validation run (§1) and produce a
   working routed shard split; EM re-sharding remains exercised on toy data only.
+- **Data decentralization (W7)** — `P2 · mostly done.` `docs/w7-data-decentralization-design.md`.
+  The server no longer needs the whole corpus in RAM in spec mode: `data.router_sample` fits the
+  k-means router on a bounded streamed sample (`build_server_corpus`) and token counts stream;
+  the worker shard cache is a bounded LRU (`run.worker_max_shards`); and `verify_routing` /
+  `join --verify-routing` lets a worker re-fit the shipped router from the public source and
+  refuse a tampered/wrong-corpus router (opt-in, belt-and-suspenders). **Owed:**
+  (a) **decentralized EM re-sharding** — the E-step (re-assign every doc to its lowest-loss path)
+  is still central, not wired into the async/sharded loop, and decentralizing it changes *global*
+  assignments and needs a consensus mechanism → §0f/research-shaped, rides the WAN run;
+  (b) **routing verification is a no-op in `schedule.mode: decentralized`** (it materializes via
+  `corpus.shard()`, not the `_materialize_from_spec` seam where verification lives — warned at
+  startup); (c) **`verify_routing` is tolerant across very different numerical stacks** (k-means
+  isn't bit-identical across BLAS/torch builds, so the centroid compare is loose and a borderline
+  false *reject* is possible — it only ever refuses, never silently trains on a bad router); a
+  stack-independent verifier (partition-agreement / quorum over verifiers) is a future hardening.
 
 ---
 
