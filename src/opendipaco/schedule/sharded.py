@@ -1778,9 +1778,14 @@ class Scheduler(_ReactorServer):
                              "rel_margin": float(probe_rel_margin)}
         self.probe_debit = bool(probe_debit)
         if self.probe_quorum:
-            # These mirror RobustnessCfg.__post_init__ (launch/config.py) so a
-            # direct Scheduler caller gets the same guards as a config-driven run;
-            # keep the two in sync.
+            # These re-check the invariants RobustnessCfg.__post_init__
+            # (launch/config.py) enforces, so a direct Scheduler caller gets the
+            # same guards as a config-driven run; keep the two in sync (config also
+            # validates probe_docs, which the Scheduler doesn't have).
+            # A positive quorum with no probe to ship is a silently-inert screen.
+            if self._probe is None or self._probe.empty:
+                raise ValueError("probe_quorum is set but no (non-empty) probe was "
+                                 "provided; pass probe= or set probe_quorum=0")
             # No audits -> no checkers -> no probe reports ever: the screen would be
             # silently inert (the Phase 3 private_quorum footgun).
             if self.redundancy_rate <= 0:

@@ -94,13 +94,13 @@ def _build_probe(cfg: LaunchConfig, model):
     from the public source, packed to the model's seq_len. A clean **in-distribution
     slice** of the public corpus (not a separate held-out set -- a poisoned update
     still raises loss on it; held-out curation is an operator refinement). Streamed
-    (bounded), deterministic. Returns a ``[N, seq_len]`` long tensor, or None when
-    the screen is off / the source can't be read.
+    (bounded), deterministic. Returns a ``[N, seq_len]`` long tensor (or None when
+    the screen is off).
 
-    Reading the source can fail transiently (a C4 stream at scheduler startup); that
-    degrades to None + a warning (run without the screen) rather than aborting the
-    scheduler. An *empty* probe from a too-small/too-short source is a deterministic
-    misconfiguration and raises -- a silently-inert screen is worse than a clear error.
+    A configured screen that can't get its probe **fails loud** rather than running
+    silently unprotected: a source read error or an empty/too-short result raises,
+    so a scheduler with the screen enabled never comes up without it. (An operator
+    who can't tolerate that fragility leaves ``probe_docs`` unset.)
     """
     if not cfg.robustness.probe_docs:
         return None
@@ -113,10 +113,11 @@ def _build_probe(cfg: LaunchConfig, model):
             docs.append(doc)
             if len(docs) >= cfg.robustness.probe_docs:
                 break
-    except Exception as e:   # transient source/stream failure -> degrade, don't crash
-        print(f"WARNING: could not read the public source to build the data-poisoning "
-              f"probe ({e}); running WITHOUT the screen.", flush=True)
-        return None
+    except Exception as e:
+        raise RuntimeError(
+            f"could not read the public source to build the data-poisoning probe ({e}); "
+            "fix the source or unset robustness.probe_docs -- a configured screen won't "
+            "run silently unprotected") from e
     probe = pack_sequences(docs, model.sequence_length)
     if probe.numel() == 0:
         raise ValueError(

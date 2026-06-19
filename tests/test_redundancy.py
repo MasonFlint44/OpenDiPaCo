@@ -211,6 +211,35 @@ def test_audit_debits_the_odd_one_out():
 # -- W8 trusted-probe data-poisoning screen ------------------------------------
 
 
+def test_probe_measurement_runs_end_to_end():
+    """The measurement->Contribution link the injected-scalar tests stub out:
+    _train_path with a probe returns finite before/after losses that training
+    actually moved, and no probe -> no measurement. (That a *poisoned* shard raises
+    the loss is the heavier demonstration in examples/validate_poisoning.py; here we
+    just guard the wiring cheaply so a regression that stops measuring fails CI.)"""
+    import math
+
+    from opendipaco.data.sharding import pack_sequences
+    from opendipaco.schedule.probe import TrustedProbe
+    cfg, dl = _cfg(), DiLoCoConfig(inner_steps=3, inner_lr=1e-2)
+    path = cfg.build_topology().path_from_index(0)
+    shard = _corpus(cfg).shard(0)
+    g = torch.Generator().manual_seed(1)
+    probe = TrustedProbe(pack_sequences(
+        [torch.randint(0, 48, (48,), generator=g) for _ in range(4)], cfg.sequence_length))
+    eng = _build_worker_engine(cfg, dl, "cpu", 0)
+    w = AsyncScheduler(eng, num_workers=1)
+    w.seed = 0
+
+    c = w._train_path(path, shard, BATCH, 0, probe=probe)
+    assert c.probe_before is not None and c.probe_after is not None
+    assert math.isfinite(c.probe_before) and math.isfinite(c.probe_after)
+    assert c.probe_before != c.probe_after                    # training moved the model
+    # No probe -> the measurement is a no-op (off path stays None).
+    c2 = w._train_path(path, shard, BATCH, 0)
+    assert c2.probe_before is None and c2.probe_after is None
+
+
 def test_probe_screen_flags_poisoned_contribution():
     """The checkers agree on the digest (they reproduce the same poisoned data),
     but a quorum reports the update RAISED clean-probe loss -> the audit flags it
@@ -277,13 +306,19 @@ def test_probe_config_is_validated():
     checker punishes an honest primary)."""
     import pytest
     cfg = _cfg()
-    common = dict(batch_size=BATCH, host="127.0.0.1", port=0, redundancy_rate=1.0)
+    common = dict(batch_size=BATCH, host="127.0.0.1", port=0, redundancy_rate=1.0,
+                  probe=torch.randint(0, 48, (2, 16)))
     with pytest.raises(ValueError, match="exceeds the available checkers"):
         Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1)], DiLoCoConfig(inner_steps=4),
                   redundancy=3, probe_quorum=3, **common)        # only 2 checkers
     with pytest.raises(ValueError, match="probe_debit requires probe_quorum >= 2"):
         Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1)], DiLoCoConfig(inner_steps=4),
                   redundancy=2, probe_quorum=1, probe_debit=True, **common)
+    # probe_quorum set but no probe -> silently inert; reject.
+    with pytest.raises(ValueError, match="no .*probe"):
+        Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1)], DiLoCoConfig(inner_steps=4),
+                  batch_size=BATCH, host="127.0.0.1", port=0, redundancy_rate=1.0,
+                  redundancy=3, probe_quorum=2)               # probe= omitted
 
 
 def test_probe_screen_ignores_malformed_reports():
@@ -307,7 +342,8 @@ def test_probe_config_rejects_no_checkers():
     never be reached -- reject it instead of silently disabling the screen."""
     import pytest
     cfg = _cfg()
-    common = dict(batch_size=BATCH, host="127.0.0.1", port=0)
+    common = dict(batch_size=BATCH, host="127.0.0.1", port=0,
+                  probe=torch.randint(0, 48, (2, 16)))
     # redundancy=1: no checkers (rate>0 so the rate guard passes first).
     with pytest.raises(ValueError, match="exceeds the available checkers"):
         Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1)], DiLoCoConfig(inner_steps=4),
