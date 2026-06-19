@@ -86,14 +86,29 @@ report it.
   `probe_delta`; a clean shard ≈ 0 or negative.
 - Off by default everywhere; no behavior change when no probe is configured.
 
-### Slice b — wire into the audit checker + resolution
-- The checker (`check_only` path) computes `probe_delta` on its reproduced update
-  and reports it in the check commit; the owner's `_resolve_audit_locked` gates:
-  a quorum of harmful `probe_delta`s rejects the contribution + records a metric
-  (+ reputation per the threat-model rule). `robustness.probe_*` config (margin,
-  quorum, source), off by default, byte-identical when off.
-- Probe data plumbing: carried in the run config / manifest (operator-curated),
-  shipped to checkers like the shard recipe.
+### Slice b — wire the mechanism into the audit checker + resolution — **landed**
+- `Contribution` carries `probe_before`/`probe_after`; `_train_path(probe=)`
+  measures the clean-probe loss on the freshly-composed model **before** the
+  inner steps (== base) and on the trained model **after** (sidesteps the
+  `dedup_private` base-recompose hazard). No-op when no probe.
+- The checker (`check_only` path) builds a `TrustedProbe` from the task's probe
+  tensor (cast `long`) and reports `(before, after)`; only checks carry the probe
+  (the primary's own probe would be self-reported, untrusted).
+- The owner's `_resolve_audit_locked` runs the screen **independently of the
+  digest tally**: a quorum (`probe_quorum`, 0 = off) of checkers reporting
+  `is_harmful` records a `poison_flagged` metric, and — opt-in via `probe_debit`
+  — debits the primary. **Post-hoc like the digest audit (no rollback):** in the
+  sharded path the data is server-supplied, so a harmful verdict is a
+  *corpus-poisoning alarm*, not grounds to blame the faithful worker — hence
+  `probe_debit` defaults off (it's only correct in the worker-chose-data model).
+- `Scheduler(probe=, probe_quorum=, probe_abs_margin=, probe_rel_margin=,
+  probe_debit=)`; `probe_quorum=0` (default) is byte-identical to the pre-W8
+  audit. Tests in `tests/test_redundancy.py`.
+
+### Slice b/c boundary
+Operator-facing plumbing — the `robustness.probe_*` launch config, loading the
+probe from a held-out source, and carrying it through the manifest — moves to
+slice c with the validation arm (it's the operator surface, not the mechanism).
 - **Wiring note (from slice-a review):** the checker reproduces via
   `worker._train_path(...)`, which builds the `PathModel` *internally* and returns
   only a `Contribution` — the trained model never escapes, and no *base* model is

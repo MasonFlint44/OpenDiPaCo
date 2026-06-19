@@ -117,6 +117,7 @@ class TransportMetrics:
     stale_rejected: int = 0
     invalid_rejected: int = 0   # non-finite gradient/weights/loss -> contribution dropped
     norm_clipped: int = 0       # pseudo-gradients scaled down to max_update_norm
+    poison_flagged: int = 0     # W8: audits where a checker quorum saw the update raise clean-probe loss
     handler_errors: int = 0     # a handler raised on a request -> connection dropped, thread kept
     staleness_sum: int = 0
     max_staleness: int = 0
@@ -153,6 +154,10 @@ class TransportMetrics:
     def record_norm_clip(self) -> None:
         with self._lock:
             self.norm_clipped += 1
+
+    def record_poison_flag(self) -> None:
+        with self._lock:
+            self.poison_flagged += 1
 
     def record_handler_error(self) -> None:
         with self._lock:

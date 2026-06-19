@@ -126,16 +126,19 @@ def _audit_primary(sched, peer, digest, base=None):
     return (tuple(task["path"]), task["gen_id"])
 
 
-def _check(sched, key, peer, digest):
+def _check(sched, key, peer, digest, probe=None):
     """Reserve a checker slot (as _next_task's oversupply branch does), then
     commit its result echoing the issued lease -- only an assigned checker's
-    vote counts."""
+    vote counts. ``probe`` is an optional ``(before, after)`` clean-probe loss
+    pair the checker reports for the W8 data-poisoning screen."""
     path, gen = key
     with sched._lock:
         _, _, _, lease, *_ = sched._reserve_check_locked(key, peer)
-    sched._commit_check({"check_only": True, "path": list(path), "gen_id": gen,
-                         "digest": digest, "lease": lease, "worker_id": peer},
-                        peer_id=peer)
+    msg = {"check_only": True, "path": list(path), "gen_id": gen,
+           "digest": digest, "lease": lease, "worker_id": peer}
+    if probe is not None:
+        msg["probe_before"], msg["probe_after"] = probe
+    sched._commit_check(msg, peer_id=peer)
 
 
 def test_unassigned_check_commit_is_ignored():
@@ -201,6 +204,99 @@ def test_audit_debits_the_odd_one_out():
         _check(sched, key, "LIAR", "Y")
         assert sched.reputation.get("LIAR") < 0.5
         assert sched.reputation.get("P") > 0.5 and sched.reputation.get("HONEST") > 0.5
+    finally:
+        sched.shutdown()
+
+
+# -- W8 trusted-probe data-poisoning screen ------------------------------------
+
+
+def test_probe_screen_flags_poisoned_contribution():
+    """The checkers agree on the digest (they reproduce the same poisoned data),
+    but a quorum reports the update RAISED clean-probe loss -> the audit flags it
+    and (opt-in) debits the primary."""
+    sched = _serving(redundancy=3, redundancy_rate=1.0, probe_quorum=2,
+                     probe=torch.randint(0, 48, (4, 16)), probe_debit=True)
+    try:
+        key = _audit_primary(sched, "P", "X")
+        _check(sched, key, "C1", "X", probe=(1.0, 2.0))   # +1.0 loss -> harmful
+        _check(sched, key, "C2", "X", probe=(1.0, 2.0))   # quorum of 2 harmful
+        assert sched.metrics.poison_flagged == 1
+        assert sched.reputation.get("P") < 0.5            # debited (probe_debit on)
+    finally:
+        sched.shutdown()
+
+
+def test_probe_screen_passes_honest_contribution():
+    """An update that doesn't raise clean-probe loss is not flagged, even though
+    the digests agree -- the screen is orthogonal to the digest tally."""
+    sched = _serving(redundancy=3, redundancy_rate=1.0, probe_quorum=2,
+                     probe=torch.randint(0, 48, (4, 16)), probe_debit=True)
+    try:
+        key = _audit_primary(sched, "P", "X")
+        _check(sched, key, "C1", "X", probe=(1.0, 1.0))   # unchanged
+        _check(sched, key, "C2", "X", probe=(1.0, 0.9))   # improved
+        assert sched.metrics.poison_flagged == 0
+        assert sched.reputation.get("P") > 0.5            # not blamed
+    finally:
+        sched.shutdown()
+
+
+def test_probe_screen_needs_a_quorum():
+    """One harmful report (below quorum) doesn't flag -- a single lying/faulty
+    checker can't manufacture a poisoning verdict."""
+    sched = _serving(redundancy=3, redundancy_rate=1.0, probe_quorum=2,
+                     probe=torch.randint(0, 48, (4, 16)), probe_debit=True)
+    try:
+        key = _audit_primary(sched, "P", "X")
+        _check(sched, key, "C1", "X", probe=(1.0, 9.0))   # one harmful
+        _check(sched, key, "C2", "X", probe=(1.0, 1.0))   # one clean -> 1 < quorum 2
+        assert sched.metrics.poison_flagged == 0
+        assert sched.reputation.get("P") > 0.5
+    finally:
+        sched.shutdown()
+
+
+def test_probe_screen_off_by_default_is_inert():
+    """probe_quorum 0 (default) -> the screen never fires, even on harmful reports
+    (byte-identical to the pre-W8 audit)."""
+    sched = _serving(redundancy=3, redundancy_rate=1.0)   # no probe, quorum 0
+    try:
+        key = _audit_primary(sched, "P", "X")
+        _check(sched, key, "C1", "X", probe=(1.0, 5.0))
+        _check(sched, key, "C2", "X", probe=(1.0, 5.0))
+        assert sched.metrics.poison_flagged == 0
+        assert sched.reputation.get("P") > 0.5            # only the digest tally ran
+    finally:
+        sched.shutdown()
+
+
+def test_check_task_carries_the_probe():
+    """When a probe is configured, the check task ships it so the checker can
+    screen (only checks carry it -- the primary's own probe would be untrusted)."""
+    probe = torch.randint(0, 48, (4, 16))
+    sched = _serving(redundancy=3, redundancy_rate=0.0, probe=probe)
+    try:
+        paths = list(sched.paths)
+        for i, _ in enumerate(paths):                     # exhaust primary work
+            sched._next_task({"worker_id": f"w{i}"}, peer_id=f"w{i}")
+        import time as _t
+        key = (paths[0], 0)
+        with sched._lock:
+            sched._audits[key] = {"target": 2, "base": {"L0E0": [0, 1]},
+                                  "primary_digest": "X", "primary_peer": "P",
+                                  "checks": [], "members": {"P"}, "probes": [],
+                                  "deadline": _t.monotonic() + 100}
+        chk = sched._next_task({"worker_id": "C1"}, peer_id="C1")
+        assert chk.get("check_only")
+        assert "probe" in chk and torch.equal(chk["probe"], probe) and chk["probe_batch"] == 8
+        # A normal (non-check) task never carries the probe.
+        sched2 = _serving(redundancy=3, redundancy_rate=0.0, probe=probe)
+        try:
+            t = sched2._next_task({"worker_id": "w"}, peer_id="w")
+            assert not t.get("check_only") and "probe" not in t
+        finally:
+            sched2.shutdown()
     finally:
         sched.shutdown()
 
