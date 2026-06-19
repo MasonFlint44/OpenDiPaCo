@@ -80,7 +80,8 @@ def cmd_join(args) -> int:
     run_join(scheduler=args.scheduler, tracker=args.tracker, auth_key=args.auth,
              identity_key=args.identity, device=args.device, max_tasks=args.max_tasks,
              server_pub=args.server_pub, data_dir=args.data_dir, max_mbps=args.max_mbps,
-             max_shards=args.max_shards, quiet=args.quiet)
+             max_shards=args.max_shards, verify_routing=args.verify_routing,
+             quiet=args.quiet)
     return 0
 
 
@@ -192,6 +193,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_join.add_argument("--max-tasks", type=int, default=None)
     p_join.add_argument("--max-shards", type=int, default=None,
                         help="materialized shards kept resident (bounded LRU; default 4)")
+    p_join.add_argument("--verify-routing", action="store_true",
+                        help="re-fit the shipped router from the public source and "
+                             "refuse to train on a mismatch (sampled-fit runs only)")
     p_join.add_argument("--server-pub", default=None,
                         help="pin the manifest signer's pubkey (else trust-on-first-use)")
     p_join.add_argument("--data-dir", default=None, help="cache dir for spec-materialized shards")

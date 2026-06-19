@@ -81,7 +81,7 @@ The operator must build the spec corpus **without holding the whole corpus**.
 - Test: same sample+seed → identical centroids on two independent builds;
   unset knob → byte-identical to today.
 
-### Slice c — Peer-side routing verification
+### Slice c — Peer-side routing verification — **landed**
 
 Make the shipped router **checkable** so a worker need not trust it blindly.
 
@@ -90,14 +90,23 @@ Make the shipped router **checkable** so a worker need not trust it blindly.
   (public) source + sample params and compares centroids to the shipped ones;
   returns ok/mismatch. A mismatch means the manifest's router was tampered with
   or built from a different corpus.
-- `launch/client.py` (`join`): after fetching the manifest, optionally
-  `--verify-routing` re-fits and **refuses to train** on mismatch (off by
-  default — re-streaming the sample costs bandwidth; opt-in for the paranoid,
-  surfaced in the health line either way). Wrong router wastes compute, can't
-  poison weights (grant/quorum-gated), so this is belt-and-suspenders, not a
-  security boundary on its own.
+  returns ok/mismatch. The sampled fit records its `sample`/`router_seed` in the
+  routing dict (`routing["fit"]`) so verification is self-contained from the spec;
+  an in-hand (full-corpus) spec has no such metadata and raises "can't verify".
+- The check fires **worker-side at the materialization seam** (`_materialize_from_spec`,
+  shared by both worker loops), not at `join` time — the spec arrives per-task,
+  not in the manifest. It runs once per spec (memoized by fingerprint, so an LRU
+  re-materialization doesn't re-stream), raises a fatal `RoutingVerificationError`
+  on mismatch (the worker refuses to train), and warns-then-proceeds when a spec
+  can't be verified (no fit metadata).
+- `--verify-routing` join flag / `run.verify_routing` config knob (volunteer-local
+  → stripped from the manifest like the other worker knobs), off by default —
+  re-streaming the sample costs bandwidth; opt-in for the paranoid, surfaced at
+  startup. Wrong router wastes compute, can't poison weights (grant/quorum-gated),
+  so this is belt-and-suspenders, not a security boundary on its own.
 - Test: untampered spec verifies; centroids perturbed → mismatch detected;
-  round-robin spec verifies trivially (no centroids).
+  round-robin verifies trivially; no-fit-metadata raises; and the worker-seam
+  path rejects/accepts/warns accordingly.
 
 ## Non-goals / owed
 

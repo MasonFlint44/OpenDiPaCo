@@ -345,6 +345,11 @@ class RunCfg:
     # volunteer-local knob, stripped from the published manifest so a joiner never
     # inherits the operator's value (see manifest._STRIP).
     worker_max_shards: int | None = None
+    # W7c: re-fit the shipped router from the public source and refuse to train on
+    # a mismatch (tampered / wrong-corpus routing). Off by default (re-streaming
+    # the sample costs bandwidth); only verifiable for a sampled fit (router_sample).
+    # Volunteer-local, like the knobs above -> stripped from the manifest.
+    verify_routing: bool | None = None
     # W5 task sizing (sharded mode; docs/w5-task-sizing-design.md). None (default)
     # = off, byte-identical: every task is the configured size. When set, the
     # scheduler sizes each task from the worker's measured rate so its lease lands

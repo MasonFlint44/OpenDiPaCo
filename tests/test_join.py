@@ -70,11 +70,14 @@ def test_manifest_strips_worker_resource_knobs(tmp_path):
     # default, never inherit the operator's value. And a stripped manifest must
     # still rebuild into a valid config (worker_max_shards -> None -> default).
     m = build_manifest(_cfg(run={"generations": 2, "batch_size": 8,
-                                 "worker_max_batch": 4, "worker_max_shards": 32}))
+                                 "worker_max_batch": 4, "worker_max_shards": 32,
+                                 "verify_routing": True}))
     assert m["config"]["run"]["worker_max_batch"] is None
     assert m["config"]["run"]["worker_max_shards"] is None
+    assert m["config"]["run"]["verify_routing"] is None
     cfg = manifest_to_config(m)                       # round-trips without crashing
     assert cfg.run.worker_max_shards is None          # default applies at the worker
+    assert cfg.run.verify_routing is None
     # An explicit joiner override still wins over the (stripped) base.
     cfg2 = manifest_to_config(m, overrides={"run": {"worker_max_shards": 2}})
     assert cfg2.run.worker_max_shards == 2

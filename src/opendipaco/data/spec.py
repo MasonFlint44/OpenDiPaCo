@@ -176,8 +176,57 @@ def fit_routing_from_source(source: dict, *, num_paths: int, vocab_size: int,
     if len(prefixes) < num_paths:
         return round_robin_routing()
     router = KMeansRouter(num_paths, seed=router_seed).fit(feat(prefixes))
-    return kmeans_routing(router.centroids, vocab_size=vocab_size,
-                          feature_dim=feature_dim)
+    routing = kmeans_routing(router.centroids, vocab_size=vocab_size,
+                             feature_dim=feature_dim)
+    # Record the fit inputs so a peer can reproduce the centroids from the public
+    # source alone (W7c verify_routing). seq_len / num_paths already live on the
+    # spec; only sample + router_seed are unique to the fit.
+    routing["fit"] = {"sample": sample, "router_seed": router_seed}
+    return routing
+
+
+def verify_routing(spec: dict, *, source=None, tokenizer=None,
+                   atol: float = 1e-4, rtol: float = 1e-4) -> bool:
+    """Re-fit the router from the spec's **own public source** + recorded sample
+    params and check it reproduces the shipped centroids (W7c,
+    ``docs/w7-data-decentralization-design.md``).
+
+    A worker can thus refuse a router that doesn't match the corpus it claims to
+    come from -- a spec whose centroids were tampered with, or built from a
+    different corpus -- instead of trusting whatever bytes the spec carries. It is
+    **belt-and-suspenders**, not a security boundary: a wrong router only wastes
+    compute (it can't poison weights -- those are grant/quorum-gated), and a fully
+    self-consistent malicious spec (a different public corpus + its matching
+    centroids) passes here -- that is the W8 data-poisoning question, not this one.
+
+    Returns ``True`` if the centroids reproduce (or routing is round-robin --
+    nothing to verify). Returns ``False`` on a centroid mismatch (including a
+    shipped k-means router that our reproduction degrades to round-robin, i.e. the
+    sample is too small for the shipped centroids to be legitimate). Raises
+    ``ValueError`` if the spec carries no reproducible fit metadata (an
+    in-hand/full-corpus fit can't be reproduced without the whole corpus, which
+    defeats the point) or an unknown routing kind -- the caller decides whether
+    "can't verify" should block.
+    """
+    routing = spec["routing"]
+    kind = routing.get("kind")
+    if kind == "round_robin":
+        return True
+    if kind != "kmeans":
+        raise ValueError(f"cannot verify routing kind {kind!r}")
+    fit = routing.get("fit")
+    if not fit:
+        raise ValueError("spec has no reproducible fit metadata (built without "
+                         "data.router_sample); routing verification needs a sampled fit")
+    feat = routing["featurizer"]
+    recomputed = fit_routing_from_source(
+        spec["source"], num_paths=spec["num_paths"], vocab_size=feat["vocab_size"],
+        seq_len=spec["seq_len"], sample=fit["sample"], feature_dim=feat["feature_dim"],
+        router_seed=fit["router_seed"], doc_source=source, tokenizer=tokenizer)
+    if recomputed.get("kind") != "kmeans":
+        return False        # shipped k-means but our honest re-fit can't even seed it
+    shipped, got = routing["centroids"], recomputed["centroids"]
+    return shipped.shape == got.shape and torch.allclose(shipped, got, atol=atol, rtol=rtol)
 
 
 def _build_predictor(spec: dict):

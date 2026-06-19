@@ -47,7 +47,7 @@ import torch
 
 from ..backend.local import LocalBackend
 from ..checkpoint import latest_checkpoint, load_checkpoint, save_checkpoint
-from ..data.spec import materialize_shard
+from ..data.spec import materialize_shard, spec_fingerprint, verify_routing
 from ..optim.diloco import apply_outer_grads, make_outer_optimizer
 from ..topology import is_private_key
 from ..train.loop import _optimizer_state_to_cpu, _state_to_cpu
@@ -477,6 +477,7 @@ def run_worker(
     data_tokenizer=None,
     max_batch_size: int | None = None,
     max_shards: int = 4,
+    verify_routing: bool = False,
 ):
     """Connect to a coordinator and train leased path-tasks until told to stop.
 
@@ -516,7 +517,8 @@ def run_worker(
     versions: dict = {}      # shared key -> version currently held
     attempts: dict = {}
     residuals: dict = {}     # path -> {key: [tensors]}: compression error feedback
-    data_ctx = {"dir": data_dir, "source": data_source, "tokenizer": data_tokenizer}
+    data_ctx = {"dir": data_dir, "source": data_source, "tokenizer": data_tokenizer,
+                "verify": verify_routing}
     caps = {"device": str(device)}
     if max_batch_size is not None:
         caps["max_batch"] = int(max_batch_size)
@@ -758,11 +760,40 @@ def _apply_task(engine, msg, shard_cache, versions, warm, residuals,
     return shard_cache[path]
 
 
+class RoutingVerificationError(RuntimeError):
+    """Raised when ``--verify-routing`` is on and a shipped router does not
+    reproduce from its stated public source -- the worker refuses to train (W7c).
+    Fatal by design: the worker loops treat it as a hard stop, not a reconnect."""
+
+
 def _materialize_from_spec(shard_spec, data_ctx) -> torch.Tensor:
-    """Build the shard locally from the shipped recipe (no corpus bytes on the wire)."""
+    """Build the shard locally from the shipped recipe (no corpus bytes on the wire).
+
+    With ``data_ctx['verify']`` (``--verify-routing``, W7c) the shipped router is
+    re-fit from the public source and checked against the shipped centroids the
+    first time each spec is seen (memoized by fingerprint, so re-materialization
+    after an LRU eviction doesn't re-stream). A mismatch is fatal; a spec without
+    reproducible fit metadata can't be verified, so it warns once and proceeds."""
     ctx = data_ctx or {}
+    spec = shard_spec["spec"]
+    if ctx.get("verify"):
+        fp = spec_fingerprint(spec)
+        seen = ctx.setdefault("verified", set())
+        if fp not in seen:
+            try:
+                ok = verify_routing(spec, source=ctx.get("source"),
+                                    tokenizer=ctx.get("tokenizer"))
+            except ValueError as e:
+                print(f"WARNING: --verify-routing requested but cannot verify spec "
+                      f"{fp}: {e}. Proceeding unverified.", flush=True)
+                ok = True
+            if not ok:
+                raise RoutingVerificationError(
+                    f"shipped router for spec {fp} does not reproduce from its public "
+                    f"source -- refusing to train (tampered or wrong-corpus routing)")
+            seen.add(fp)
     return materialize_shard(
-        shard_spec["spec"], shard_spec["path_index"],
+        spec, shard_spec["path_index"],
         source=ctx.get("source"), tokenizer=ctx.get("tokenizer"),
         cache_dir=ctx.get("dir"),
     )

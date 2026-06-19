@@ -52,7 +52,7 @@ _STRIP = {
     # via flags/config, falling back to the library default, never the operator's).
     "transport": ("auth_key", "grant_key", "identity_key", "accept_keys",
                   "admitted_peers", "max_mbps"),
-    "run": ("worker_max_batch", "worker_max_shards"),
+    "run": ("worker_max_batch", "worker_max_shards", "verify_routing"),
     "tls": ("certfile", "keyfile", "cafile"),
     "data": ("cache_path", "shard_cache_dir"),
 }

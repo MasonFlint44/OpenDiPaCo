@@ -29,6 +29,7 @@ from opendipaco.data.spec import (
     round_robin_routing,
     synthetic_documents,
     synthetic_source,
+    verify_routing,
 )
 from opendipaco.routing import BagOfTokensFeaturizer, KMeansRouter
 from opendipaco.schedule import (
@@ -204,6 +205,62 @@ def test_build_server_corpus_unset_router_sample_is_unchanged():
     streamed = build_server_corpus(cfg, model)
     in_hand = build_corpus(cfg, model, build_documents(cfg))
     assert streamed.token_counts == in_hand.token_counts
+
+
+def _sampled_spec(sample=24):
+    """A spec whose kmeans router was fit via the streaming sampled path (so it
+    carries the `fit` metadata verify_routing needs)."""
+    routing = fit_routing_from_source(_source_spec(), num_paths=PATHS, vocab_size=VOCAB,
+                                      seq_len=SEQ, sample=sample, feature_dim=VOCAB)
+    return make_shard_spec(source=_source_spec(), routing=routing,
+                           num_paths=PATHS, seq_len=SEQ)
+
+
+def test_verify_routing_accepts_untampered_sampled_spec():
+    assert verify_routing(_sampled_spec()) is True
+
+
+def test_verify_routing_detects_tampered_centroids():
+    spec = _sampled_spec()
+    spec["routing"]["centroids"] = spec["routing"]["centroids"] + 5.0   # poison the router
+    assert verify_routing(spec) is False
+
+
+def test_verify_routing_trivial_for_round_robin():
+    spec = make_shard_spec(source=_source_spec(), routing=round_robin_routing(),
+                           num_paths=PATHS, seq_len=SEQ)
+    assert verify_routing(spec) is True
+
+
+def test_verify_routing_raises_without_fit_metadata():
+    # An in-hand kmeans spec has no reproducible `fit` block -> can't verify.
+    spec, *_ = _kmeans_spec(_docs())
+    with pytest.raises(ValueError, match="fit metadata"):
+        verify_routing(spec)
+
+
+def test_materialize_from_spec_verify_rejects_tampered():
+    from opendipaco.schedule.distributed import RoutingVerificationError, _materialize_from_spec
+    spec = _sampled_spec()
+    spec["routing"]["centroids"] = spec["routing"]["centroids"] + 5.0
+    with pytest.raises(RoutingVerificationError):
+        _materialize_from_spec({"spec": spec, "path_index": 0}, {"verify": True})
+
+
+def test_materialize_from_spec_verify_accepts_good_and_memoizes():
+    from opendipaco.schedule.distributed import _materialize_from_spec
+    spec = _sampled_spec()
+    ctx = {"verify": True}
+    shard = _materialize_from_spec({"spec": spec, "path_index": 0}, ctx)
+    assert shard is not None
+    assert spec_fingerprint(spec) in ctx["verified"]      # verified once, memoized
+
+
+def test_materialize_from_spec_verify_warns_and_proceeds_without_fit_metadata():
+    from opendipaco.schedule.distributed import _materialize_from_spec
+    spec, *_ = _kmeans_spec(_docs())                       # in-hand spec, no `fit`
+    shard = _materialize_from_spec({"spec": spec, "path_index": 0}, {"verify": True})
+    assert shard is not None                               # can't-verify -> proceed, not crash
 
 
 def test_spec_corpus_refuses_to_serve_bytes():

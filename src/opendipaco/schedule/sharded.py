@@ -2542,7 +2542,8 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
                        fault_hook=None, tls=None, tls_hostname=None,
                        data_dir=None, data_source=None, data_tokenizer=None,
                        max_batch_size=None, transport="tcp", identity=None,
-                       stop_event=None, bucket=None, max_shards=4):
+                       stop_event=None, bucket=None, max_shards=4,
+                       verify_routing=False):
     """Train path-tasks for a sharded scheduler + parameter servers.
 
     Per task: lease from the scheduler, fetch the path's modules from the owning
@@ -2563,7 +2564,8 @@ def run_sharded_worker(config, diloco, scheduler_addr, *, device="cpu", seed=0,
     versions: dict = {}          # shared key -> held (trained-against / nominal) version
     keyframes: dict = {}         # shared key -> (version, exact state) baseline for deltas (W2a)
     residuals: dict = {}         # path -> {key: [tensors]}: compression error feedback
-    data_ctx = {"dir": data_dir, "source": data_source, "tokenizer": data_tokenizer}
+    data_ctx = {"dir": data_dir, "source": data_source, "tokenizer": data_tokenizer,
+                "verify": verify_routing}
     caps = {"device": str(device)}
     if max_batch_size is not None:
         caps["max_batch"] = int(max_batch_size)
