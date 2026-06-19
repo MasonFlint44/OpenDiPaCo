@@ -109,6 +109,21 @@ report it.
 Operator-facing plumbing — the `robustness.probe_*` launch config, loading the
 probe from a held-out source, and carrying it through the manifest — moves to
 slice c with the validation arm (it's the operator surface, not the mechanism).
+
+Slice-b review fixes folded in: `safe_probe_loss` degrades a malformed probe
+(out-of-vocab ids, bad seq_len) to "couldn't measure" so it can't crash the
+checker (which would also kill its digest audit); the screen only judges a
+contribution the primary actually committed (`primary_digest is not None`);
+`Scheduler.__init__` rejects `probe_quorum > redundancy-1` (unreachable → silent
+no-op) and `probe_debit` with `probe_quorum < 2` (a lone checker mustn't debit an
+honest primary — matches the digest tally's ≥2-agreeing rule).
+
+**Owed (slice c / follow-up):** the probe is re-shipped on *every* check task; for
+a realistically-sized operator probe this is redundant downlink — advertise-and-
+cache it worker-side (keyed by a probe hash), like `cached_shards`. And
+`probe_quorum` is an absolute count against a variable checker pool: abstaining
+checkers (aborted/empty-shard) lower detection power in the *safe* direction
+(miss, not false-flag) — a fraction-of-reporting quorum would be steadier.
 - **Wiring note (from slice-a review):** the checker reproduces via
   `worker._train_path(...)`, which builds the `PathModel` *internally* and returns
   only a `Contribution` — the trained model never escapes, and no *base* model is

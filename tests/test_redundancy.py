@@ -271,6 +271,42 @@ def test_probe_screen_off_by_default_is_inert():
         sched.shutdown()
 
 
+def test_probe_config_is_validated():
+    """probe_quorum can't exceed the available checkers (else the screen silently
+    never fires), and debiting needs a >=2 corroboration floor (else one Byzantine
+    checker punishes an honest primary)."""
+    import pytest
+    cfg = _cfg()
+    common = dict(batch_size=BATCH, host="127.0.0.1", port=0)
+    with pytest.raises(ValueError, match="exceeds the available checkers"):
+        Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1)], DiLoCoConfig(inner_steps=4),
+                  redundancy=3, probe_quorum=3, **common)        # only 2 checkers
+    with pytest.raises(ValueError, match="probe_debit requires probe_quorum >= 2"):
+        Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1)], DiLoCoConfig(inner_steps=4),
+                  redundancy=2, probe_quorum=1, probe_debit=True, **common)
+
+
+def test_probe_screen_skips_uncommitted_primary():
+    """A contribution the primary never committed (audit timed out before its
+    commit) is neither flagged nor debited, even with harmful checker probes --
+    the update never landed."""
+    sched = _serving(redundancy=3, redundancy_rate=0.0, probe_quorum=2,
+                     probe=torch.randint(0, 48, (4, 16)), probe_debit=True)
+    try:
+        key = (list(sched.paths)[0], 0)
+        with sched._lock:
+            sched._audits[key] = {"target": 2, "base": {"L0E0": [0, 1]},
+                                  "primary_digest": None, "primary_peer": None,
+                                  "checks": [], "members": {"P"}, "checked": set(),
+                                  "check_leases": {},
+                                  "probes": [("C1", 1.0, 9.0), ("C2", 1.0, 9.0)],
+                                  "deadline": 0.0}
+            sched._resolve_audit_locked(key)
+        assert sched.metrics.poison_flagged == 0
+    finally:
+        sched.shutdown()
+
+
 def test_check_task_carries_the_probe():
     """When a probe is configured, the check task ships it so the checker can
     screen (only checks carry it -- the primary's own probe would be untrusted)."""

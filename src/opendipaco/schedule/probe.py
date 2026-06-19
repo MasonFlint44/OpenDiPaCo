@@ -78,6 +78,19 @@ def is_harmful(before: float, after: float, *, abs_margin: float = 0.05,
     return after - before > abs_margin + rel_margin * abs(before)
 
 
+def safe_probe_loss(probe, model: nn.Module) -> float | None:
+    """``probe.loss(model)`` for the audit checker, but never raising: the screen
+    is an auxiliary measurement on a verification replica, so a malformed probe
+    (out-of-vocab token ids, a seq_len the model can't take, a dtype slip after
+    the wire round-trip) must NOT crash the checker -- that would also kill its
+    digest audit. A failure degrades to ``None`` ("couldn't measure"), which the
+    owner treats as "can't screen" (no signal), exactly like an empty probe."""
+    try:
+        return probe.loss(model)
+    except Exception:
+        return None
+
+
 class TrustedProbe:
     """A small, clean, operator-curated held-out batch the checker screens
     contributions against (trust rides the W6 manifest pinning). Holds the token

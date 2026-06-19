@@ -12,7 +12,7 @@ import pytest
 import torch
 from torch import nn
 
-from opendipaco.schedule.probe import TrustedProbe, is_harmful, probe_loss
+from opendipaco.schedule.probe import TrustedProbe, is_harmful, probe_loss, safe_probe_loss
 from opendipaco.train.loop import token_loss_sum
 
 VOCAB = 8
@@ -116,6 +116,26 @@ def test_is_harmful_nan_is_not_harmful():
     assert is_harmful(float("nan"), 2.0) is False
     assert is_harmful(1.0, float("nan")) is False
     assert is_harmful(float("inf"), float("inf")) is False
+
+
+class _BoomLM(nn.Module):
+    """A model that raises in forward -- stands in for a malformed probe (bad
+    token ids / seq_len) that would blow up the embedding lookup."""
+
+    def __init__(self):
+        super().__init__()
+        self._p = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        raise RuntimeError("bad probe")
+
+
+def test_safe_probe_loss_degrades_instead_of_raising():
+    # A check-task probe that errors must not crash the checker (it would also
+    # kill the digest audit); safe_probe_loss returns None ("couldn't measure").
+    assert safe_probe_loss(TrustedProbe(_probe(3)), _BoomLM()) is None
+    # A good probe still measures.
+    assert safe_probe_loss(TrustedProbe(_probe(3)), _StubLM(3)) is not None
 
 
 def test_trusted_probe_holder():

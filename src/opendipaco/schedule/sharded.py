@@ -1777,6 +1777,22 @@ class Scheduler(_ReactorServer):
         self.probe_margin = {"abs_margin": float(probe_abs_margin),
                              "rel_margin": float(probe_rel_margin)}
         self.probe_debit = bool(probe_debit)
+        if self.probe_quorum:
+            # Probes come only from checkers (at most redundancy-1 of them); a quorum
+            # it can never reach silently disables the screen (the Phase 3
+            # private_quorum<=redundancy footgun), so fail fast.
+            max_checkers = max(1, self.redundancy - 1)
+            if self.probe_quorum > max_checkers:
+                raise ValueError(
+                    f"probe_quorum {self.probe_quorum} exceeds the available checkers "
+                    f"(redundancy-1 = {max_checkers}); the screen could never reach quorum")
+            # Debiting a peer is the digest tally's job, and it demands a >=2 agreeing
+            # majority. The screen must corroborate the same way before it debits, or
+            # one Byzantine checker can punish an honest primary.
+            if self.probe_debit and self.probe_quorum < 2:
+                raise ValueError(
+                    "probe_debit requires probe_quorum >= 2 (a lone checker can't "
+                    "corroborate a poisoning verdict); raise redundancy to >= 3")
         # Under the private proposal policy (D5/3a), private-bearing tasks are
         # *always* audited so checkers corroborate the private state before the
         # owner applies it (without an audit a proposal never reaches quorum).
@@ -2257,11 +2273,16 @@ class Scheduler(_ReactorServer):
         # path the data is server-supplied, so this is a corpus-poisoning ALARM
         # (a faithful worker isn't to blame) -- debit only when opted in (the
         # worker-chose-data model); otherwise surface the metric.
-        harmful = sum(1 for _, b, af in a.get("probes", []) if is_harmful(b, af, **self.probe_margin))
-        if self.probe_quorum and harmful >= self.probe_quorum:
-            self.metrics.record_poison_flag()
-            if self.probe_debit and a.get("primary_peer") is not None:
-                self.reputation.debit(a["primary_peer"])
+        # Only screen a contribution the primary actually committed -- on a
+        # timed-out audit whose primary died before committing, the update never
+        # landed, so neither flag nor debit it.
+        if self.probe_quorum and a.get("primary_digest") is not None:
+            harmful = sum(1 for _, b, af in a.get("probes", [])
+                          if is_harmful(b, af, **self.probe_margin))
+            if harmful >= self.probe_quorum:
+                self.metrics.record_poison_flag()
+                if self.probe_debit and a.get("primary_peer") is not None:
+                    self.reputation.debit(a["primary_peer"])
 
     def _resolve_audits_locked(self, now) -> None:
         for key in list(self._audits):

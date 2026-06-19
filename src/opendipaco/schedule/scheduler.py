@@ -54,6 +54,7 @@ from ..train.loop import (
     _state_to_cpu,
     run_inner_steps,
 )
+from .probe import safe_probe_loss
 
 
 class TransientFault(Exception):
@@ -311,15 +312,16 @@ class AsyncScheduler:
         inner_steps = inner_steps or e.diloco.inner_steps
         total_steps = e.total_rounds * inner_steps if e.total_rounds else None
         # W8: pm currently holds the base (a fresh copy of the bank) -- measure the
-        # trusted-probe loss now, before the inner steps mutate it.
+        # trusted-probe loss now, before the inner steps mutate it. safe_probe_loss
+        # degrades a bad probe to None instead of crashing the checker.
         screening = probe is not None and not probe.empty
-        probe_before = probe.loss(pm) if screening else None
+        probe_before = safe_probe_loss(probe, pm) if screening else None
         loss = run_inner_steps(
             pm, opt, shard, batch_size, gen,
             inner_steps=inner_steps, total_steps=total_steps,
             base_step=generation * inner_steps, diloco=e.diloco, device=e.device,
         )
-        probe_after = probe.loss(pm) if screening else None  # trained-model probe loss
+        probe_after = safe_probe_loss(probe, pm) if screening else None
 
         shared_delta: dict[str, list[torch.Tensor]] = {}
         private_state: dict[str, dict] = {}
