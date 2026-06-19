@@ -75,6 +75,32 @@ def _copy_into(dst: nn.Module, src: nn.Module) -> None:
         d.data.copy_(s.data)
 
 
+@torch.no_grad()
+def token_loss_sum(model: nn.Module, sequences: torch.Tensor, *, batch_size: int,
+                   device, ignore_index: int = -100) -> tuple[float, int]:
+    """Summed next-token cross-entropy and scored-token count of ``model`` over
+    ``sequences`` (the single source of truth for token-level eval loss).
+
+    Full-sequence scoring (``logits[:, :-1]`` vs ``[:, 1:]``) with padding targets
+    (``ignore_index``) masked out, exactly matching the training objective
+    (``PathModel.forward``). Returns ``(total, n_tokens)`` so callers pick their own
+    empty convention. Does **not** change the model's train/eval mode. Used by both
+    ``DiPaCoEngine._eval_val`` and the W8 probe screen, so the two can't drift (the
+    screen's margin calibration depends on measuring the same loss as training)."""
+    total, tokens = 0.0, 0
+    for start in range(0, sequences.size(0), batch_size):
+        batch = sequences[start : start + batch_size].to(device)
+        if batch.size(1) < 2:
+            continue  # need >= 2 tokens to form one (prediction, target) pair
+        logits, _ = model(batch)
+        pred, tgt = logits[:, :-1, :], batch[:, 1:]
+        total += float(F.cross_entropy(
+            pred.reshape(-1, pred.size(-1)), tgt.reshape(-1),
+            ignore_index=ignore_index, reduction="sum"))
+        tokens += int((tgt != ignore_index).sum())
+    return total, tokens
+
+
 def _optimizer_state_to_cpu(state: dict) -> dict:
     """Move an optimizer ``state_dict``'s tensors to CPU (for offload between rounds)."""
     moved = {}
@@ -337,15 +363,7 @@ class DiPaCoEngine:
     def _eval_val(self, pm: nn.Module, seqs: torch.Tensor, batch_size: int) -> float:
         """Token-level loss of ``pm`` on a validation shard."""
         pm.eval()
-        total, tokens = 0.0, 0
-        for start in range(0, seqs.size(0), batch_size):
-            batch = seqs[start : start + batch_size].to(self.device)
-            logits, _ = pm(batch)
-            pred, tgt = logits[:, :-1, :], batch[:, 1:]
-            total += float(
-                F.cross_entropy(pred.reshape(-1, pred.size(-1)), tgt.reshape(-1), reduction="sum")
-            )
-            tokens += tgt.numel()
+        total, tokens = token_loss_sum(pm, seqs, batch_size=batch_size, device=self.device)
         pm.train()
         return total / max(tokens, 1)
 

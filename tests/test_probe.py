@@ -8,10 +8,12 @@ loss -- that's the signal these catch.
 
 import math
 
+import pytest
 import torch
 from torch import nn
 
 from opendipaco.schedule.probe import TrustedProbe, is_harmful, probe_loss
+from opendipaco.train.loop import token_loss_sum
 
 VOCAB = 8
 
@@ -49,6 +51,39 @@ def test_probe_loss_empty_is_nan():
     assert math.isnan(probe_loss(_StubLM(0), None))
     # A length-1 sequence has no (prediction, target) pair -> nothing scorable.
     assert math.isnan(probe_loss(_StubLM(0), torch.zeros(4, 1, dtype=torch.long)))
+
+
+class _NoParamLM(nn.Module):
+    """A model with no parameters -- probe_loss can't find a device, so it can't
+    measure (must return NaN, not raise StopIteration)."""
+
+    def forward(self, x):
+        return torch.zeros((*x.shape, VOCAB)), None
+
+
+def test_probe_loss_no_parameters_is_nan():
+    assert math.isnan(probe_loss(_NoParamLM(), _probe(3)))
+
+
+def test_probe_loss_rejects_nonpositive_batch_size():
+    with pytest.raises(ValueError, match="batch_size"):
+        probe_loss(_StubLM(0), _probe(0), batch_size=0)
+
+
+def test_token_loss_sum_masks_ignore_index():
+    # The shared kernel both _eval_val and probe_loss use: -100 targets are masked
+    # out (not scored, not counted), matching the training objective. (Defensive --
+    # the single-tensor eval convention rarely produces -100, but the kernel must
+    # match training's cross_entropy call.)
+    m = _StubLM(3)
+    clean = _probe(3, n=2, length=5)
+    padded = clean.clone()
+    padded[:, -2:] = -100                                  # last targets ignored
+    total_c, tok_c = token_loss_sum(m, clean, batch_size=8, device=torch.device("cpu"))
+    total_p, tok_p = token_loss_sum(m, padded, batch_size=8, device=torch.device("cpu"))
+    assert tok_p < tok_c                                   # masked targets not counted
+    # Per-token mean is identical (every scored 3->3 transition costs the same).
+    assert total_c / tok_c == pytest.approx(total_p / tok_p)
 
 
 def test_probe_loss_restores_train_mode():

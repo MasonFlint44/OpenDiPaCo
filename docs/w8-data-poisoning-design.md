@@ -94,6 +94,21 @@ report it.
   quorum, source), off by default, byte-identical when off.
 - Probe data plumbing: carried in the run config / manifest (operator-curated),
   shipped to checkers like the shard recipe.
+- **Wiring note (from slice-a review):** the checker reproduces via
+  `worker._train_path(...)`, which builds the `PathModel` *internally* and returns
+  only a `Contribution` — the trained model never escapes, and no *base* model is
+  composed at audit time. So slice b can't just call `probe_loss(model)` at the
+  call site; the clean shape is to thread an optional probe into `_train_path` so
+  it measures **base loss before the inner steps** and **trained loss after** on
+  the same composed model, and stashes the `(before, after)` pair on the
+  `Contribution`. (Watch the `dedup_private` path, which mutates private modules
+  in place — take the base measurement before training there.)
+- **Caveats to honor in slice b:** measure the probe in the *same numeric regime*
+  as training (under `inner_autocast`, probe under autocast too, else the margin
+  is calibrated on a different scale); validate the probe's `seq_len` against
+  `max_position_embeddings` (an over-long probe gets OOD RoPE positions, silent
+  garbage loss); ensure the probe tensor is `long` after manifest/wire
+  round-trip (the embedding lookup needs it).
 
 ### Slice c — validation arm + docs
 - `examples/validate_robustness.py` poisoned-shard arm: a label-flipped /

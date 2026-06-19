@@ -21,37 +21,38 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn.functional as F
 from torch import nn
+
+from ..train.loop import token_loss_sum
 
 
 @torch.no_grad()
 def probe_loss(model: nn.Module, sequences: torch.Tensor, *, batch_size: int = 8) -> float:
     """Mean token-level next-token cross-entropy of ``model`` over ``sequences``.
 
-    Matches the *training* loss convention (``DiPaCoEngine._eval_val``): the whole
-    sequence is scored (``logits[:, :-1]`` vs ``[:, 1:]``, no prefix exclusion), so
-    the value is directly comparable to what the path was trained to minimise.
-    Restores the model's prior train/eval mode. Returns NaN for an empty probe (no
-    scorable tokens) -- the caller treats "couldn't measure" as "can't screen".
+    Delegates to ``train.loop.token_loss_sum`` -- the *same* kernel
+    ``DiPaCoEngine._eval_val`` uses -- so the probe measures exactly the loss the
+    path was trained to minimise (full-sequence scoring, ``ignore_index=-100``
+    masked); the screen's margin calibration depends on that, so they share code
+    rather than risk drift. Restores the model's prior train/eval mode.
+
+    Returns NaN when there is nothing to measure -- an empty probe, a model with no
+    parameters (nothing to evaluate), or no scorable tokens -- and the caller
+    treats "couldn't measure" as "can't screen" (don't block; design coverage
+    caveat). ``batch_size`` must be >= 1.
     """
     if sequences is None or sequences.numel() == 0:
         return float("nan")
+    if batch_size < 1:
+        raise ValueError(f"probe batch_size must be >= 1, got {batch_size}")
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        return float("nan")  # parameter-less model: nothing to evaluate
     was_training = model.training
     model.eval()
-    device = next(model.parameters()).device
-    total, tokens = 0.0, 0
     try:
-        for start in range(0, sequences.size(0), batch_size):
-            batch = sequences[start : start + batch_size].to(device)
-            if batch.size(1) < 2:
-                continue  # need >= 2 tokens to form one (prediction, target) pair
-            logits, _ = model(batch)
-            pred, tgt = logits[:, :-1, :], batch[:, 1:]
-            total += float(
-                F.cross_entropy(pred.reshape(-1, pred.size(-1)), tgt.reshape(-1), reduction="sum")
-            )
-            tokens += tgt.numel()
+        total, tokens = token_loss_sum(model, sequences, batch_size=batch_size, device=device)
     finally:
         if was_training:
             model.train()
