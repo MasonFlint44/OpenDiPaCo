@@ -351,6 +351,51 @@ def test_run_local_sharded_with_robustness_on():
     assert scheduler.reputation is not None       # the gate substrate is live
 
 
+def test_from_dict_validates_probe_screen():
+    # W8c: the probe screen needs audits, a reachable quorum, and a >=2 floor to debit.
+    base = {"mode": "sharded",
+            "sharded": {"num_shards": 2, "parameter_servers": [["127.0.0.1", 1], ["127.0.0.1", 2]]}}
+    def rob(**kw):
+        return {**base, "robustness": {"mode": "on", "redundancy": 3, **kw}}
+    with pytest.raises(ValueError, match="needs redundancy_rate > 0"):
+        LaunchConfig.from_dict(rob(probe_docs=8, probe_quorum=2))            # no audits
+    with pytest.raises(ValueError, match="probe_quorum .* > redundancy-1"):
+        LaunchConfig.from_dict(rob(redundancy_rate=0.5, probe_docs=8, probe_quorum=3))
+    with pytest.raises(ValueError, match="probe_debit requires probe_quorum >= 2"):
+        LaunchConfig.from_dict(rob(redundancy_rate=0.5, probe_docs=8, probe_quorum=1,
+                                   probe_debit=True))
+    with pytest.raises(ValueError, match="both probe_docs >= 1 and probe_quorum >= 1"):
+        LaunchConfig.from_dict(rob(redundancy_rate=0.5, probe_docs=8))       # quorum unset
+    ok = LaunchConfig.from_dict(rob(redundancy_rate=0.5, probe_docs=8, probe_quorum=2))
+    assert ok.robustness.probe_docs == 8
+
+
+def test_scheduler_robustness_kw_builds_probe():
+    """``run_scheduler`` wiring: with probe_docs set, the scheduler kwargs carry a
+    packed probe tensor + the screen knobs; off -> probe is None."""
+    from opendipaco.launch.config import dipaco_config
+    from opendipaco.launch.roles import _scheduler_robustness_kw
+    base = {"model": {"vocab_size": 64, "hidden_size": 32, "num_attention_heads": 4,
+                      "intermediate_size": 64, "layers_per_level": [1, 1],
+                      "level_sizes": [2, 2], "sequence_length": 16,
+                      "max_position_embeddings": 64},
+            "data": {"source": "synthetic", "num_documents": 32}}
+    cfg = LaunchConfig.from_dict({**base, "mode": "sharded",
+                                  "sharded": {"num_shards": 2,
+                                              "parameter_servers": [["127.0.0.1", 1], ["127.0.0.1", 2]]},
+                                  "robustness": {"mode": "on", "redundancy": 3,
+                                                 "redundancy_rate": 0.5, "probe_docs": 8,
+                                                 "probe_quorum": 2}})
+    model = dipaco_config(cfg.model)
+    kw = _scheduler_robustness_kw(cfg, model)
+    assert kw["probe"] is not None and kw["probe"].shape[1] == model.sequence_length
+    assert kw["probe_quorum"] == 2
+    # No model (or screen off) -> no probe.
+    assert _scheduler_robustness_kw(cfg)["probe"] is None
+    off = LaunchConfig.from_dict({**base})
+    assert _scheduler_robustness_kw(off, model)["probe"] is None
+
+
 def test_decentralized_owner_kw_built_only_in_decentralized_mode():
     from opendipaco.launch.roles import _decentralized_owner_kw
     assert _decentralized_owner_kw(LaunchConfig.from_dict(_tiny_dict())) == {}  # central

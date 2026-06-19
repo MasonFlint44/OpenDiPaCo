@@ -140,10 +140,19 @@ checkers (aborted/empty-shard) lower detection power in the *safe* direction
   garbage loss); ensure the probe tensor is `long` after manifest/wire
   round-trip (the embedding lookup needs it).
 
-### Slice c — validation arm + docs
-- `examples/validate_robustness.py` poisoned-shard arm: a label-flipped /
-  backdoored shard's contribution is flagged by the probe screen while a clean
-  one passes. Roadmap + `remaining-gaps.md` updates.
+### Slice c — operator config + validation arm + docs — **landed**
+- `robustness.probe_docs` (clean docs drawn from the public source as the probe),
+  `probe_quorum`, `probe_abs_margin`, `probe_rel_margin`, `probe_debit` on
+  `RobustnessCfg`, validated at load (screen needs `redundancy_rate > 0`, a
+  reachable `probe_quorum <= redundancy-1`, and `probe_quorum >= 2` to debit).
+  `run_scheduler` builds the probe (`_build_probe`, streamed/bounded) and wires it
+  + the knobs into the `Scheduler` via `_scheduler_robustness_kw`.
+- `examples/validate_poisoning.py`: trains the same path+base on a clean shard vs
+  a random-token ("poison") shard and shows the probe screen flags the poisoned
+  update (clean-probe loss rises) while the clean one passes. (A dedicated harness
+  rather than a `validate_robustness.py` arm — that one is aggregator-level only,
+  with no real training.)
+- Roadmap + `remaining-gaps.md` updated.
 
 ## Honest limitations (state them, don't paper over)
 - **The probe must be trusted.** A poisoned probe inverts the defense; trust

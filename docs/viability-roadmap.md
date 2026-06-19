@@ -232,15 +232,23 @@ dependencies:
   (no shard-spec materialization seam) and tolerant across very different
   numerical stacks — both noted in the design doc.
 
-### W8 · Trust beyond the current threat model · B2 · [research]
+### W8 · Trust beyond the current threat model · B2 · [research] · ◑ **data-poisoning part landed**
 
-Phase 3's robust aggregation defends **weight-space** attacks, but a worker
-training honestly on **poisoned data** produces plausible gradients that pass
-every finite/norm/agreement check — undefended today. Also open: **eclipse /
-Sybil-at-the-tracker** (a malicious or partitioned bootstrap seed isolating a
-newcomer), and **incentives** — the reputation system tracks behavior but
-rewards nothing, and sustained volunteer participation (BOINC/Petals-style)
-needs a reason to contribute. These are research-shaped, not just unbuilt.
+Three open trust problems; **data poisoning** is now defended
+(`docs/w8-data-poisoning-design.md`): Phase 3's robust aggregation + redundant
+execution agree on a *digest*, which a worker training on **poisoned data** can
+pass (every honest checker reproduces the same harmful gradient). The W8
+trusted-probe screen catches what the digest can't — the audit checker measures
+the reproduced update's loss on a small clean **probe**, and a quorum reporting a
+loss rise flags the contribution (`robustness.probe_docs`/`probe_quorum`, off by
+default; `examples/validate_poisoning.py`). It's a heuristic that raises the bar
+on crude poisoning (a targeted backdoor tuned to preserve clean-probe loss can
+evade), post-hoc like the digest audit, and its efficacy at scale rides the §0f
+run — all recorded in `remaining-gaps.md`. **Still open (research-shaped):**
+**eclipse / Sybil-at-the-tracker** (a malicious or partitioned bootstrap seed
+isolating a newcomer), and **incentives** — the reputation system tracks behavior
+but rewards nothing, and sustained volunteer participation (BOINC/Petals-style)
+needs a reason to contribute.
 
 ---
 
@@ -262,7 +270,7 @@ needs a reason to contribute. These are research-shaped, not just unbuilt.
                                                 ▼
                   W3 VRAM fit ✅  ·  W4 churn ✅  ·  W5 task sizing ✅       (B1: "large + consumer")
                                                 ▼
-                    W6 client ✅  ·  W7 data plane ✅  ·  W8 trust/incentives   (B2: ecosystem)
+              W6 client ✅  ·  W7 data plane ✅  ·  W8 trust ◑ (poisoning ✅ / incentives ⬜)   (B2)
 ```
 
 **Bottom line:** Phases 0–4 removed what had to be *trusted* or *central*. The

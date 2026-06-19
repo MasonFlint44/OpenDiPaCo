@@ -192,6 +192,20 @@ production deployment. Mostly **deliberate scope decisions**, documented here.
   ingestion, checkpoint/resume. Verified by `tests/test_launch.py` (parsing/validation,
   builders, both modes end-to-end via `run_local`); demo `examples/launch_cluster.py`. (Docker
   images / systemd units / a cluster orchestrator are still out of scope.)
+- **Data-poisoning defense (W8 part 1)** — `P2 · landed (heuristic; efficacy 0f-gated).`
+  `docs/w8-data-poisoning-design.md`. Phase 3c's audit agrees on a pseudo-gradient *digest*,
+  which a worker training on poisoned data passes (honest checkers reproduce the same harmful
+  gradient). The trusted-probe screen adds what the digest can't see: the audit checker measures
+  the reproduced update's loss on a small clean probe (`robustness.probe_docs`), and a quorum
+  reporting a loss rise flags the contribution (`probe_quorum`, off by default;
+  `examples/validate_poisoning.py`). **Owed:** it's a *heuristic* — catches crude poisoning, a
+  targeted backdoor tuned to preserve clean-probe loss can evade; post-hoc like the digest audit
+  (no rollback); a *corpus-poisoning alarm* in the sharded path (data is server-supplied, so
+  `probe_debit` is off by default — only sound in the worker-chose-data model); the probe is
+  re-shipped per check (should become advertise-and-cache); the screen is inert in
+  `schedule.mode: decentralized` (no `_materialize_from_spec` seam); and its end-to-end efficacy
+  rides the §0f run, like all of Phase 3. **Still open in W8:** eclipse/Sybil-at-the-tracker and
+  incentives (research-shaped).
 - **Auth-key rotation / per-worker identity** — `P2 · done (rotation + per-worker); secret
   store still out of scope.` A server now takes `accept_keys=` (alongside `auth_key=`) — a
   list of secrets it will accept — so **key rotation** (list old+new during the migration
@@ -232,6 +246,11 @@ choices**, listed for completeness:
 - **Async tests assert behavior, not determinism** — inherent (threaded/async float
   reordering), not a gap, but it means we can't catch fine numerical regressions on those
   paths the way the synchronous engine tests do.
+- **A few async tests are intermittently flaky** — `tests/test_scheduler_distributed.py`
+  (`test_async_stragglers_dont_block`, `test_checkpoint_resume_continues`) compare
+  worker-thread-raced training results against marginal thresholds, so they occasionally tip
+  (~1 in 3 for the file); different tests fail on different runs. Pre-existing (not tied to any
+  feature); a re-run is green. Worth tightening (seed/serialize) or marking, not a correctness gap.
 
 ---
 
