@@ -606,6 +606,14 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
             engine._opt_state[path] = contrib.opt_state
             _load_private(engine, contrib.private_state)
             warm.add(path)
+        except RoutingVerificationError:
+            # --verify-routing rejected the shipped router: a hard refuse-to-train,
+            # NOT a transient fault. Let it escape the broad nack/continue below
+            # (and the reconnect loop, which catches only OSError/ConnectionError)
+            # so the worker exits instead of re-leasing the same poisoned spec.
+            stop_beat.set()
+            beat.join(timeout=1)
+            raise
         except Exception as e:
             stop_beat.set()
             beat.join(timeout=1)

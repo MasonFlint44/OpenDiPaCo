@@ -615,6 +615,13 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
         # the corpus locally (the shard source) and needs an identity (it is
         # HRW-scored by peer_id and derives epochs).
         own = cfg.ownership
+        if cfg.run.verify_routing:
+            # The decentralized worker materializes via corpus.shard(), not the
+            # _materialize_from_spec seam where W7c verification lives -- so the
+            # flag would silently do nothing. Say so rather than imply it's active.
+            print("WARNING: --verify-routing is not enforced in decentralized mode "
+                  "(no shard-spec materialization seam); routing is unverified.",
+                  flush=True)
         corpus = build_corpus(cfg, model, build_documents(cfg))
         run_decentralized_worker(
             model, diloco, tuple(cfg.tracker_connect_addr()), corpus,

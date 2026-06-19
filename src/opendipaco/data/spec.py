@@ -186,7 +186,7 @@ def fit_routing_from_source(source: dict, *, num_paths: int, vocab_size: int,
 
 
 def verify_routing(spec: dict, *, source=None, tokenizer=None,
-                   atol: float = 1e-4, rtol: float = 1e-4) -> bool:
+                   atol: float = 1e-3, rtol: float = 1e-3) -> bool:
     """Re-fit the router from the spec's **own public source** + recorded sample
     params and check it reproduces the shipped centroids (W7c,
     ``docs/w7-data-decentralization-design.md``).
@@ -194,19 +194,32 @@ def verify_routing(spec: dict, *, source=None, tokenizer=None,
     A worker can thus refuse a router that doesn't match the corpus it claims to
     come from -- a spec whose centroids were tampered with, or built from a
     different corpus -- instead of trusting whatever bytes the spec carries. It is
-    **belt-and-suspenders**, not a security boundary: a wrong router only wastes
-    compute (it can't poison weights -- those are grant/quorum-gated), and a fully
-    self-consistent malicious spec (a different public corpus + its matching
-    centroids) passes here -- that is the W8 data-poisoning question, not this one.
+    **belt-and-suspenders**, not a security boundary, and the guarantee is
+    deliberately narrow:
 
-    Returns ``True`` if the centroids reproduce (or routing is round-robin --
-    nothing to verify). Returns ``False`` on a centroid mismatch (including a
-    shipped k-means router that our reproduction degrades to round-robin, i.e. the
-    sample is too small for the shipped centroids to be legitimate). Raises
-    ``ValueError`` if the spec carries no reproducible fit metadata (an
-    in-hand/full-corpus fit can't be reproduced without the whole corpus, which
-    defeats the point) or an unknown routing kind -- the caller decides whether
-    "can't verify" should block.
+    * It confirms the centroids are consistent with the *recorded fit params over
+      the stated source*. It does **not** vouch that those params or the resulting
+      routing are benign: an adversary who controls the spec can pick
+      ``router_seed``/``sample`` over the genuine public corpus to skew which docs
+      land in which shard and still reproduce here. Detecting that, or a different
+      public corpus + matching centroids, is the W8 data-poisoning question.
+    * A wrong router only wastes compute -- it can't poison weights (grant/quorum
+      gated) -- which is why this is opt-in and off by default.
+    * Reproducibility rests on the fit being recomputable: identical sample rows
+      *and* deterministic float reductions. k-means (cdist + argmin + iterated
+      means) is not bit-identical across BLAS/thread/torch-version stacks, so the
+      tolerance is intentionally loose and a genuine mismatch must move centroids
+      well beyond float noise (a meaningful poisoning does). On a wildly different
+      stack a borderline false reject is possible -- acceptable because it only
+      ever *refuses* (never silently trains on a bad router).
+
+    Returns ``True`` if the centroids reproduce, or routing is round-robin
+    (nothing to verify). Returns ``False`` only on a real centroid mismatch.
+    Raises ``ValueError`` for the "cannot verify" cases -- no reproducible fit
+    metadata (an in-hand/full-corpus fit needs the whole corpus), an unknown
+    routing kind, or the live source now yielding too few docs to re-seed the fit
+    -- leaving the caller to decide whether inability-to-verify should block
+    (the worker seam warns and proceeds rather than refusing).
     """
     routing = spec["routing"]
     kind = routing.get("kind")
@@ -224,8 +237,16 @@ def verify_routing(spec: dict, *, source=None, tokenizer=None,
         seq_len=spec["seq_len"], sample=fit["sample"], feature_dim=feat["feature_dim"],
         router_seed=fit["router_seed"], doc_source=source, tokenizer=tokenizer)
     if recomputed.get("kind") != "kmeans":
-        return False        # shipped k-means but our honest re-fit can't even seed it
-    shipped, got = routing["centroids"], recomputed["centroids"]
+        # The honest re-fit couldn't even seed k-means (the live source yields
+        # fewer than num_paths docs right now). That's an inability to reproduce
+        # the fit conditions, not evidence of tampering -- can't verify, don't
+        # refuse.
+        raise ValueError("could not reproduce a k-means fit from the current source "
+                         "(too few sample docs available now) -- cannot verify")
+    # Compare in a common dtype so a serialized/round-tripped (e.g. float64)
+    # centroid tensor yields a verdict instead of allclose raising on a dtype skew.
+    shipped = routing["centroids"].float()
+    got = recomputed["centroids"].float()
     return shipped.shape == got.shape and torch.allclose(shipped, got, atol=atol, rtol=rtol)
 
 

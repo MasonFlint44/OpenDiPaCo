@@ -239,6 +239,16 @@ def test_verify_routing_raises_without_fit_metadata():
         verify_routing(spec)
 
 
+def test_verify_routing_cant_verify_when_refit_degrades_to_round_robin():
+    # Shipped k-means, but the recorded sample is now too small to re-seed the fit
+    # (e.g. the live source shrank). That's inability-to-reproduce, not tampering:
+    # raise "cannot verify" (caller proceeds) rather than refuse.
+    spec = _sampled_spec()
+    spec["routing"]["fit"]["sample"] = PATHS - 1     # re-fit will degrade to round-robin
+    with pytest.raises(ValueError, match="cannot verify"):
+        verify_routing(spec)
+
+
 def test_materialize_from_spec_verify_rejects_tampered():
     from opendipaco.schedule.distributed import RoutingVerificationError, _materialize_from_spec
     spec = _sampled_spec()

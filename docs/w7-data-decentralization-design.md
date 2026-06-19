@@ -112,6 +112,17 @@ Make the shipped router **checkable** so a worker need not trust it blindly.
 
 - **Decentralized EM re-sharding** — §0f/research, see gap (3). Tracked in
   `docs/remaining-gaps.md` and the roadmap.
+- **Routing verification across wildly different stacks** — `verify_routing`
+  re-runs k-means (cdist + argmin + iterated means), which isn't bit-identical
+  across BLAS/thread/torch-version stacks, so the centroid compare is tolerant
+  and a borderline false *reject* is possible on a very different stack. It only
+  ever refuses (never silently trains on a bad router), and it's opt-in, so this
+  is acceptable; a stack-independent verifier (partition-agreement / quorum over
+  several verifiers) is a possible future hardening.
+- **Verification in decentralized mode** — the decentralized worker materializes
+  via `corpus.shard()`, not the `_materialize_from_spec` seam where verification
+  lives, so `--verify-routing` is a no-op there (warned at startup, not silently
+  ignored). Wiring a verification hook into the decentralized path is owed.
 - **Worker-reported token counts under heterogeneous sources** — counts are
   deterministic from the (public) spec, so worker- vs operator-derived counts
   are identical today; only matters if peers see different source bytes, which
