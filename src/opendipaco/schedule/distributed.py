@@ -41,12 +41,13 @@ import ssl
 import threading
 import time
 import uuid
+from collections import OrderedDict
 
 import torch
 
 from ..backend.local import LocalBackend
 from ..checkpoint import latest_checkpoint, load_checkpoint, save_checkpoint
-from ..data.spec import materialize_shard
+from ..data.spec import materialize_shard, spec_fingerprint, verify_routing
 from ..optim.diloco import apply_outer_grads, make_outer_optimizer
 from ..topology import is_private_key
 from ..train.loop import _optimizer_state_to_cpu, _state_to_cpu
@@ -475,6 +476,8 @@ def run_worker(
     data_source=None,
     data_tokenizer=None,
     max_batch_size: int | None = None,
+    max_shards: int = 4,
+    verify_routing: bool = False,
 ):
     """Connect to a coordinator and train leased path-tasks until told to stop.
 
@@ -510,11 +513,12 @@ def run_worker(
     worker = AsyncScheduler(engine, num_workers=1)
     wid = uuid.uuid4().hex
     warm: set = set()        # paths whose private modules + Adam state are held warm
-    shard_cache: dict = {}   # path -> shard tensor (fetched once)
+    shard_cache = _ShardCache(max_shards)   # bounded LRU of materialized shards (W7a)
     versions: dict = {}      # shared key -> version currently held
     attempts: dict = {}
     residuals: dict = {}     # path -> {key: [tensors]}: compression error feedback
-    data_ctx = {"dir": data_dir, "source": data_source, "tokenizer": data_tokenizer}
+    data_ctx = {"dir": data_dir, "source": data_source, "tokenizer": data_tokenizer,
+                "verify": verify_routing}
     caps = {"device": str(device)}
     if max_batch_size is not None:
         caps["max_batch"] = int(max_batch_size)
@@ -602,6 +606,14 @@ def _serve_connection(conn, engine, worker, wid, warm, shard_cache, versions,
             engine._opt_state[path] = contrib.opt_state
             _load_private(engine, contrib.private_state)
             warm.add(path)
+        except RoutingVerificationError:
+            # --verify-routing rejected the shipped router: a hard refuse-to-train,
+            # NOT a transient fault. Let it escape the broad nack/continue below
+            # (and the reconnect loop, which catches only OSError/ConnectionError)
+            # so the worker exits instead of re-leasing the same poisoned spec.
+            stop_beat.set()
+            beat.join(timeout=1)
+            raise
         except Exception as e:
             stop_beat.set()
             beat.join(timeout=1)
@@ -689,6 +701,54 @@ def _commit_residuals(residuals, path, pending) -> None:
         residuals.setdefault(path, {}).update(pending)
 
 
+class _ShardCache:
+    """Bounded LRU of materialized shards (``path -> tensor``), W7a.
+
+    A long-lived worker that fails over / is re-assigned across many paths would
+    otherwise keep *every* shard it ever leased resident (the plain dict it
+    replaces never evicts). This caps how many it holds; the least-recently-used
+    shard is dropped on overflow and re-built on its next lease -- from the spec
+    (cheap when the on-disk cache is warm) or from the shipped bytes. Training is
+    **byte-identical**: eviction changes only *when* a shard is rebuilt, never its
+    contents. The common one-path worker holds a single entry and never evicts.
+
+    Supports exactly the dict operations the worker loops use: ``path in cache``,
+    ``cache[path]`` (get marks most-recently-used), ``cache[path] = shard``, and
+    ``list(cache)`` for the ``cached_shards`` advertisement.
+    """
+
+    def __init__(self, maxsize: int | None = 4):
+        maxsize = 4 if maxsize is None else int(maxsize)   # None -> library default
+        if maxsize < 1:
+            raise ValueError(f"shard cache maxsize must be >= 1, got {maxsize}")
+        self._max = maxsize
+        self._d: OrderedDict = OrderedDict()
+
+    def __contains__(self, path) -> bool:
+        return path in self._d
+
+    def __getitem__(self, path):
+        self._d.move_to_end(path)          # touched -> most-recently-used
+        return self._d[path]
+
+    def __setitem__(self, path, shard) -> None:
+        self._d[path] = shard
+        self._d.move_to_end(path)
+        while len(self._d) > self._max:
+            self._d.popitem(last=False)    # evict least-recently-used
+
+    def __iter__(self):
+        # The worker drives the cache from a single serve thread (get/set and the
+        # `list(cache)` advertisement never overlap), so iteration is already safe;
+        # the cheap tuple() snapshot just keeps it that way if a future caller ever
+        # iterates while a get reorders the mapping. It is not a substitute for a
+        # lock -- a second *writer* thread would need real synchronization.
+        return iter(tuple(self._d))
+
+    def __len__(self) -> int:
+        return len(self._d)
+
+
 def _apply_task(engine, msg, shard_cache, versions, warm, residuals,
                 data_ctx=None) -> torch.Tensor:
     """Load a task's shipped (delta) state into the worker bank; return the shard."""
@@ -708,11 +768,40 @@ def _apply_task(engine, msg, shard_cache, versions, warm, residuals,
     return shard_cache[path]
 
 
+class RoutingVerificationError(RuntimeError):
+    """Raised when ``--verify-routing`` is on and a shipped router does not
+    reproduce from its stated public source -- the worker refuses to train (W7c).
+    Fatal by design: the worker loops treat it as a hard stop, not a reconnect."""
+
+
 def _materialize_from_spec(shard_spec, data_ctx) -> torch.Tensor:
-    """Build the shard locally from the shipped recipe (no corpus bytes on the wire)."""
+    """Build the shard locally from the shipped recipe (no corpus bytes on the wire).
+
+    With ``data_ctx['verify']`` (``--verify-routing``, W7c) the shipped router is
+    re-fit from the public source and checked against the shipped centroids the
+    first time each spec is seen (memoized by fingerprint, so re-materialization
+    after an LRU eviction doesn't re-stream). A mismatch is fatal; a spec without
+    reproducible fit metadata can't be verified, so it warns once and proceeds."""
     ctx = data_ctx or {}
+    spec = shard_spec["spec"]
+    if ctx.get("verify"):
+        fp = spec_fingerprint(spec)
+        seen = ctx.setdefault("verified", set())
+        if fp not in seen:
+            try:
+                ok = verify_routing(spec, source=ctx.get("source"),
+                                    tokenizer=ctx.get("tokenizer"))
+            except ValueError as e:
+                print(f"WARNING: --verify-routing requested but cannot verify spec "
+                      f"{fp}: {e}. Proceeding unverified.", flush=True)
+                ok = True
+            if not ok:
+                raise RoutingVerificationError(
+                    f"shipped router for spec {fp} does not reproduce from its public "
+                    f"source -- refusing to train (tampered or wrong-corpus routing)")
+            seen.add(fp)
     return materialize_shard(
-        shard_spec["spec"], shard_spec["path_index"],
+        spec, shard_spec["path_index"],
         source=ctx.get("source"), tokenizer=ctx.get("tokenizer"),
         cache_dir=ctx.get("dir"),
     )

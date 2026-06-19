@@ -77,6 +77,11 @@ class DataCfg:
     shard_cache_dir: str | None = None # directory for sharded resumable ingestion
     routing: str = "kmeans"            # "kmeans" | "round_robin"
     router_seed: int = 0
+    # W7b: fit the router on the first N streamed documents instead of the whole
+    # corpus, so the server (spec mode) never holds every document in RAM. None
+    # (default) = off, byte-identical (fit on all docs in hand). Sampling changes
+    # the centroids -> the shards differ from the unsampled run; spec mode only.
+    router_sample: int | None = None
     # "bytes": the server holds the corpus and ships packed shards (default).
     # "spec": the server ships a shard *recipe*; workers materialize shards
     # locally from the public source (data/spec.py). No per-path val split.
@@ -332,6 +337,19 @@ class RunCfg:
     # Worker-advertised batch cap: the server clamps this worker's task batch
     # size to it (small-VRAM volunteers train smaller batches instead of OOMing).
     worker_max_batch: int | None = None
+    # W7a: how many materialized shards a worker keeps resident (bounded LRU). A
+    # worker that fails over across many paths would otherwise hold every shard;
+    # the LRU drops the least-recently-used and re-materializes on the next lease.
+    # The one-path common case holds a single entry. Byte-identical to training.
+    # None -> the worker's library default; like worker_max_batch this is a
+    # volunteer-local knob, stripped from the published manifest so a joiner never
+    # inherits the operator's value (see manifest._STRIP).
+    worker_max_shards: int | None = None
+    # W7c: re-fit the shipped router from the public source and refuse to train on
+    # a mismatch (tampered / wrong-corpus routing). Off by default (re-streaming
+    # the sample costs bandwidth); only verifiable for a sampled fit (router_sample).
+    # Volunteer-local, like the knobs above -> stripped from the manifest.
+    verify_routing: bool | None = None
     # W5 task sizing (sharded mode; docs/w5-task-sizing-design.md). None (default)
     # = off, byte-identical: every task is the configured size. When set, the
     # scheduler sizes each task from the worker's measured rate so its lease lands
@@ -412,6 +430,25 @@ class LaunchConfig:
         if kw["run"].task_seconds is not None and kw["mode"] != "sharded":
             raise ValueError("run.task_seconds requires mode: sharded "
                              "(throughput-measured sizing is a scheduler lease feature)")
+        # W7a: the shard cache must hold at least the in-flight shard (None ->
+        # the worker's library default, so only an explicit value is checked).
+        wms = kw["run"].worker_max_shards
+        if wms is not None and wms < 1:
+            raise ValueError(f"run.worker_max_shards must be >= 1, got {wms}")
+        # W7b: sampled router fitting only saves memory in spec mode (bytes mode
+        # holds every document anyway to ship it), and it changes the shards, so
+        # gate it to spec mode and require a positive sample.
+        rs = kw["data"].router_sample
+        if rs is not None:
+            if rs < 1:
+                raise ValueError(f"data.router_sample must be >= 1, got {rs}")
+            if kw["data"].ship != "spec":
+                raise ValueError("data.router_sample requires data.ship: spec "
+                                 "(it only saves memory when the server ships recipes)")
+            if kw["data"].routing != "kmeans":
+                raise ValueError("data.router_sample requires data.routing: kmeans "
+                                 "(round-robin routing fits no router, so the sample "
+                                 "would be silently ignored)")
         # Decentralized scheduling is built on the replicated owner tier, so it
         # requires rendezvous ownership (Phase 4 D9). Catch the mismatch at load
         # rather than half-wiring a run with no owners to mint grants.
@@ -419,6 +456,16 @@ class LaunchConfig:
             raise ValueError(
                 "schedule.mode: decentralized requires ownership.mode: rendezvous "
                 "(it builds on the replicated owner tier)")
+        # The decentralized worker materializes its shard via corpus.shard(), which
+        # a SpecCorpus cannot serve (it holds recipes, not bytes). Reject spec mode
+        # here at load rather than crash mid-training on the first lease. (Central
+        # sharded / rendezvous ownership DO support spec -- the scheduler ships the
+        # recipe -- so this gate is specific to schedule.mode: decentralized.)
+        if kw["schedule"].mode == "decentralized" and kw["data"].ship == "spec":
+            raise ValueError(
+                "schedule.mode: decentralized does not support data.ship: spec "
+                "(the decentralized worker materializes via corpus.shard(), which a "
+                "spec corpus can't serve); use data.ship: bytes")
         # Decentralized reads confirm a key by cross-replica byte-digest agreement
         # (quorum reads); lossy downlink compression breaks that (the fetched
         # bytes never match the raw-fp32 digest), so reject it at load rather than

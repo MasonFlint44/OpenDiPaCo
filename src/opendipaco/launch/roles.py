@@ -22,6 +22,7 @@ from ..data import ShardedCorpus
 from ..data.spec import (
     SpecCorpus,
     c4_source,
+    fit_routing_from_source,
     kmeans_routing,
     make_shard_spec,
     round_robin_routing,
@@ -260,6 +261,33 @@ def build_documents(cfg: LaunchConfig):
     raise ValueError(f"unknown data source {d.source!r} (use 'c4' or 'synthetic')")
 
 
+def build_server_corpus(cfg: LaunchConfig, model):
+    """The scheduler/coordinator corpus, choosing the lowest-memory build.
+
+    In spec mode with ``data.router_sample`` set the server **streams** the public
+    source (bounded RAM: a sampled router fit, then a counts pass) and never holds
+    the full corpus (W7b). Otherwise it loads every document and builds in hand --
+    bytes mode needs the sequences to ship, and the unsampled spec fit needs all
+    documents (byte-identical to before)."""
+    if cfg.data.ship == "spec" and cfg.data.router_sample is not None:
+        return build_spec_corpus_streaming(cfg, model)
+    return build_corpus(cfg, model, build_documents(cfg))
+
+
+def _spec_source(cfg: LaunchConfig) -> dict:
+    """The document-source recipe for a spec corpus (synthetic or C4)."""
+    d = cfg.data
+    if d.source == "synthetic":
+        return synthetic_source(
+            vocab_size=cfg.model.vocab_size, num_documents=d.num_documents,
+            doc_len=d.synthetic_doc_len, topics=d.synthetic_topics, seed=cfg.run.seed)
+    if d.source == "c4":
+        return c4_source(num_documents=d.num_documents,
+                         tokenizer=d.tokenizer or "t5-base",
+                         max_doc_tokens=d.max_doc_tokens, min_doc_tokens=d.min_doc_tokens)
+    raise ValueError(f"unknown data source {d.source!r}")
+
+
 def build_corpus(cfg: LaunchConfig, model, docs):
     """Build the server-side corpus: packed shards, or (``data.ship: spec``) a
     shard recipe + token counts with workers materializing shards locally."""
@@ -282,17 +310,7 @@ def build_spec_corpus(cfg: LaunchConfig, model, docs) -> SpecCorpus:
     """Fit the router on the docs in hand, then keep only the recipe + counts."""
     d = cfg.data
     num_paths, seq_len = model.num_paths, model.sequence_length
-    if d.source == "synthetic":
-        source = synthetic_source(
-            vocab_size=cfg.model.vocab_size, num_documents=d.num_documents,
-            doc_len=d.synthetic_doc_len, topics=d.synthetic_topics, seed=cfg.run.seed)
-    elif d.source == "c4":
-        source = c4_source(num_documents=d.num_documents,
-                           tokenizer=d.tokenizer or "t5-base",
-                           max_doc_tokens=d.max_doc_tokens,
-                           min_doc_tokens=d.min_doc_tokens)
-    else:
-        raise ValueError(f"unknown data source {d.source!r}")
+    source = _spec_source(cfg)
     if cfg.data.routing == "round_robin" or len(docs) < num_paths:
         routing = round_robin_routing()
     else:
@@ -305,6 +323,26 @@ def build_spec_corpus(cfg: LaunchConfig, model, docs) -> SpecCorpus:
     spec = make_shard_spec(source=source, routing=routing,
                            num_paths=num_paths, seq_len=seq_len)
     return SpecCorpus.from_documents(spec, docs)
+
+
+def build_spec_corpus_streaming(cfg: LaunchConfig, model) -> SpecCorpus:
+    """Build the spec corpus by **streaming** the public source twice -- a sampled
+    router fit, then a token-count pass -- so the operator never holds the full
+    corpus (W7b). Used when ``data.ship: spec`` and ``data.router_sample`` is set;
+    ``SpecCorpus.build`` does the counts pass holding no sequences."""
+    d = cfg.data
+    num_paths, seq_len = model.num_paths, model.sequence_length
+    source = _spec_source(cfg)
+    if d.routing == "round_robin":
+        routing = round_robin_routing()
+    else:
+        routing = fit_routing_from_source(
+            source, num_paths=num_paths, vocab_size=cfg.model.vocab_size,
+            seq_len=seq_len, sample=d.router_sample,
+            feature_dim=min(256, cfg.model.vocab_size), router_seed=d.router_seed)
+    spec = make_shard_spec(source=source, routing=routing,
+                           num_paths=num_paths, seq_len=seq_len)
+    return SpecCorpus.build(spec)
 
 
 def _attach_metrics(server, cfg: LaunchConfig):
@@ -353,8 +391,7 @@ def _bounded_graceful_shutdown(server, *, deadline: float = _SHUTDOWN_DEADLINE) 
 def run_coordinator(cfg: LaunchConfig, *, on_start=None):
     """Single-node async coordinator: train to the budget, then return completions."""
     model, diloco = dipaco_config(cfg.model), diloco_config(cfg.diloco)
-    docs = build_documents(cfg)
-    corpus = build_corpus(cfg, model, docs)
+    corpus = build_server_corpus(cfg, model)
     engine = DiPaCoEngine(model, diloco, LocalBackend(model.build_topology()),
                           seed=cfg.run.seed, materialize="serial")
     scheduler = AsyncScheduler(engine, lease_timeout=cfg.transport.heartbeat_timeout)
@@ -388,8 +425,7 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None, identity=N
     (``watch_tracker``) and routing derives from the current epoch.
     """
     model, diloco = dipaco_config(cfg.model), diloco_config(cfg.diloco)
-    docs = build_documents(cfg)
-    corpus = build_corpus(cfg, model, docs)
+    corpus = build_server_corpus(cfg, model)
     own = cfg.ownership
     rendezvous = own.mode == "rendezvous"
     if own.mode not in ("static", "rendezvous"):
@@ -569,6 +605,8 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             max_tasks=mt, reconnect=True,
             heartbeat_interval=cfg.transport.heartbeat_interval,
             data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch,
+            max_shards=cfg.run.worker_max_shards,
+            verify_routing=bool(cfg.run.verify_routing),
             transport="libp2p", identity=_node_identity(cfg, generate=True),
             stop_event=stop_event or _wait_for_signal())
         return
@@ -577,6 +615,13 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
         # the corpus locally (the shard source) and needs an identity (it is
         # HRW-scored by peer_id and derives epochs).
         own = cfg.ownership
+        if cfg.run.verify_routing:
+            # The decentralized worker materializes via corpus.shard(), not the
+            # _materialize_from_spec seam where W7c verification lives -- so the
+            # flag would silently do nothing. Say so rather than imply it's active.
+            print("WARNING: --verify-routing is not enforced in decentralized mode "
+                  "(no shard-spec materialization seam); routing is unverified.",
+                  flush=True)
         corpus = build_corpus(cfg, model, build_documents(cfg))
         run_decentralized_worker(
             model, diloco, tuple(cfg.tracker_connect_addr()), corpus,
@@ -596,6 +641,8 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             heartbeat_interval=cfg.transport.heartbeat_interval,
             tls=build_tls_client(cfg), tls_hostname=cfg.tls.server_hostname,
             data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch,
+            max_shards=cfg.run.worker_max_shards,
+            verify_routing=bool(cfg.run.verify_routing),
             stop_event=stop_event or _wait_for_signal(), bucket=bucket)
     else:
         if bucket is not None:
@@ -608,7 +655,9 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             auth_key=auth, max_tasks=mt,
             heartbeat_interval=cfg.transport.heartbeat_interval,
             tls=build_tls_client(cfg), tls_hostname=cfg.tls.server_hostname,
-            data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch)
+            data_dir=data_dir, max_batch_size=cfg.run.worker_max_batch,
+            max_shards=cfg.run.worker_max_shards,
+            verify_routing=bool(cfg.run.verify_routing))
 
 
 def run_local(cfg: LaunchConfig):
@@ -806,7 +855,7 @@ def _run_local_decentralized(cfg: LaunchConfig):
         cfg.transport.auth_key = os.urandom(16).hex()
     auth = cfg.transport.auth_key
     model, diloco = dipaco_config(cfg.model), diloco_config(cfg.diloco)
-    corpus = build_corpus(cfg, model, build_documents(cfg))
+    corpus = build_server_corpus(cfg, model)
     topo = model.build_topology()
 
     owner_ids = [PeerIdentity.generate() for _ in range(n)]

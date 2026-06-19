@@ -22,12 +22,14 @@ from opendipaco import (
 from opendipaco.data import ShardedCorpus, SpecCorpus, materialize_shard, spec_fingerprint
 from opendipaco.data.spec import (
     c4_source,
+    fit_routing_from_source,
     iter_spec_documents,
     kmeans_routing,
     make_shard_spec,
     round_robin_routing,
     synthetic_documents,
     synthetic_source,
+    verify_routing,
 )
 from opendipaco.routing import BagOfTokensFeaturizer, KMeansRouter
 from opendipaco.schedule import (
@@ -128,6 +130,166 @@ def test_spec_corpus_build_streams_counts():
     a = SpecCorpus.from_documents(spec, docs)
     b = SpecCorpus.build(spec)            # streams from the spec's source
     assert a.token_counts == b.token_counts
+
+
+def test_fit_routing_from_source_is_deterministic():
+    """W7b: a sampled router fit reproduces byte-identical centroids from the same
+    public source + params -- the basis for slice c's verification."""
+    kw = dict(num_paths=PATHS, vocab_size=VOCAB, seq_len=SEQ, sample=24,
+              feature_dim=VOCAB, router_seed=0)
+    a = fit_routing_from_source(_source_spec(), **kw)
+    b = fit_routing_from_source(_source_spec(), **kw)
+    assert a["kind"] == "kmeans"
+    assert torch.equal(a["centroids"], b["centroids"])
+
+
+def test_fit_routing_from_source_falls_back_to_round_robin_when_sample_too_small():
+    """Fewer streamed docs than num_paths can't seed k-means; degrade to round-robin
+    (mirroring the in-hand builder) instead of crashing at server startup."""
+    routing = fit_routing_from_source(_source_spec(), num_paths=PATHS, vocab_size=VOCAB,
+                                      seq_len=SEQ, sample=PATHS - 1, feature_dim=VOCAB)
+    assert routing == round_robin_routing()
+
+
+def test_fit_routing_from_source_matches_full_fit_when_sample_covers_corpus():
+    """With sample >= corpus size the streamed fit sees every doc in stream order,
+    so it equals the in-hand fit (the unsampled path) bit-for-bit."""
+    docs = _docs()
+    full = fit_routing_from_source(_source_spec(), num_paths=PATHS, vocab_size=VOCAB,
+                                   seq_len=SEQ, sample=10_000, feature_dim=VOCAB)
+    feat = BagOfTokensFeaturizer(VOCAB, feature_dim=VOCAB)
+    router = KMeansRouter(PATHS, seed=0).fit(feat([d[:SEQ] for d in docs]))
+    assert torch.equal(full["centroids"], router.centroids)
+
+
+def test_build_server_corpus_streams_with_router_sample():
+    """``build_server_corpus`` with data.router_sample set builds a SpecCorpus by
+    streaming -- a valid kmeans recipe + normalized counts, never holding the
+    corpus."""
+    from opendipaco.launch import LaunchConfig
+    from opendipaco.launch.config import dipaco_config
+    from opendipaco.launch.roles import build_server_corpus
+
+    cfg = LaunchConfig.from_dict({
+        "model": {"vocab_size": VOCAB, "hidden_size": 32, "num_attention_heads": 4,
+                  "intermediate_size": 64, "layers_per_level": [1, 1],
+                  "level_sizes": [2, 2], "sequence_length": SEQ,
+                  "max_position_embeddings": 64},
+        "data": {"source": "synthetic", "num_documents": 32, "ship": "spec",
+                 "synthetic_topics": 4, "synthetic_doc_len": 48, "router_sample": 24},
+    })
+    model = dipaco_config(cfg.model)
+    corpus = build_server_corpus(cfg, model)
+    assert isinstance(corpus, SpecCorpus)
+    assert corpus.spec["routing"]["kind"] == "kmeans"
+    assert abs(sum(corpus.shard_weight(p) for p in range(model.num_paths)) - 1.0) < 1e-6
+
+
+def test_build_server_corpus_unset_router_sample_is_unchanged():
+    """Default (no router_sample) routes through the in-hand build -- identical
+    token counts to the existing path (byte-identical baseline preserved)."""
+    from opendipaco.launch import LaunchConfig
+    from opendipaco.launch.config import dipaco_config
+    from opendipaco.launch.roles import build_corpus, build_documents, build_server_corpus
+
+    spec_cfg = {
+        "model": {"vocab_size": VOCAB, "hidden_size": 32, "num_attention_heads": 4,
+                  "intermediate_size": 64, "layers_per_level": [1, 1],
+                  "level_sizes": [2, 2], "sequence_length": SEQ,
+                  "max_position_embeddings": 64},
+        "data": {"source": "synthetic", "num_documents": 32, "ship": "spec",
+                 "synthetic_topics": 4, "synthetic_doc_len": 48},
+    }
+    cfg = LaunchConfig.from_dict(spec_cfg)
+    model = dipaco_config(cfg.model)
+    streamed = build_server_corpus(cfg, model)
+    in_hand = build_corpus(cfg, model, build_documents(cfg))
+    assert streamed.token_counts == in_hand.token_counts
+
+
+def _sampled_spec(sample=24):
+    """A spec whose kmeans router was fit via the streaming sampled path (so it
+    carries the `fit` metadata verify_routing needs)."""
+    routing = fit_routing_from_source(_source_spec(), num_paths=PATHS, vocab_size=VOCAB,
+                                      seq_len=SEQ, sample=sample, feature_dim=VOCAB)
+    return make_shard_spec(source=_source_spec(), routing=routing,
+                           num_paths=PATHS, seq_len=SEQ)
+
+
+def test_verify_routing_accepts_untampered_sampled_spec():
+    assert verify_routing(_sampled_spec()) is True
+
+
+def test_verify_routing_detects_tampered_centroids():
+    spec = _sampled_spec()
+    spec["routing"]["centroids"] = spec["routing"]["centroids"] + 5.0   # poison the router
+    assert verify_routing(spec) is False
+
+
+def test_verify_routing_detects_tampered_featurizer_seed():
+    # Keep the legit centroids but flip ONLY the featurizer seed: materialization
+    # routes through a different projection (different shards), so verification
+    # must reproduce with the shipped seed and refuse the mismatch -- not pass
+    # because the centroids are unchanged.
+    spec = _sampled_spec()
+    spec["routing"]["featurizer"]["seed"] = 7
+    assert verify_routing(spec) is False
+
+
+def test_verify_routing_cant_verify_unknown_featurizer_kind():
+    # A future / tampered featurizer kind can't be reproduced by the bag-of-tokens
+    # re-fit -> report can't-verify, don't falsely reject by fitting the wrong one.
+    spec = _sampled_spec()
+    spec["routing"]["featurizer"]["kind"] = "ngram_hash"
+    with pytest.raises(ValueError, match="featurizer kind"):
+        verify_routing(spec)
+
+
+def test_verify_routing_trivial_for_round_robin():
+    spec = make_shard_spec(source=_source_spec(), routing=round_robin_routing(),
+                           num_paths=PATHS, seq_len=SEQ)
+    assert verify_routing(spec) is True
+
+
+def test_verify_routing_raises_without_fit_metadata():
+    # An in-hand kmeans spec has no reproducible `fit` block -> can't verify.
+    spec, *_ = _kmeans_spec(_docs())
+    with pytest.raises(ValueError, match="fit metadata"):
+        verify_routing(spec)
+
+
+def test_verify_routing_cant_verify_when_refit_degrades_to_round_robin():
+    # Shipped k-means, but the recorded sample is now too small to re-seed the fit
+    # (e.g. the live source shrank). That's inability-to-reproduce, not tampering:
+    # raise "cannot verify" (caller proceeds) rather than refuse.
+    spec = _sampled_spec()
+    spec["routing"]["fit"]["sample"] = PATHS - 1     # re-fit will degrade to round-robin
+    with pytest.raises(ValueError, match="cannot verify"):
+        verify_routing(spec)
+
+
+def test_materialize_from_spec_verify_rejects_tampered():
+    from opendipaco.schedule.distributed import RoutingVerificationError, _materialize_from_spec
+    spec = _sampled_spec()
+    spec["routing"]["centroids"] = spec["routing"]["centroids"] + 5.0
+    with pytest.raises(RoutingVerificationError):
+        _materialize_from_spec({"spec": spec, "path_index": 0}, {"verify": True})
+
+
+def test_materialize_from_spec_verify_accepts_good_and_memoizes():
+    from opendipaco.schedule.distributed import _materialize_from_spec
+    spec = _sampled_spec()
+    ctx = {"verify": True}
+    shard = _materialize_from_spec({"spec": spec, "path_index": 0}, ctx)
+    assert shard is not None
+    assert spec_fingerprint(spec) in ctx["verified"]      # verified once, memoized
+
+
+def test_materialize_from_spec_verify_warns_and_proceeds_without_fit_metadata():
+    from opendipaco.schedule.distributed import _materialize_from_spec
+    spec, *_ = _kmeans_spec(_docs())                       # in-hand spec, no `fit`
+    shard = _materialize_from_spec({"spec": spec, "path_index": 0}, {"verify": True})
+    assert shard is not None                               # can't-verify -> proceed, not crash
 
 
 def test_spec_corpus_refuses_to_serve_bytes():

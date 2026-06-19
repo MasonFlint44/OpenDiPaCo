@@ -134,6 +134,132 @@ def kmeans_routing(centroids: torch.Tensor, *, vocab_size: int, feature_dim: int
                            "feature_dim": feature_dim, "seed": seed}}
 
 
+def fit_routing_from_source(source: dict, *, num_paths: int, vocab_size: int,
+                            seq_len: int, sample: int, feature_dim: int,
+                            router_seed: int = 0, feat_seed: int = 0,
+                            doc_source=None, tokenizer=None) -> dict:
+    """Fit the k-means router on a bounded, **deterministic** sample of the public
+    source (the first ``sample`` documents) and return a :func:`kmeans_routing`
+    dict -- or :func:`round_robin_routing` if the sample is too small to fit
+    (W7b, ``docs/w7-data-decentralization-design.md``).
+
+    The point: the operator builds the shard spec **without ever holding the whole
+    corpus** -- it streams at most ``sample`` document prefixes to fit, then
+    :meth:`SpecCorpus.build` streams again for the token counts. The fit matches
+    the in-hand one (:func:`~opendipaco.launch.roles.build_spec_corpus`): a
+    ``BagOfTokensFeaturizer`` (``feat_seed``, default 0) over ``doc[:seq_len]``
+    prefixes, k-means at ``router_seed``. ``feat_seed`` is recorded in the routing
+    dict's featurizer block; ``verify_routing`` passes the *shipped* seed so a
+    spec that flips only the featurizer seed (same centroids, different routing
+    projection) reproduces different centroids and is refused.
+
+    **Determinism / reproducibility:** the centroids are a pure function of the
+    *exact prefix sequence* the source yields (k-means++ seeds off ``randperm(n)``
+    where ``n`` is the number of docs actually streamed, so the count itself is an
+    input). A synthetic source regenerates bit-identically; a C4 source is only
+    reproducible if the stream replays the same rows (pin the dataset revision).
+    Under that assumption any peer reproduces byte-identical centroids -- the basis
+    for slice c's ``verify_routing``. Because it fits on a *sample* (not every
+    document) the assignments differ from the full-corpus fit; this path is opt-in
+    (``data.router_sample``) and not byte-identical to the unsampled run.
+
+    If the sample yields fewer than ``num_paths`` documents (a tiny corpus, an
+    over-small ``sample``, or aggressive C4 filtering), k-means cannot seed one
+    centroid per cluster, so this degrades to round-robin -- mirroring the in-hand
+    builder's ``len(docs) < num_paths`` fallback rather than crashing at startup.
+    """
+    if sample < 1:
+        raise ValueError(f"router sample must be >= 1, got {sample}")
+    feat = BagOfTokensFeaturizer(vocab_size, feature_dim=feature_dim, seed=feat_seed)
+    prefixes: list[torch.Tensor] = []
+    for doc in iter_spec_documents({"source": source}, source=doc_source, tokenizer=tokenizer):
+        prefixes.append(doc[:seq_len])
+        if len(prefixes) >= sample:
+            break
+    if len(prefixes) < num_paths:
+        return round_robin_routing()
+    router = KMeansRouter(num_paths, seed=router_seed).fit(feat(prefixes))
+    routing = kmeans_routing(router.centroids, vocab_size=vocab_size,
+                             feature_dim=feature_dim, seed=feat_seed)
+    # Record the fit inputs so a peer can reproduce the centroids from the public
+    # source alone (W7c verify_routing). seq_len / num_paths already live on the
+    # spec; only sample + router_seed are unique to the fit.
+    routing["fit"] = {"sample": sample, "router_seed": router_seed}
+    return routing
+
+
+def verify_routing(spec: dict, *, source=None, tokenizer=None,
+                   atol: float = 1e-3, rtol: float = 1e-3) -> bool:
+    """Re-fit the router from the spec's **own public source** + recorded sample
+    params and check it reproduces the shipped centroids (W7c,
+    ``docs/w7-data-decentralization-design.md``).
+
+    A worker can thus refuse a router that doesn't match the corpus it claims to
+    come from -- a spec whose centroids were tampered with, or built from a
+    different corpus -- instead of trusting whatever bytes the spec carries. It is
+    **belt-and-suspenders**, not a security boundary, and the guarantee is
+    deliberately narrow:
+
+    * It confirms the centroids are consistent with the *recorded fit params over
+      the stated source*. It does **not** vouch that those params or the resulting
+      routing are benign: an adversary who controls the spec can pick
+      ``router_seed``/``sample`` over the genuine public corpus to skew which docs
+      land in which shard and still reproduce here. Detecting that, or a different
+      public corpus + matching centroids, is the W8 data-poisoning question.
+    * A wrong router only wastes compute -- it can't poison weights (grant/quorum
+      gated) -- which is why this is opt-in and off by default.
+    * Reproducibility rests on the fit being recomputable: identical sample rows
+      *and* deterministic float reductions. k-means (cdist + argmin + iterated
+      means) is not bit-identical across BLAS/thread/torch-version stacks, so the
+      tolerance is intentionally loose and a genuine mismatch must move centroids
+      well beyond float noise (a meaningful poisoning does). On a wildly different
+      stack a borderline false reject is possible -- acceptable because it only
+      ever *refuses* (never silently trains on a bad router).
+
+    Returns ``True`` if the centroids reproduce, or routing is round-robin
+    (nothing to verify). Returns ``False`` only on a real centroid mismatch.
+    Raises ``ValueError`` for the "cannot verify" cases -- no reproducible fit
+    metadata (an in-hand/full-corpus fit needs the whole corpus), an unknown
+    routing kind, or the live source now yielding too few docs to re-seed the fit
+    -- leaving the caller to decide whether inability-to-verify should block
+    (the worker seam warns and proceeds rather than refusing).
+    """
+    routing = spec["routing"]
+    kind = routing.get("kind")
+    if kind == "round_robin":
+        return True
+    if kind != "kmeans":
+        raise ValueError(f"cannot verify routing kind {kind!r}")
+    fit = routing.get("fit")
+    if not fit:
+        raise ValueError("spec has no reproducible fit metadata (built without "
+                         "data.router_sample); routing verification needs a sampled fit")
+    feat = routing["featurizer"]
+    if feat.get("kind") != "bag_of_tokens":
+        # fit_routing_from_source only rebuilds the bag-of-tokens featurizer
+        # (matching _build_predictor's guard); a different kind can't be
+        # reproduced here, so report can't-verify rather than re-fit the wrong
+        # featurizer and falsely reject.
+        raise ValueError(f"cannot verify featurizer kind {feat.get('kind')!r}")
+    recomputed = fit_routing_from_source(
+        spec["source"], num_paths=spec["num_paths"], vocab_size=feat["vocab_size"],
+        seq_len=spec["seq_len"], sample=fit["sample"], feature_dim=feat["feature_dim"],
+        router_seed=fit["router_seed"], feat_seed=feat.get("seed", 0),
+        doc_source=source, tokenizer=tokenizer)
+    if recomputed.get("kind") != "kmeans":
+        # The honest re-fit couldn't even seed k-means (the live source yields
+        # fewer than num_paths docs right now). That's an inability to reproduce
+        # the fit conditions, not evidence of tampering -- can't verify, don't
+        # refuse.
+        raise ValueError("could not reproduce a k-means fit from the current source "
+                         "(too few sample docs available now) -- cannot verify")
+    # Compare in a common dtype so a serialized/round-tripped (e.g. float64)
+    # centroid tensor yields a verdict instead of allclose raising on a dtype skew.
+    shipped = routing["centroids"].float()
+    got = recomputed["centroids"].float()
+    return shipped.shape == got.shape and torch.allclose(shipped, got, atol=atol, rtol=rtol)
+
+
 def _build_predictor(spec: dict):
     """Return ``predict(prefixes) -> LongTensor`` for a spec, or None (round-robin)."""
     routing = spec["routing"]

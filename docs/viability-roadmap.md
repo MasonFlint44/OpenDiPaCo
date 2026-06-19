@@ -209,13 +209,28 @@ one-command "join this run," GPU autodetection, honor a bandwidth cap, pause/
 resume on sleep, and surface contribution/health. Without this, "consumer
 hardware" means "people who can write a YAML config and open a port."
 
-### W7 · Finish data decentralization · B2 · [eng]
+### W7 · Finish data decentralization · B2 · [eng] · ✅ **mostly landed**
 
-`data.ship: spec` decentralized shard *materialization* (Phase 0d), but the
-server still fits the k-means router and computes token counts centrally at
-startup, EM re-sharding is still central, and the worker-side `shard_cache` is
-unbounded in RAM (the disk cache bounds re-streaming, not memory). For a swarm
-with no central data authority these need to move peer-side and be bounded.
+`data.ship: spec` decentralized shard *materialization* (Phase 0d); W7
+(`docs/w7-data-decentralization-design.md`) closes the rest of the central data
+dependencies:
+
+- **Bounded worker memory** ✅ — the worker shard cache is a bounded LRU
+  (`run.worker_max_shards` / `join --max-shards`), so a worker that fails over
+  across many paths no longer holds every shard it ever leased; an evicted shard
+  re-materializes from the spec on its next lease (byte-identical training).
+- **No central data authority for the router** ✅ — `data.router_sample` fits the
+  k-means router on a bounded streamed sample (`build_server_corpus`), so the
+  server never holds the whole corpus in RAM; token counts stream too.
+- **Peer-verifiable routing** ✅ — `verify_routing` / `join --verify-routing`
+  re-fits the shipped router from the public source and refuses to train on a
+  mismatch (opt-in, belt-and-suspenders).
+- **Owed:** EM re-sharding is still central (and not wired into the async/sharded
+  loop) — decentralizing it changes *global* assignments and needs consensus, so
+  it's §0f/research-shaped, tracked in `docs/remaining-gaps.md` alongside the WAN
+  run. Routing verification is also a no-op in `schedule.mode: decentralized`
+  (no shard-spec materialization seam) and tolerant across very different
+  numerical stacks — both noted in the design doc.
 
 ### W8 · Trust beyond the current threat model · B2 · [research]
 
@@ -247,7 +262,7 @@ needs a reason to contribute. These are research-shaped, not just unbuilt.
                                                 ▼
                   W3 VRAM fit ✅  ·  W4 churn ✅  ·  W5 task sizing ✅       (B1: "large + consumer")
                                                 ▼
-                       W6 client   ·   W7 data plane   ·   W8 trust/incentives   (B2: ecosystem)
+                    W6 client ✅  ·  W7 data plane ✅  ·  W8 trust/incentives   (B2: ecosystem)
 ```
 
 **Bottom line:** Phases 0–4 removed what had to be *trusted* or *central*. The
