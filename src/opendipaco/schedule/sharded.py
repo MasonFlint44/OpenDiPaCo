@@ -3418,14 +3418,20 @@ def run_decentralized_worker(config, diloco, tracker_addr, corpus, *, identity,
                              total_rounds=0, max_tasks=None, reachability="nat",
                              heartbeat_interval=3.0, poll_interval=0.05,
                              max_msg_bytes=DEFAULT_MAX_MSG_BYTES, connect_timeout=10.0,
-                             tls=None, stop_event=None, fault_hook=None, bucket=None):
+                             tls=None, stop_event=None, fault_hook=None, bucket=None,
+                             seeds=None):
     """Self-assigning worker for a decentralized swarm (``schedule.mode:
     decentralized``): no scheduler, no central grant signer. It registers with
     the rendezvous tracker (role ``worker``), then loops :func:`_serve_decentralized`
     -- derive the epoch locally, self-assign a path, quorum-fetch, train, commit
     to the path's coordinator, push to all k owners. Needs an ``identity`` (it is
-    HRW-scored by ``peer_id`` and derives epochs)."""
-    from .tracker import fetch_directory, register_peer
+    HRW-scored by ``peer_id`` and derives epochs).
+
+    ``seeds`` (W8 eclipse defense): extra bootstrap trackers; the directory is the
+    **union** over ``tracker_addr`` + ``seeds`` (one honest seed defeats a
+    malicious/partitioned seed that withholds peers). Registration/heartbeat still
+    go to the primary ``tracker_addr``."""
+    from .tracker import fetch_directory_multi, register_peer
 
     engine = _build_worker_engine(config, diloco, device, seed)
     worker = AsyncScheduler(engine, num_workers=1)
@@ -3455,11 +3461,19 @@ def run_decentralized_worker(config, diloco, tracker_addr, corpus, *, identity,
     beat = threading.Thread(target=_beat, daemon=True)
     beat.start()
 
+    # Union over the primary + any extra seeds (deduped, primary first): omission-
+    # eclipse needs every seed to withhold a peer, so one honest seed restores it.
+    all_seeds = [tuple(tracker_addr)]
+    for s in (seeds or []):
+        addr = (s[0], int(s[1]))
+        if addr not in all_seeds:
+            all_seeds.append(addr)
+
     def directory_fn():
-        try:
-            return fetch_directory(tracker_addr, auth_key=auth_key, tls=tls)
-        except (OSError, ConnectionError):
-            return []  # tracker blip: a previous epoch persists until it answers
+        # fetch_directory_multi skips erroring seeds (best-effort) and returns the
+        # union; all-seeds-down -> [] (a previous epoch persists until one answers).
+        records, _answered = fetch_directory_multi(all_seeds, auth_key=auth_key, tls=tls)
+        return records
 
     link = _WorkerLink(None, auth_key=auth_key, max_msg_bytes=max_msg_bytes,
                        connect_timeout=connect_timeout, tls=tls, bucket=bucket)

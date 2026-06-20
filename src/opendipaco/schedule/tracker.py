@@ -354,6 +354,60 @@ def fetch_directory_and_tombstones(addr, *, roles=None, reachability=None, auth_
     return records, out
 
 
+def _record_issued_at(r):
+    ts = r.get("issued_at")
+    return float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else None
+
+
+def fetch_directory_multi(seeds, *, roles=None, reachability=None, auth_key=None,
+                          tls=None, timeout: float = 10.0):
+    """Bootstrap the directory from **multiple seeds**, returning the **union** of
+    verified records (freshest per ``peer_id``) with verified deregister tombstones
+    suppressing same-or-older registrations (W8 eclipse defense; design
+    ``docs/w8-eclipse-sybil-design.md``).
+
+    Records are self-certifying, so the union is sound regardless of which seed
+    served them: omission-eclipse needs *every* seed to withhold a peer, and one
+    honest+reachable seed restores it. Unreachable/erroring/malicious seeds are
+    skipped (best-effort -> also better availability). ``seeds`` is an iterable of
+    ``(host, port)`` (a trailing pinned pubkey, if present, is ignored here --
+    pinning is a transport-auth concern, not what makes the union sound). Returns
+    ``(records, seeds_answered)``.
+    """
+    merged: dict[str, dict] = {}    # peer_id -> freshest verified record
+    tombs: dict[str, float] = {}    # peer_id -> max verified deregister issued_at
+    answered = 0
+    for seed in seeds:
+        addr = (seed[0], seed[1])
+        try:
+            records, t = fetch_directory_and_tombstones(
+                addr, roles=roles, reachability=reachability,
+                auth_key=auth_key, tls=tls, timeout=timeout)
+        except Exception:
+            # A seed is untrusted and best-effort: skip ANY failure (unreachable,
+            # a malformed/garbage reply that escapes the codec as struct.error /
+            # AttributeError / RuntimeError, etc.) rather than let one bad seed
+            # crash the caller. Records that DO come through are verify_record'd.
+            continue
+        answered += 1
+        for pid, ts in t.items():
+            if pid not in tombs or ts > tombs[pid]:
+                tombs[pid] = ts
+        for r in records:           # already verify_record-checked by the fetch
+            pid, ts = r.get("peer_id"), _record_issued_at(r)
+            if not isinstance(pid, str) or ts is None:
+                continue
+            cur = merged.get(pid)
+            if cur is None or ts > _record_issued_at(cur):
+                merged[pid] = r
+    # A tombstone suppresses a registration at or before its issued_at, so a
+    # malicious seed can't resurrect a departed peer by replaying its still-within-
+    # TTL record; a peer that left then rejoined (newer registration) survives.
+    out = [r for pid, r in merged.items()
+           if pid not in tombs or _record_issued_at(r) > tombs[pid]]
+    return out, answered
+
+
 def import_records(addr, records, *, auth_key=None, tls=None, timeout: float = 10.0) -> dict:
     """Push relayed records into a tracker (bootstrap a replacement from a cache)."""
     return tracker_rpc(addr, {"type": "import", "records": list(records)},

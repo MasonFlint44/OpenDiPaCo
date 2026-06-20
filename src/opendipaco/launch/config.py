@@ -198,6 +198,11 @@ class TrackerCfg:
     ttl: float = 30.0                  # registrations expire unless re-registered
     open_enrollment: bool = False      # True: any validly-signed record may register
     enroll_peers: list[str] = field(default_factory=list)  # pubkeys allowed to register
+    # W8 eclipse defense: extra bootstrap trackers to UNION the directory from
+    # (beyond the primary host/port) -- [[host, port], ...] (a 3rd pinned-pubkey
+    # element is tolerated for a future authenticated transport). One honest seed
+    # restores peers a malicious/partitioned seed withholds. Empty = single-seed.
+    seeds: list = field(default_factory=list)
 
 
 @dataclass
@@ -501,6 +506,18 @@ class LaunchConfig:
             raise ValueError(
                 "schedule.mode: decentralized requires transport.compress: none "
                 "(quorum reads need byte-exact agreement across replicas)")
+        # W8 multi-seed: validate each tracker.seeds entry is [host, port(, pubkey)]
+        # with an int-able port, so a typo fails at load (not deep in the worker).
+        for i, s in enumerate(kw["tracker"].seeds):
+            try:
+                host = s[0]
+                int(s[1])             # port must be int-able
+            except (TypeError, ValueError, IndexError) as e:
+                raise ValueError(
+                    f"tracker.seeds[{i}]={s!r} must be [host, port] (optional 3rd "
+                    f"pinned-pubkey element); got {e!r}") from e
+            if not isinstance(host, str):
+                raise ValueError(f"tracker.seeds[{i}] host must be a string, got {host!r}")
         return cls(**kw)
 
     def connect_addr(self) -> tuple[str, int]:

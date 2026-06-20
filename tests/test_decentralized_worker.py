@@ -11,6 +11,7 @@ Design: docs/decentralized-worker-loop-design.md.
 """
 
 import os
+import threading
 import time
 
 import pytest
@@ -40,6 +41,7 @@ from opendipaco.schedule.sharded import (
     _pick_assigned_path,
     _push_all_owners,
     _serve_decentralized,
+    run_decentralized_worker,
 )
 from opendipaco.topology import is_private_key
 
@@ -460,3 +462,31 @@ def test_byzantine_owner_is_flagged_and_evicted():
     finally:
         for ps in owners:
             ps.shutdown()
+
+
+def test_run_decentralized_worker_bootstraps_from_all_seeds(monkeypatch):
+    """W8 eclipse wiring: the worker's directory bootstrap unions over the primary
+    tracker + extra seeds. A regression dropping seeds= or reverting directory_fn
+    to a single-seed fetch would otherwise ship green (the standalone
+    fetch_directory_multi tests don't cover this integration)."""
+    from opendipaco.schedule import tracker as tk
+    seen = []
+    monkeypatch.setattr(
+        tk, "fetch_directory_multi",
+        lambda seeds, **kw: (seen.append([tuple(s) for s in seeds]), ([], 0))[1])
+    cfg = _cfg()
+    stop = threading.Event()
+    th = threading.Thread(target=lambda: run_decentralized_worker(
+        cfg, _diloco(), ("127.0.0.1", 59991), _corpus(cfg),
+        identity=PeerIdentity.generate(), seeds=[["127.0.0.1", 59992]],
+        poll_interval=0.01, stop_event=stop), daemon=True)
+    th.start()
+    try:
+        for _ in range(300):                 # wait for directory_fn to fire once
+            if seen:
+                break
+            time.sleep(0.01)
+    finally:
+        stop.set()
+        th.join(timeout=5)
+    assert seen and seen[0] == [("127.0.0.1", 59991), ("127.0.0.1", 59992)]

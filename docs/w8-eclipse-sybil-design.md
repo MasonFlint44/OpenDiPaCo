@@ -53,19 +53,22 @@ deregister. `max_peers` bounds the directory size (global cap).
 
 Build the honestly-buildable hardening; do **not** claim Sybil-of-control is solved.
 
-### Defense 1 — multi-seed bootstrap + union, keyed on pinned seed pubkeys
-A newcomer bootstraps from **several seeds it pins by Ed25519 pubkey** (not just
-host:port) and takes the **union** of verified records (freshest per `peer_id`).
-- *Eclipse (omission):* defeated as long as ≥1 pinned seed is honest+reachable —
-  one honest seed restores any peer the others withhold. Dead/malicious seeds are
+### Defense 1 — multi-seed bootstrap + union (self-certifying records)
+A newcomer bootstraps from **several seed addresses** and takes the **union** of
+verified records (freshest per `peer_id`). The union is sound because records are
+**self-certifying** — a malicious seed can't forge a record, only *omit* or
+*inject* real ones.
+- *Eclipse (omission):* defeated as long as ≥1 seed is honest+reachable — one
+  honest seed restores any peer the others withhold. Dead/malicious seeds are
   skipped (best-effort → also better availability).
-- *Pinned pubkeys are the trust root.* `TrackerCfg.seeds` carries `(host, port,
-  pubkey)`; a seed's reply is attributed to its pinned identity (the directory
-  records are self-certifying regardless, but pinning lets us *attribute* a
-  withholding/garbage seed and refuse an unpinned one on a paranoid run). The seed
-  *list's* provenance is the irreducible trust input — it must come from a trusted
-  channel, **not** the W6 manifest (which has the same provenance hole). Documented
-  as such; no out-of-band magic claimed.
+- *Trust input & pinning.* The irreducible trust input is **knowing ≥1 honest
+  seed's address**; the seed *list's* provenance must come from a trusted channel,
+  **not** the W6 manifest (same provenance hole). `TrackerCfg.seeds` may carry an
+  optional `pubkey` per seed, but note: the tracker's *reply envelope* isn't
+  signed (only the records inside it are), so a pubkey pin only prevents
+  **MITM-impersonation of a seed on an authenticated transport** (TLS/libp2p) —
+  over plain TCP it's advisory. Pinning is therefore a transport-auth follow-on,
+  **not** what makes the union sound (the self-certifying records are).
 - *Union tradeoff (acknowledged):* the union is monotone — it also aggregates each
   seed's admitted records, so a malicious pinned seed can **inject** its
   signature-valid Sybils into the view. Union is therefore an **omission**
@@ -77,13 +80,17 @@ host:port) and takes the **union** of verified records (freshest per `peer_id`).
   `peer_id` across all seeds — else a malicious seed could replay a departed
   peer's still-within-TTL record to resurrect it.
 
-### Defense 2 — worker-side reputation filter (a real consistency fix)
-Wire `is_eligible` (reputation ≥ `min_owner_reputation`) into the **worker-side**
-`derive_epoch` (`_serve_decentralized`), matching the owner-side. This doesn't
-stop *fresh* Sybils (floor > threshold — that's part 3), but it makes
-**proven-bad** owners excluded *everywhere* (today a debited owner is dropped
-owner-side but still HRW-selected in the worker's own view). Closes the
-worker/owner inconsistency the review surfaced.
+### Defense 2 — worker-side reputation filter (owed — needs a reputation source)
+The review noted the worker-side `derive_epoch` (`_serve_decentralized`) isn't
+reputation-filtered. **Build-time correction:** the worker has **no reputation
+object** — reputation is owner-hosted (computed from commit outcomes), and the
+worker only holds `directory_fn`. So this isn't a one-line "wire `is_eligible`"
+fix: the worker would need reputation *plumbed to it* (gossiped, or owner-reported)
+first. And it's an **optimization, not a security boundary** — the worker's HRW
+only chooses which owners to *route* to; write-acceptance is gated owner-side +
+by quorum (which do have reputation). So a worker routing to a debited owner is
+caught at the owner/quorum, not silently accepted. **Deferred** (needs a worker
+reputation view; ties to the part-3 Sybil work). Not in slice a.
 
 ### Defense 3 — admission dampening + observability (honestly bounded)
 - Per-source registration rate-limit on the open tracker (reuse the Phase-3
@@ -99,20 +106,22 @@ worker/owner inconsistency the review surfaced.
 
 ## Slices
 
-### Slice a — multi-seed union (pinned), tombstones, worker-side rep filter
+### Slice a — multi-seed union (pinned) + tombstones
 - `tracker.fetch_directory_multi(seeds, ...)`: per seed fetch+verify, union by
-  `peer_id` keeping freshest `issued_at`, union+apply verified tombstones, skip
-  unreachable/erroring seeds; pinned-pubkey attribution. Mirror the owner-side
-  `_directory` merge.
+  `peer_id` keeping freshest `issued_at`, union+apply verified tombstones (a
+  tombstone suppresses a same-or-older registration for its `peer_id` across all
+  seeds), skip unreachable/erroring seeds; optional pinned-pubkey attribution.
+  Mirror the owner-side `_directory` merge.
 - `TrackerCfg.seeds: list[[host, port, pubkey]]`; `tracker_connect_seeds()`
   returns the full pinned list (the primary + extras). One seed (default) =
   byte-identical to today.
-- Wire the decentralized worker / scheduler bootstrap through the union; wire
-  `is_eligible` into the worker-side `derive_epoch`.
-- Tests: filtering seed + honest seed → union recovers omitted peers; tombstone
+- Wire the **decentralized worker** bootstrap through the union. (The scheduler's
+  `watch_tracker` stays single-seed in slice a — the *newcomer worker* is the
+  eclipse target; the operator's scheduler is less so. Scheduler multi-seed is a
+  slice-b/follow-on item.)
+- Tests: filtering seed + honest seed → union recovers omitted peers; a tombstone
   suppresses a replayed within-TTL record; all-seeds-down → empty, no crash;
-  single-seed unchanged; a proven-bad (debited) owner is excluded from the
-  worker's epoch.
+  single-seed unchanged.
 
 ### Slice b — `seed_quorum` (M-of-N) + admission rate-limit + divergence metric
 - Optional `seed_quorum` injection-resistance knob (M=1 default = union).

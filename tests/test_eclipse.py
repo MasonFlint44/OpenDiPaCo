@@ -1,0 +1,121 @@
+"""W8 (part 2) slice a: multi-seed bootstrap union (docs/w8-eclipse-sybil-design.md).
+
+A newcomer bootstrapping from one tracker can be eclipsed by a malicious/partitioned
+seed that withholds honest peers. fetch_directory_multi unions self-certifying
+records across several seeds, so one honest seed restores what others omit; verified
+tombstones suppress a replayed within-TTL record.
+"""
+
+import time
+
+from opendipaco.schedule import (
+    PeerIdentity,
+    Tracker,
+    deregister_peer,
+    fetch_directory,
+    fetch_directory_multi,
+    register_peer,
+)
+
+
+def _tracker():
+    t = Tracker(host="127.0.0.1", port=0, ttl=30.0, open_enrollment=True)
+    t.start()
+    return t
+
+
+def _addr(t):
+    return ("127.0.0.1", t.port)
+
+
+def test_union_recovers_peers_a_seed_omits():
+    """The eclipse defense: a seed that serves only its own peers (omitting the
+    honest ones) can't isolate a newcomer once a second honest seed is in the mix."""
+    good, evil = _tracker(), _tracker()
+    a, b, e = PeerIdentity.generate(), PeerIdentity.generate(), PeerIdentity.generate()
+    try:
+        ga, ea = _addr(good), _addr(evil)
+        register_peer(ga, a, reachability="public", peer_addr=("10.0.0.1", 1), roles=["owner"])
+        register_peer(ga, b, roles=["worker"])
+        register_peer(ea, e, reachability="public", peer_addr=("10.0.0.2", 2), roles=["owner"])
+        # Single (malicious/partitioned) seed: the newcomer sees only the evil set.
+        assert {r["peer_id"] for r in fetch_directory(ea)} == {e.peer_id}
+        # Multi-seed union restores the honest peers the evil seed withheld.
+        recs, answered = fetch_directory_multi([ea, ga])
+        assert answered == 2
+        assert {r["peer_id"] for r in recs} == {a.peer_id, b.peer_id, e.peer_id}
+    finally:
+        good.shutdown()
+        evil.shutdown()
+
+
+def test_union_keeps_the_freshest_record_per_peer():
+    """Same peer on two seeds with different issued_at -> the freshest wins (a seed
+    can't pin a victim to a stale addr if another serves the newer one)."""
+    t1, t2 = _tracker(), _tracker()
+    a = PeerIdentity.generate()
+    try:
+        a1, a2 = _addr(t1), _addr(t2)
+        register_peer(a1, a, reachability="public", peer_addr=("10.0.0.1", 100))
+        time.sleep(0.02)
+        register_peer(a2, a, reachability="public", peer_addr=("10.0.0.1", 200))   # newer
+        recs, _ = fetch_directory_multi([a1, a2])
+        assert [r["addr"] for r in recs] == [["10.0.0.1", 200]]
+    finally:
+        t1.shutdown()
+        t2.shutdown()
+
+
+def test_tombstone_suppresses_a_replayed_within_ttl_record():
+    """A departed peer's deregister tombstone (from an honest seed) suppresses a
+    malicious seed replaying its still-within-TTL registration."""
+    good, evil = _tracker(), _tracker()
+    a = PeerIdentity.generate()
+    try:
+        ga, ea = _addr(good), _addr(evil)
+        register_peer(ga, a, roles=["worker"])
+        register_peer(ea, a, roles=["worker"])     # the evil seed holds the live record
+        time.sleep(0.02)
+        deregister_peer(ga, a)                      # graceful leave -> tombstone on good
+        # Negative control: the evil seed alone DOES still serve the live record,
+        # so the suppression below is load-bearing (not vacuously absent).
+        assert a.peer_id in {r["peer_id"] for r in fetch_directory(ea)}
+        recs, answered = fetch_directory_multi([ga, ea])
+        assert answered == 2
+        assert a.peer_id not in {r["peer_id"] for r in recs}
+    finally:
+        good.shutdown()
+        evil.shutdown()
+
+
+def test_all_seeds_unreachable_returns_empty():
+    recs, answered = fetch_directory_multi([("127.0.0.1", 1), ("127.0.0.1", 2)], timeout=1.0)
+    assert recs == [] and answered == 0
+
+
+def test_single_seed_matches_fetch_directory():
+    t = _tracker()
+    a, b = PeerIdentity.generate(), PeerIdentity.generate()
+    try:
+        addr = _addr(t)
+        register_peer(addr, a, roles=["worker"])
+        register_peer(addr, b, roles=["owner"], reachability="public", peer_addr=("10.0.0.1", 9))
+        multi, answered = fetch_directory_multi([addr])
+        assert answered == 1
+        assert ({r["peer_id"] for r in multi}
+                == {r["peer_id"] for r in fetch_directory(addr)} == {a.peer_id, b.peer_id})
+    finally:
+        t.shutdown()
+
+
+def test_tracker_seeds_config_parses_and_validates():
+    import pytest
+
+    from opendipaco.launch import LaunchConfig
+    ok = LaunchConfig.from_dict({"tracker": {"port": 5, "seeds": [["h2", 6], ["h3", 7]]}})
+    assert ok.tracker.seeds == [["h2", 6], ["h3", 7]]
+    # A typo'd entry fails at load, not deep in the worker.
+    with pytest.raises(ValueError, match="tracker.seeds"):
+        LaunchConfig.from_dict({"tracker": {"seeds": [["h2"]]}})          # missing port
+    with pytest.raises(ValueError, match="tracker.seeds"):
+        LaunchConfig.from_dict({"tracker": {"seeds": [["h2", "bad"]]}})   # non-int port
