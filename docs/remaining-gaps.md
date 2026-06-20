@@ -204,8 +204,23 @@ production deployment. Mostly **deliberate scope decisions**, documented here.
   `probe_debit` is off by default — only sound in the worker-chose-data model); the probe is
   re-shipped per check (should become advertise-and-cache); the screen is inert in
   `schedule.mode: decentralized` (no `_materialize_from_spec` seam); and its end-to-end efficacy
-  rides the §0f run, like all of Phase 3. **Still open in W8:** eclipse/Sybil-at-the-tracker and
-  incentives (research-shaped).
+  rides the §0f run, like all of Phase 3.
+- **Eclipse / Sybil-at-the-tracker (W8 part 2)** — `P2 · eclipse landed; Sybil-of-control owed.`
+  `docs/w8-eclipse-sybil-design.md`. A newcomer used to bootstrap from a single tracker, which a
+  malicious/partitioned seed could eclipse by withholding honest peers. Now it unions the
+  self-certifying directory across **multiple seeds** (`tracker.seeds`; `fetch_directory_multi`),
+  so one honest+reachable seed restores any omission; verified tombstones suppress within-TTL
+  replay; `seed_quorum` (M-of-N, opt-in) filters single-seed Sybil injection;
+  `examples/validate_eclipse.py`. **Owed / NOT closed:** the design review found "control is
+  reputation-gated" is *false* — a fresh identity starts above `min_owner_reputation` and the
+  worker-side `derive_epoch` isn't reputation-filtered (and the worker holds no reputation object
+  to filter with), so **fresh Sybils can become owners** and a Sybil-bloated directory skews HRW.
+  Closing it needs non-free identities (**stake**), which is the incentives problem — enrollment
+  breaks open volunteering, PoW is a poor fit for a compute network. Also owed: pinned-seed
+  *transport* auth (the tracker reply envelope isn't signed, so pubkey pins aren't TCP-verifiable),
+  scheduler-side multi-seed (`watch_tracker` is single-seed), and per-source admission limiting
+  (needs source-IP plumbing through the reactor; weak vs a multi-IP adversary). **Still open in
+  W8:** incentives (which also subsumes Sybil-of-control), research-shaped.
 - **Auth-key rotation / per-worker identity** — `P2 · done (rotation + per-worker); secret
   store still out of scope.` A server now takes `accept_keys=` (alongside `auth_key=`) — a
   list of secrets it will accept — so **key rotation** (list old+new during the migration

@@ -139,10 +139,15 @@ The original plan (per-source registration rate-limit + a divergence flag) was
   len(seeds)` at load (a quorum above the seed count drops *everything*).
 - (Rate-limit + divergence dropped — see Defense 3.)
 
-### Slice c — validation arm + docs
-- Harness: a malicious seed can't isolate a newcomer given ≥1 honest pinned seed;
-  show the union recovers omitted owners and a debited owner is excluded. Roadmap
-  + `remaining-gaps.md` updates (incl. the fresh-Sybil-owner gap → part 3).
+### Slice c — validation arm + docs — **landed**
+- `examples/validate_eclipse.py`: two honest seeds + one malicious seed (omits the
+  honest owners, injects Sybils); shows end-to-end that (1) a single-seed bootstrap
+  off the malicious seed is eclipsed, (2) the multi-seed union recovers the honest
+  owners, (3) `seed_quorum=2` filters the 1-seed Sybil injection. Carries the
+  honest caveats (≥1 honest seed; fresh-Sybil-as-owner is part 3). (The
+  debited-owner-excluded claim was dropped — Defense 2's worker-side rep filter is
+  deferred, since the worker has no reputation object.)
+- Roadmap + `remaining-gaps.md` updated (incl. the fresh-Sybil-owner → part 3).
 
 ## Honest limitations (state them)
 - **Fresh-Sybil-as-owner is NOT closed** — identities are free; the only effective
