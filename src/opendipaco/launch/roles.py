@@ -89,9 +89,46 @@ def _server_kw(cfg: LaunchConfig, extra_admitted=None) -> dict:
     return kw
 
 
-def _scheduler_robustness_kw(cfg: LaunchConfig) -> dict:
+def _build_probe(cfg: LaunchConfig, model):
+    """The W8 trusted probe: the first ``robustness.probe_docs`` documents streamed
+    from the public source, packed to the model's seq_len. A clean **in-distribution
+    slice** of the public corpus (not a separate held-out set -- a poisoned update
+    still raises loss on it; held-out curation is an operator refinement). Streamed
+    (bounded), deterministic. Returns a ``[N, seq_len]`` long tensor (or None when
+    the screen is off).
+
+    A configured screen that can't get its probe **fails loud** rather than running
+    silently unprotected: a source read error or an empty/too-short result raises,
+    so a scheduler with the screen enabled never comes up without it. (An operator
+    who can't tolerate that fragility leaves ``probe_docs`` unset.)
+    """
+    if not cfg.robustness.probe_docs:
+        return None
+    from ..data.sharding import pack_sequences
+    from ..data.spec import iter_spec_documents
+    source = _spec_source(cfg)
+    docs = []
+    try:
+        for doc in iter_spec_documents({"source": source}):
+            docs.append(doc)
+            if len(docs) >= cfg.robustness.probe_docs:
+                break
+    except Exception as e:
+        raise RuntimeError(
+            f"could not read the public source to build the data-poisoning probe ({e}); "
+            "fix the source or unset robustness.probe_docs -- a configured screen won't "
+            "run silently unprotected") from e
+    probe = pack_sequences(docs, model.sequence_length)
+    if probe.numel() == 0:
+        raise ValueError(
+            f"robustness.probe_docs={cfg.robustness.probe_docs} yielded an empty probe "
+            "(the source returned too few/too-short documents); the screen would be inert")
+    return probe
+
+
+def _scheduler_robustness_kw(cfg: LaunchConfig, model=None) -> dict:
     """Phase 3 knobs the scheduler owns: reputation, rate limiting, redundant
-    execution, and the private-module policy."""
+    execution, the private-module policy, and (W8) the trusted-probe screen."""
     r = cfg.robustness
     return dict(
         reputation=Reputation(floor=r.reputation_floor, credit=r.reputation_credit,
@@ -100,7 +137,10 @@ def _scheduler_robustness_kw(cfg: LaunchConfig) -> dict:
                                  refill_per_sec=r.rate_refill_per_sec),
         min_owner_reputation=r.min_owner_reputation,
         redundancy=r.redundancy, redundancy_rate=r.redundancy_rate,
-        audit_timeout=r.audit_timeout, private_policy=r.private_policy)
+        audit_timeout=r.audit_timeout, private_policy=r.private_policy,
+        probe=_build_probe(cfg, model) if model is not None else None,
+        probe_quorum=r.probe_quorum, probe_abs_margin=r.probe_abs_margin,
+        probe_rel_margin=r.probe_rel_margin, probe_debit=r.probe_debit)
 
 
 def _ps_robustness_kw(cfg: LaunchConfig) -> dict:
@@ -456,7 +496,7 @@ def run_scheduler(cfg: LaunchConfig, *, ps_addrs=None, on_start=None, identity=N
         up_density=cfg.transport.up_density, idle_backoff=cfg.transport.idle_backoff,
         task_seconds=cfg.run.task_seconds, park_factor=cfg.run.park_factor,
         min_task_rate=cfg.run.min_task_rate, tailor_bandwidth=cfg.transport.tailor_bandwidth,
-        **_scheduler_robustness_kw(cfg), **_server_kw(cfg, extra_admitted))
+        **_scheduler_robustness_kw(cfg, model), **_server_kw(cfg, extra_admitted))
     scheduler.start()
     _publish_manifest(scheduler, cfg, ident)  # W6: flags-only `join`
     lp = _serve_libp2p(scheduler, cfg, ident) if _libp2p_routes(cfg) else None

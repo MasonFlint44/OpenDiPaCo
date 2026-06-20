@@ -126,16 +126,19 @@ def _audit_primary(sched, peer, digest, base=None):
     return (tuple(task["path"]), task["gen_id"])
 
 
-def _check(sched, key, peer, digest):
+def _check(sched, key, peer, digest, probe=None):
     """Reserve a checker slot (as _next_task's oversupply branch does), then
     commit its result echoing the issued lease -- only an assigned checker's
-    vote counts."""
+    vote counts. ``probe`` is an optional ``(before, after)`` clean-probe loss
+    pair the checker reports for the W8 data-poisoning screen."""
     path, gen = key
     with sched._lock:
         _, _, _, lease, *_ = sched._reserve_check_locked(key, peer)
-    sched._commit_check({"check_only": True, "path": list(path), "gen_id": gen,
-                         "digest": digest, "lease": lease, "worker_id": peer},
-                        peer_id=peer)
+    msg = {"check_only": True, "path": list(path), "gen_id": gen,
+           "digest": digest, "lease": lease, "worker_id": peer}
+    if probe is not None:
+        msg["probe_before"], msg["probe_after"] = probe
+    sched._commit_check(msg, peer_id=peer)
 
 
 def test_unassigned_check_commit_is_ignored():
@@ -201,6 +204,204 @@ def test_audit_debits_the_odd_one_out():
         _check(sched, key, "LIAR", "Y")
         assert sched.reputation.get("LIAR") < 0.5
         assert sched.reputation.get("P") > 0.5 and sched.reputation.get("HONEST") > 0.5
+    finally:
+        sched.shutdown()
+
+
+# -- W8 trusted-probe data-poisoning screen ------------------------------------
+
+
+def test_probe_measurement_runs_end_to_end():
+    """The measurement->Contribution link the injected-scalar tests stub out:
+    _train_path with a probe returns finite before/after losses that training
+    actually moved, and no probe -> no measurement. (That a *poisoned* shard raises
+    the loss is the heavier demonstration in examples/validate_poisoning.py; here we
+    just guard the wiring cheaply so a regression that stops measuring fails CI.)"""
+    import math
+
+    from opendipaco.data.sharding import pack_sequences
+    from opendipaco.schedule.probe import TrustedProbe
+    cfg, dl = _cfg(), DiLoCoConfig(inner_steps=3, inner_lr=1e-2)
+    path = cfg.build_topology().path_from_index(0)
+    shard = _corpus(cfg).shard(0)
+    g = torch.Generator().manual_seed(1)
+    probe = TrustedProbe(pack_sequences(
+        [torch.randint(0, 48, (48,), generator=g) for _ in range(4)], cfg.sequence_length))
+    eng = _build_worker_engine(cfg, dl, "cpu", 0)
+    w = AsyncScheduler(eng, num_workers=1)
+    w.seed = 0
+
+    c = w._train_path(path, shard, BATCH, 0, probe=probe)
+    assert c.probe_before is not None and c.probe_after is not None
+    assert math.isfinite(c.probe_before) and math.isfinite(c.probe_after)
+    assert c.probe_before != c.probe_after                    # training moved the model
+    # No probe -> the measurement is a no-op (off path stays None).
+    c2 = w._train_path(path, shard, BATCH, 0)
+    assert c2.probe_before is None and c2.probe_after is None
+
+
+def test_probe_screen_flags_poisoned_contribution():
+    """The checkers agree on the digest (they reproduce the same poisoned data),
+    but a quorum reports the update RAISED clean-probe loss -> the audit flags it
+    and (opt-in) debits the primary."""
+    sched = _serving(redundancy=3, redundancy_rate=1.0, probe_quorum=2,
+                     probe=torch.randint(0, 48, (4, 16)), probe_debit=True)
+    try:
+        key = _audit_primary(sched, "P", "X")
+        _check(sched, key, "C1", "X", probe=(1.0, 2.0))   # +1.0 loss -> harmful
+        _check(sched, key, "C2", "X", probe=(1.0, 2.0))   # quorum of 2 harmful
+        assert sched.metrics.poison_flagged == 1
+        assert sched.reputation.get("P") < 0.5            # debited (probe_debit on)
+    finally:
+        sched.shutdown()
+
+
+def test_probe_screen_passes_honest_contribution():
+    """An update that doesn't raise clean-probe loss is not flagged, even though
+    the digests agree -- the screen is orthogonal to the digest tally."""
+    sched = _serving(redundancy=3, redundancy_rate=1.0, probe_quorum=2,
+                     probe=torch.randint(0, 48, (4, 16)), probe_debit=True)
+    try:
+        key = _audit_primary(sched, "P", "X")
+        _check(sched, key, "C1", "X", probe=(1.0, 1.0))   # unchanged
+        _check(sched, key, "C2", "X", probe=(1.0, 0.9))   # improved
+        assert sched.metrics.poison_flagged == 0
+        assert sched.reputation.get("P") > 0.5            # not blamed
+    finally:
+        sched.shutdown()
+
+
+def test_probe_screen_needs_a_quorum():
+    """One harmful report (below quorum) doesn't flag -- a single lying/faulty
+    checker can't manufacture a poisoning verdict."""
+    sched = _serving(redundancy=3, redundancy_rate=1.0, probe_quorum=2,
+                     probe=torch.randint(0, 48, (4, 16)), probe_debit=True)
+    try:
+        key = _audit_primary(sched, "P", "X")
+        _check(sched, key, "C1", "X", probe=(1.0, 9.0))   # one harmful
+        _check(sched, key, "C2", "X", probe=(1.0, 1.0))   # one clean -> 1 < quorum 2
+        assert sched.metrics.poison_flagged == 0
+        assert sched.reputation.get("P") > 0.5
+    finally:
+        sched.shutdown()
+
+
+def test_probe_screen_off_by_default_is_inert():
+    """probe_quorum 0 (default) -> the screen never fires, even on harmful reports
+    (byte-identical to the pre-W8 audit)."""
+    sched = _serving(redundancy=3, redundancy_rate=1.0)   # no probe, quorum 0
+    try:
+        key = _audit_primary(sched, "P", "X")
+        _check(sched, key, "C1", "X", probe=(1.0, 5.0))
+        _check(sched, key, "C2", "X", probe=(1.0, 5.0))
+        assert sched.metrics.poison_flagged == 0
+        assert sched.reputation.get("P") > 0.5            # only the digest tally ran
+    finally:
+        sched.shutdown()
+
+
+def test_probe_config_is_validated():
+    """probe_quorum can't exceed the available checkers (else the screen silently
+    never fires), and debiting needs a >=2 corroboration floor (else one Byzantine
+    checker punishes an honest primary)."""
+    import pytest
+    cfg = _cfg()
+    common = dict(batch_size=BATCH, host="127.0.0.1", port=0, redundancy_rate=1.0,
+                  probe=torch.randint(0, 48, (2, 16)))
+    with pytest.raises(ValueError, match="exceeds the available checkers"):
+        Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1)], DiLoCoConfig(inner_steps=4),
+                  redundancy=3, probe_quorum=3, **common)        # only 2 checkers
+    with pytest.raises(ValueError, match="probe_debit requires probe_quorum >= 2"):
+        Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1)], DiLoCoConfig(inner_steps=4),
+                  redundancy=2, probe_quorum=1, probe_debit=True, **common)
+    # probe_quorum set but no probe -> silently inert; reject.
+    with pytest.raises(ValueError, match="no .*probe"):
+        Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1)], DiLoCoConfig(inner_steps=4),
+                  batch_size=BATCH, host="127.0.0.1", port=0, redundancy_rate=1.0,
+                  redundancy=3, probe_quorum=2)               # probe= omitted
+
+
+def test_probe_screen_ignores_malformed_reports():
+    """A Byzantine checker sending a non-numeric probe is dropped at ingestion, not
+    crashed on during resolution -- the valid checkers' quorum still decides."""
+    sched = _serving(redundancy=4, redundancy_rate=1.0, probe_quorum=2,
+                     probe=torch.randint(0, 48, (4, 16)), probe_debit=True)
+    try:
+        key = _audit_primary(sched, "P", "X")
+        _check(sched, key, "BAD", "X", probe=("nan", "boom"))   # non-numeric -> dropped
+        _check(sched, key, "C1", "X", probe=(1.0, 2.0))         # harmful
+        _check(sched, key, "C2", "X", probe=(1.0, 2.0))         # harmful -> quorum 2
+        assert sched.metrics.poison_flagged == 1                # survived + valid quorum decided
+        assert sched.reputation.get("P") < 0.5
+    finally:
+        sched.shutdown()
+
+
+def test_probe_config_rejects_no_checkers():
+    """redundancy=1 means no audits/checkers ever, so a positive probe_quorum could
+    never be reached -- reject it instead of silently disabling the screen."""
+    import pytest
+    cfg = _cfg()
+    common = dict(batch_size=BATCH, host="127.0.0.1", port=0,
+                  probe=torch.randint(0, 48, (2, 16)))
+    # redundancy=1: no checkers (rate>0 so the rate guard passes first).
+    with pytest.raises(ValueError, match="exceeds the available checkers"):
+        Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1)], DiLoCoConfig(inner_steps=4),
+                  redundancy=1, redundancy_rate=1.0, probe_quorum=1, **common)
+    # redundancy_rate=0: no audits ever -> screen inert (must match the config-level
+    # guard so a direct Scheduler caller can't silently get an inert screen).
+    with pytest.raises(ValueError, match="needs redundancy_rate > 0"):
+        Scheduler(cfg, _corpus(cfg), [("127.0.0.1", 1)], DiLoCoConfig(inner_steps=4),
+                  redundancy=3, redundancy_rate=0.0, probe_quorum=2, **common)
+
+
+def test_probe_screen_skips_uncommitted_primary():
+    """A contribution the primary never committed (audit timed out before its
+    commit) is neither flagged nor debited, even with harmful checker probes --
+    the update never landed."""
+    sched = _serving(redundancy=3, redundancy_rate=1.0, probe_quorum=2,
+                     probe=torch.randint(0, 48, (4, 16)), probe_debit=True)
+    try:
+        key = (list(sched.paths)[0], 0)
+        with sched._lock:
+            sched._audits[key] = {"target": 2, "base": {"L0E0": [0, 1]},
+                                  "primary_digest": None, "primary_peer": None,
+                                  "checks": [], "members": {"P"}, "checked": set(),
+                                  "check_leases": {},
+                                  "probes": [("C1", 1.0, 9.0), ("C2", 1.0, 9.0)],
+                                  "deadline": 0.0}
+            sched._resolve_audit_locked(key)
+        assert sched.metrics.poison_flagged == 0
+    finally:
+        sched.shutdown()
+
+
+def test_check_task_carries_the_probe():
+    """When a probe is configured, the check task ships it so the checker can
+    screen (only checks carry it -- the primary's own probe would be untrusted)."""
+    probe = torch.randint(0, 48, (4, 16))
+    sched = _serving(redundancy=3, redundancy_rate=0.0, probe=probe)
+    try:
+        paths = list(sched.paths)
+        for i, _ in enumerate(paths):                     # exhaust primary work
+            sched._next_task({"worker_id": f"w{i}"}, peer_id=f"w{i}")
+        import time as _t
+        key = (paths[0], 0)
+        with sched._lock:
+            sched._audits[key] = {"target": 2, "base": {"L0E0": [0, 1]},
+                                  "primary_digest": "X", "primary_peer": "P",
+                                  "checks": [], "members": {"P"}, "probes": [],
+                                  "deadline": _t.monotonic() + 100}
+        chk = sched._next_task({"worker_id": "C1"}, peer_id="C1")
+        assert chk.get("check_only")
+        assert "probe" in chk and torch.equal(chk["probe"], probe) and chk["probe_batch"] == 8
+        # A normal (non-check) task never carries the probe.
+        sched2 = _serving(redundancy=3, redundancy_rate=0.0, probe=probe)
+        try:
+            t = sched2._next_task({"worker_id": "w"}, peer_id="w")
+            assert not t.get("check_only") and "probe" not in t
+        finally:
+            sched2.shutdown()
     finally:
         sched.shutdown()
 

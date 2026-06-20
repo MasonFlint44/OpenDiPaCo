@@ -54,6 +54,7 @@ from ..train.loop import (
     _state_to_cpu,
     run_inner_steps,
 )
+from .probe import safe_probe_loss
 
 
 class TransientFault(Exception):
@@ -75,6 +76,12 @@ class Contribution:
     private_state: dict[str, dict]               # private key -> trained state_dict (CPU)
     opt_state: dict                              # inner-optimizer state (CPU) to persist
     empty: bool = False                          # empty shard -> no-op contribution
+    # W8 trusted-probe screen (data-poisoning): the path's clean-probe loss before
+    # and after the inner steps, measured only when an audit checker is handed a
+    # probe. None = not measured (no probe / not a check). The owner screens the
+    # (before, after) delta -- a poisoned update raises clean-probe loss.
+    probe_before: float | None = None
+    probe_after: float | None = None
 
 
 @dataclass
@@ -261,7 +268,7 @@ class AsyncScheduler:
 
     # -- map: train one path on a worker ------------------------------------
     def _train_path(self, path: Path, shard: torch.Tensor, batch_size: int, generation: int,
-                    inner_steps: int | None = None):
+                    inner_steps: int | None = None, probe=None):
         """Train ``path`` on ``shard`` and return its :class:`Contribution`.
 
         Takes the shard tensor directly (rather than a corpus) so the same
@@ -269,6 +276,11 @@ class AsyncScheduler:
         received its shard over the wire. Reads the starting weights from
         ``engine.bank`` -- which the remote worker has loaded with the
         coordinator's shipped authoritative weights for this path.
+
+        ``probe`` (a ``TrustedProbe``, W8): when given, the path's clean-probe loss
+        is measured on the freshly-composed model **before** the inner steps (the
+        base) and on the trained model **after**, and stashed on the Contribution
+        for the owner to screen. Used only by audit checkers; ``None`` is a no-op.
         """
         e = self.engine
         path_idx = e.topology.path_index(path)
@@ -299,11 +311,17 @@ class AsyncScheduler:
         # LR-schedule position still tracks generations via base_step below.
         inner_steps = inner_steps or e.diloco.inner_steps
         total_steps = e.total_rounds * inner_steps if e.total_rounds else None
+        # W8: pm currently holds the base (a fresh copy of the bank) -- measure the
+        # trusted-probe loss now, before the inner steps mutate it. safe_probe_loss
+        # degrades a bad probe to None instead of crashing the checker.
+        screening = probe is not None and not probe.empty
+        probe_before = safe_probe_loss(probe, pm) if screening else None
         loss = run_inner_steps(
             pm, opt, shard, batch_size, gen,
             inner_steps=inner_steps, total_steps=total_steps,
             base_step=generation * inner_steps, diloco=e.diloco, device=e.device,
         )
+        probe_after = safe_probe_loss(probe, pm) if screening else None
 
         shared_delta: dict[str, list[torch.Tensor]] = {}
         private_state: dict[str, dict] = {}
@@ -315,6 +333,7 @@ class AsyncScheduler:
         return Contribution(
             path, path_idx, loss, shared_delta, private_state,
             _optimizer_state_to_cpu(opt.state_dict()),
+            probe_before=probe_before, probe_after=probe_after,
         )
 
     def _worker(self, gen: _Generation, corpus, batch_size, generation, fault_hook):

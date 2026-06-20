@@ -65,6 +65,7 @@ from .distributed import (
 )
 from .aggregate import check_aggregate, robust_delta
 from .guard import all_finite, clip_norm_, loss_ok
+from .probe import TrustedProbe, as_finite_float, is_harmful
 from .ratelimit import RateLimiter
 from .reputation import Reputation
 from .assignment import coordinator_key, is_assignee, path_primary, version_lag
@@ -1727,7 +1728,9 @@ class Scheduler(_ReactorServer):
                  redundancy=3, redundancy_rate=0.0, audit_timeout=60.0,
                  private_policy="overwrite", down="full", up_density=1.0,
                  task_seconds=None, park_factor=3.0, min_task_rate=None,
-                 tailor_bandwidth=False, **reactor_kw):
+                 tailor_bandwidth=False, probe=None, probe_quorum=0,
+                 probe_abs_margin=0.05, probe_rel_margin=0.02, probe_debit=False,
+                 **reactor_kw):
         super().__init__(host=host, port=port, auth_key=auth_key, **reactor_kw)
         # W5b: target wall-time per task. None (default) -> no sizing, every task
         # is the configured (batch_size, inner_steps) -> byte-identical anchor.
@@ -1761,6 +1764,48 @@ class Scheduler(_ReactorServer):
         self.redundancy_rate = float(redundancy_rate)
         self.audit_timeout = float(audit_timeout)
         self._audits: dict = {}  # (path, gen) -> audit record
+        # W8 data-poisoning screen: when a probe is configured, audit checkers
+        # measure the reproduced update's clean-probe loss and the audit flags a
+        # contribution that a quorum (>= probe_quorum, 0 = off) reports as harmful.
+        # Wrap a bare token tensor in a TrustedProbe. probe_debit (off) also debits
+        # the primary -- only correct when the worker chose its data (decentralized);
+        # in the sharded path the data is server-supplied, so the default is to
+        # surface the metric, not blame the worker.
+        self._probe = (probe if isinstance(probe, TrustedProbe) or probe is None
+                       else TrustedProbe(probe))
+        self.probe_quorum = int(probe_quorum)
+        self.probe_margin = {"abs_margin": float(probe_abs_margin),
+                             "rel_margin": float(probe_rel_margin)}
+        self.probe_debit = bool(probe_debit)
+        if self.probe_quorum:
+            # These re-check the invariants RobustnessCfg.__post_init__
+            # (launch/config.py) enforces, so a direct Scheduler caller gets the
+            # same guards as a config-driven run; keep the two in sync (config also
+            # validates probe_docs, which the Scheduler doesn't have).
+            # A positive quorum with no probe to ship is a silently-inert screen.
+            if self._probe is None or self._probe.empty:
+                raise ValueError("probe_quorum is set but no (non-empty) probe was "
+                                 "provided; pass probe= or set probe_quorum=0")
+            # No audits -> no checkers -> no probe reports ever: the screen would be
+            # silently inert (the Phase 3 private_quorum footgun).
+            if self.redundancy_rate <= 0:
+                raise ValueError("the probe screen needs redundancy_rate > 0 "
+                                 "(it rides audited tasks; with no audits it never runs)")
+            # Probes come only from checkers (redundancy-1 of them; redundancy=1
+            # means no checkers at all), so a quorum above that can never be reached.
+            max_checkers = self.redundancy - 1
+            if self.probe_quorum > max_checkers:
+                raise ValueError(
+                    f"probe_quorum {self.probe_quorum} exceeds the available checkers "
+                    f"(redundancy-1 = {max_checkers}); raise redundancy (>= 2) or the "
+                    "screen could never reach quorum")
+            # Debiting a peer is the digest tally's job, and it demands a >=2 agreeing
+            # majority. The screen must corroborate the same way before it debits, or
+            # one Byzantine checker can punish an honest primary.
+            if self.probe_debit and self.probe_quorum < 2:
+                raise ValueError(
+                    "probe_debit requires probe_quorum >= 2 (a lone checker can't "
+                    "corroborate a poisoning verdict); raise redundancy to >= 3")
         # Under the private proposal policy (D5/3a), private-bearing tasks are
         # *always* audited so checkers corroborate the private state before the
         # owner applies it (without an audit a proposal never reaches quorum).
@@ -2087,7 +2132,8 @@ class Scheduler(_ReactorServer):
                         # commits (worker died) still expires and is reaped --
                         # the primary's commit extends it for the checkers.
                         "deadline": time.monotonic() + self.audit_timeout,
-                        "private": has_private and self.private_policy == "proposal"}
+                        "private": has_private and self.private_policy == "proposal",
+                        "probes": []}  # W8: (peer, before, after) from each checker
             keys = self.topology.path_module_keys(path)
             routing = self._routing_locked(keys)
         # Data plane: shard bytes, or just the recipe for a spec corpus. A check
@@ -2139,6 +2185,15 @@ class Scheduler(_ReactorServer):
             if check_private:  # also submit private proposals to the owners
                 task["private_proposal"] = True
                 task["grant"] = check_grant  # authorizes the proposal at the owner
+            # W8: hand the checker the trusted probe so it screens the reproduced
+            # update for data poisoning (only checks carry it -- the primary's own
+            # probe would be self-reported and untrusted).
+            # TODO(W8): the probe is session-constant; re-shipping it on every check
+            # is redundant bandwidth -- advertise + cache it per checker (cf. W7a
+            # cached_shards) instead. Tracked in docs/remaining-gaps.md.
+            if self._probe is not None and not self._probe.empty:
+                task["probe"] = self._probe.sequences
+                task["probe_batch"] = self._probe.batch_size
         elif audit:
             task["audit"] = True
         return task
@@ -2190,6 +2245,12 @@ class Scheduler(_ReactorServer):
                     and member not in a.setdefault("checked", set())):
                 a["checked"].add(member)  # one vote per assigned checker
                 a["checks"].append((peer_id, msg.get("digest")))
+                # Validate the wire-supplied probe losses: a Byzantine checker
+                # mustn't be able to inject a non-numeric value that crashes audit
+                # resolution. Only finite numbers count as a probe report.
+                pb, pa = as_finite_float(msg.get("probe_before")), as_finite_float(msg.get("probe_after"))
+                if pb is not None and pa is not None:
+                    a["probes"].append((peer_id, pb, pa))
                 self._maybe_resolve_audit_locked(key, time.monotonic())
         return {"type": "commit_ack", "check": True}
 
@@ -2225,6 +2286,23 @@ class Scheduler(_ReactorServer):
                     else:
                         self.reputation.debit(peer)
                         self.metrics.record_invalid_reject()
+        # W8 data-poisoning screen: independent of the digest tally. The checkers
+        # all reproduce the *same* (poisoned) data, so their digests agree -- but a
+        # poisoned update still raises clean-probe loss, which the digest can't see.
+        # A quorum of checkers reporting harm flags the contribution. In the sharded
+        # path the data is server-supplied, so this is a corpus-poisoning ALARM
+        # (a faithful worker isn't to blame) -- debit only when opted in (the
+        # worker-chose-data model); otherwise surface the metric.
+        # Only screen a contribution the primary actually committed -- on a
+        # timed-out audit whose primary died before committing, the update never
+        # landed, so neither flag nor debit it.
+        if self.probe_quorum and a.get("primary_digest") is not None:
+            harmful = sum(1 for _, b, af in a.get("probes", [])
+                          if is_harmful(b, af, **self.probe_margin))
+            if harmful >= self.probe_quorum:
+                self.metrics.record_poison_flag()
+                if self.probe_debit and a.get("primary_peer") is not None:
+                    self.reputation.debit(a["primary_peer"])
 
     def _resolve_audits_locked(self, now) -> None:
         for key in list(self._audits):
@@ -2805,12 +2883,20 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions, keyfr
             # A pure verification replica: reproduce the primary's update from its
             # pinned base and report only a digest -- never push, never warm.
             digest, contrib = None, None
+            # W8: a check task may carry a trusted probe; the checker measures the
+            # reproduced update's clean-probe loss (before/after the inner steps)
+            # and reports it so the owner can screen for data poisoning. Cast to
+            # long -- the embedding lookup needs it after the wire round-trip.
+            probe = None
+            ptoks = task.get("probe")
+            if ptoks is not None:
+                probe = TrustedProbe(ptoks.long(), batch_size=task.get("probe_batch", 8))
             try:
                 fetch_keys(pin)
                 engine._opt_state.pop(path, None)  # cold
                 contrib = worker._train_path(path, load_shard_locked(),
                                              task["batch_size"], task["gen_id"],
-                                             task.get("inner_steps"))
+                                             task.get("inner_steps"), probe=probe)
                 if not contrib.empty:
                     digest = pseudograd_digest(contrib.shared_delta)
             except _CheckAborted:
@@ -2836,7 +2922,9 @@ def _serve_sharded(link, engine, worker, wid, warm, shard_cache, versions, keyfr
             engine._opt_state.pop(path, None)  # leave no warm trace of the check
             ack = link.sch_rpc({"type": "commit", "check_only": True, "path": path,
                                 "worker_id": wid, "lease": lease, "digest": digest,
-                                "gen_id": task["gen_id"]})
+                                "gen_id": task["gen_id"],
+                                "probe_before": contrib.probe_before if contrib else None,
+                                "probe_after": contrib.probe_after if contrib else None})
             if ack is None:
                 raise OSError("scheduler disconnected during check commit")
             continue

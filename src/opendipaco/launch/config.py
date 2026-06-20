@@ -274,6 +274,15 @@ class RobustnessCfg:
     # Private modules.
     private_policy: str = "overwrite"   # "overwrite" | "proposal"
     private_quorum: int = 2             # agreeing peers needed to apply a private proposal
+    # W8 trusted-probe data-poisoning screen (docs/w8-data-poisoning-design.md).
+    # probe_docs > 0 draws that many clean documents from the public source as the
+    # probe; audit checkers measure the reproduced update's loss on it and a quorum
+    # reporting harm flags the contribution. Off (0) by default.
+    probe_docs: int = 0
+    probe_quorum: int = 0               # harmful checkers needed to flag (0 = screen off)
+    probe_abs_margin: float = 0.05      # probe-loss rise treated as harmful (absolute floor)
+    probe_rel_margin: float = 0.02      # ...plus this fraction of the base loss
+    probe_debit: bool = False           # also debit the primary (only sound when it chose its data)
 
     def __post_init__(self):
         # Catch the *guaranteed*-stall private-policy misconfigurations at load
@@ -289,6 +298,24 @@ class RobustnessCfg:
                 raise ValueError(
                     f"private_quorum ({self.private_quorum}) > redundancy "
                     f"({self.redundancy}): a private proposal could never reach quorum")
+        # W8 probe screen: catch the disabled-by-misconfig and lone-checker-debit
+        # cases at load (the Scheduler re-checks the same invariants in its __init__
+        # for direct callers -- keep the two in sync; a clear error here is kinder).
+        if self.probe_docs or self.probe_quorum:
+            if self.probe_docs < 1 or self.probe_quorum < 1:
+                raise ValueError("the probe screen needs both probe_docs >= 1 and "
+                                 "probe_quorum >= 1 (set neither to leave it off)")
+            if self.redundancy_rate <= 0:
+                raise ValueError("the probe screen needs redundancy_rate > 0 "
+                                 "(it rides audited tasks; with no audits it never runs)")
+            if self.probe_quorum > self.redundancy - 1:
+                raise ValueError(
+                    f"probe_quorum ({self.probe_quorum}) > redundancy-1 "
+                    f"({self.redundancy - 1}): only checkers report probes, so it could "
+                    "never reach quorum")
+            if self.probe_debit and self.probe_quorum < 2:
+                raise ValueError("probe_debit requires probe_quorum >= 2 (a lone checker "
+                                 "must not be able to debit an honest primary)")
 
 
 @dataclass
