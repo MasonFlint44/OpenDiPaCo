@@ -50,11 +50,17 @@ def _tracker():
 
 
 def main() -> None:
+    if N_HONEST < 1 or N_SYBIL < 1:
+        # Without honest owners to hide AND Sybils to inject, the checks below are
+        # vacuously true -- refuse to print a meaningless PASS.
+        print("need N_HONEST >= 1 and N_SYBIL >= 1 to demonstrate anything")
+        return
     # Two honest seeds know the honest owners; one malicious seed omits them and
     # serves only its Sybils. (Honest owners on BOTH honest seeds so seed_quorum=2
     # keeps them while dropping the 1-seed Sybils.)
-    h1, h2, evil = _tracker(), _tracker(), _tracker()
+    h1 = h2 = evil = None
     try:
+        h1, h2, evil = _tracker(), _tracker(), _tracker()
         h1a, h2a, ea = [("127.0.0.1", t.port) for t in (h1, h2, evil)]
         honest = [PeerIdentity.generate() for _ in range(N_HONEST)]
         sybils = [PeerIdentity.generate() for _ in range(N_SYBIL)]
@@ -75,23 +81,27 @@ def main() -> None:
         # 3. seed_quorum=2: the 1-seed Sybils are filtered, honest (2 seeds) kept.
         quorum = {r["peer_id"] for r in fetch_directory_multi([ea, h1a, h2a], seed_quorum=2)[0]}
 
+        # Eclipse = the malicious seed shows EXACTLY its Sybils (substitution), not
+        # merely "no honest" -- an empty directory would trivially lack honest peers.
+        eclipsed_ok = eclipsed == sybil_ids
         print(f"honest_owners={N_HONEST} sybils={N_SYBIL}")
-        print(f"  1. single malicious seed: sees {len(eclipsed)} peers, "
-              f"{len(eclipsed & honest_ids)}/{N_HONEST} honest  -> "
-              f"{'ECLIPSED' if not (eclipsed & honest_ids) else 'ok'}")
+        print(f"  1. single malicious seed: sees {len(eclipsed)} peers "
+              f"({len(eclipsed & honest_ids)}/{N_HONEST} honest, {len(eclipsed & sybil_ids)} sybils)"
+              f"  -> {'ECLIPSED (attacker-only view)' if eclipsed_ok else 'ok'}")
         print(f"  2. multi-seed union:      {len(union & honest_ids)}/{N_HONEST} honest "
               f"recovered, {len(union & sybil_ids)} sybils also present (injection tradeoff)")
         print(f"  3. seed_quorum=2:         {len(quorum & honest_ids)}/{N_HONEST} honest kept, "
               f"{len(quorum & sybil_ids)} sybils (1-seed injection filtered)")
 
-        ok = (not (eclipsed & honest_ids)                       # single seed eclipses
+        ok = (eclipsed_ok                                       # single seed -> attacker-only view
               and honest_ids <= union                           # union recovers all honest
               and honest_ids <= quorum and not (quorum & sybil_ids))   # quorum filters sybils
         print(f"  verdict: {'PASS' if ok else 'INCONCLUSIVE'} "
               "(single-seed eclipses; union recovers; quorum filters injection)")
     finally:
         for t in (h1, h2, evil):
-            t.shutdown()
+            if t is not None:
+                t.shutdown()
 
 
 if __name__ == "__main__":
