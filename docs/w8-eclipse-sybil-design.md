@@ -92,17 +92,21 @@ by quorum (which do have reputation). So a worker routing to a debited owner is
 caught at the owner/quorum, not silently accepted. **Deferred** (needs a worker
 reputation view; ties to the part-3 Sybil work). Not in slice a.
 
-### Defense 3 — admission dampening + observability (honestly bounded)
-- Per-source registration rate-limit on the open tracker (reuse the Phase-3
-  `RateLimiter`): bounds bloat *rate* from one source. **Honest limit:** "source"
-  is per-connection/IP, so a multi-IP adversary bypasses it, and `max_peers` then
-  becomes an honest-peer-**exclusion DoS** lever (a flood fills it, refusing
-  honest newcomers). It bounds rate, not count; real resistance is part 3.
-- A seed serving a view that is a subset of the union beyond a margin is
-  **surfaced as a metric/log** (an eclipsing/partitioned seed is observable). This
-  is **observability, not a relied-on defense** — it's blind to a *targeted*
-  one-peer omission (below any margin), and the actual protection is the union +
-  ≥1 honest seed.
+### Defense 3 — admission dampening + observability — **not built (see below)**
+The original plan (per-source registration rate-limit + a divergence flag) was
+**dropped after the design review and a build-time check**:
+- *Per-source rate-limit:* the tracker handler (`_handle(msg, nbytes, peer_id)`)
+  receives only the authenticated `peer_id` (free to generate on an open tracker
+  → a useless rate-limit key), **not** the source IP. Per-IP limiting would need a
+  cross-cutting reactor change (plumb the remote addr through every `_handle`
+  subclass), and the review showed it's weak anyway (multi-IP-bypassable, bounds
+  rate not count, and `max_peers` then becomes an honest-peer-exclusion DoS).
+  Real Sybil resistance is the stake/incentives layer (part 3); a half-measure
+  here isn't worth the reactor churn.
+- *Divergence flag:* it is observability, not a defense (blind to a targeted
+  one-peer omission), and its only consumer would be the worker's hot poll loop
+  (no operator-facing one-shot bootstrap log to surface it cleanly). Deferred
+  until there's a consumer and the targeted-omission limit is acceptable.
 
 ## Slices
 
@@ -123,10 +127,17 @@ reputation view; ties to the part-3 Sybil work). Not in slice a.
   suppresses a replayed within-TTL record; all-seeds-down → empty, no crash;
   single-seed unchanged.
 
-### Slice b — `seed_quorum` (M-of-N) + admission rate-limit + divergence metric
-- Optional `seed_quorum` injection-resistance knob (M=1 default = union).
-- Per-source registration rate-limit on the open tracker; refuse beyond it.
-- Divergence metric/log for a withholding seed (observability).
+### Slice b — `seed_quorum` (M-of-N injection-resistance)
+- `fetch_directory_multi(..., seed_quorum=M)`: keep a record only if ≥M distinct
+  seeds served that `peer_id` (M=1 default = pure union, byte-identical to slice
+  a). Trades omission-resistance for injection-resistance: M>1 filters a Sybil a
+  single malicious seed injects, but also **drops an honest peer only ≤M-1 seeds
+  know** — so it can *re-introduce* eclipse and is opt-in for runs that trust
+  having ≥M honest seeds. Verified tombstones still suppress with no quorum (a
+  signed deregister is the peer's own statement — one is authoritative).
+- `TrackerCfg.seed_quorum` wired worker-side; validated `1 <= seed_quorum <= 1 +
+  len(seeds)` at load (a quorum above the seed count drops *everything*).
+- (Rate-limit + divergence dropped — see Defense 3.)
 
 ### Slice c — validation arm + docs
 - Harness: a malicious seed can't isolate a newcomer given ≥1 honest pinned seed;

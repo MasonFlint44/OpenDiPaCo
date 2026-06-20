@@ -203,6 +203,10 @@ class TrackerCfg:
     # element is tolerated for a future authenticated transport). One honest seed
     # restores peers a malicious/partitioned seed withholds. Empty = single-seed.
     seeds: list = field(default_factory=list)
+    # W8 injection-resistance: keep a directory record only if >= seed_quorum
+    # distinct seeds serve that peer (1 = pure union). >1 filters a Sybil one
+    # malicious seed injects but also drops an honest peer few seeds know -- opt-in.
+    seed_quorum: int = 1
 
 
 @dataclass
@@ -518,6 +522,13 @@ class LaunchConfig:
                     f"pinned-pubkey element); got {e!r}") from e
             if not isinstance(host, str):
                 raise ValueError(f"tracker.seeds[{i}] host must be a string, got {host!r}")
+        # seed_quorum must be reachable: at most the seed count (primary + extras),
+        # else every record is dropped (no peer can be served by that many seeds).
+        n_seeds = 1 + len(kw["tracker"].seeds)
+        if not 1 <= kw["tracker"].seed_quorum <= n_seeds:
+            raise ValueError(
+                f"tracker.seed_quorum ({kw['tracker'].seed_quorum}) must be in "
+                f"[1, {n_seeds}] (1 + #seeds); a higher quorum drops every peer")
         return cls(**kw)
 
     def connect_addr(self) -> tuple[str, int]:

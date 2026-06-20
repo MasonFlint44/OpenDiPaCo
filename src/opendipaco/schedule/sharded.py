@@ -3419,7 +3419,7 @@ def run_decentralized_worker(config, diloco, tracker_addr, corpus, *, identity,
                              heartbeat_interval=3.0, poll_interval=0.05,
                              max_msg_bytes=DEFAULT_MAX_MSG_BYTES, connect_timeout=10.0,
                              tls=None, stop_event=None, fault_hook=None, bucket=None,
-                             seeds=None):
+                             seeds=None, seed_quorum=1):
     """Self-assigning worker for a decentralized swarm (``schedule.mode:
     decentralized``): no scheduler, no central grant signer. It registers with
     the rendezvous tracker (role ``worker``), then loops :func:`_serve_decentralized`
@@ -3472,7 +3472,8 @@ def run_decentralized_worker(config, diloco, tracker_addr, corpus, *, identity,
     def directory_fn():
         # fetch_directory_multi skips erroring seeds (best-effort) and returns the
         # union; all-seeds-down -> [] (a previous epoch persists until one answers).
-        records, _answered = fetch_directory_multi(all_seeds, auth_key=auth_key, tls=tls)
+        records, _answered = fetch_directory_multi(
+            all_seeds, auth_key=auth_key, tls=tls, seed_quorum=seed_quorum)
         return records
 
     link = _WorkerLink(None, auth_key=auth_key, max_msg_bytes=max_msg_bytes,

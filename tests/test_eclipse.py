@@ -108,6 +108,40 @@ def test_single_seed_matches_fetch_directory():
         t.shutdown()
 
 
+def test_seed_quorum_drops_records_only_one_seed_serves():
+    """seed_quorum M keeps a peer only if >= M seeds serve it: a Sybil a single
+    malicious seed injects (served by 1) is dropped at M=2, while a peer all seeds
+    know survives. M=1 is the pure union (both kept)."""
+    t1, t2, t3 = _tracker(), _tracker(), _tracker()
+    a, b = PeerIdentity.generate(), PeerIdentity.generate()
+    try:
+        addrs = [_addr(t1), _addr(t2), _addr(t3)]
+        for ad in addrs:
+            register_peer(ad, a, roles=["worker"])        # a known to all 3 seeds
+        register_peer(addrs[0], b, roles=["worker"])       # b injected by 1 seed only
+        union, _ = fetch_directory_multi(addrs, seed_quorum=1)
+        assert {r["peer_id"] for r in union} == {a.peer_id, b.peer_id}
+        quorum, _ = fetch_directory_multi(addrs, seed_quorum=2)
+        assert {r["peer_id"] for r in quorum} == {a.peer_id}   # b dropped (served by 1)
+    finally:
+        t1.shutdown()
+        t2.shutdown()
+        t3.shutdown()
+
+
+def test_seed_quorum_config_validation():
+    import pytest
+
+    from opendipaco.launch import LaunchConfig
+    seeds = [["h2", 6], ["h3", 7]]                          # + primary = 3 seeds total
+    ok = LaunchConfig.from_dict({"tracker": {"port": 5, "seeds": seeds, "seed_quorum": 3}})
+    assert ok.tracker.seed_quorum == 3
+    with pytest.raises(ValueError, match="seed_quorum"):   # > 1 + #seeds -> drops everything
+        LaunchConfig.from_dict({"tracker": {"port": 5, "seeds": seeds, "seed_quorum": 4}})
+    with pytest.raises(ValueError, match="seed_quorum"):   # < 1
+        LaunchConfig.from_dict({"tracker": {"port": 5, "seed_quorum": 0}})
+
+
 def test_tracker_seeds_config_parses_and_validates():
     import pytest
 

@@ -671,7 +671,7 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             batch_size=cfg.run.batch_size, total_rounds=cfg.run.generations,
             max_tasks=mt, heartbeat_interval=own.heartbeat_interval,
             tls=build_tls_client(cfg), stop_event=stop_event or _wait_for_signal(),
-            bucket=bucket, seeds=cfg.tracker.seeds)
+            bucket=bucket, seeds=cfg.tracker.seeds, seed_quorum=cfg.tracker.seed_quorum)
         return
     if cfg.mode == "sharded":
         target = scheduler_addr or cfg.connect_addr()
@@ -941,7 +941,7 @@ def _run_local_decentralized(cfg: LaunchConfig):
             device=cfg.run.device, seed=cfg.run.seed, auth_key=auth,
             k=own.k, salt=own.salt, read_quorum=cfg.schedule.read_quorum,
             lease_ttl=cfg.schedule.lease_ttl, batch_size=cfg.run.batch_size,
-            total_rounds=cfg.run.generations, seeds=cfg.tracker.seeds,
+            total_rounds=cfg.run.generations, seeds=cfg.tracker.seeds, seed_quorum=cfg.tracker.seed_quorum,
             heartbeat_interval=own.heartbeat_interval, stop_event=stop)
 
     workers = [threading.Thread(target=worker_target, daemon=True)

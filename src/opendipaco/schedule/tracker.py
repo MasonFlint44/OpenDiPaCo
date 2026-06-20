@@ -360,7 +360,7 @@ def _record_issued_at(r):
 
 
 def fetch_directory_multi(seeds, *, roles=None, reachability=None, auth_key=None,
-                          tls=None, timeout: float = 10.0):
+                          tls=None, timeout: float = 10.0, seed_quorum: int = 1):
     """Bootstrap the directory from **multiple seeds**, returning the **union** of
     verified records (freshest per ``peer_id``) with verified deregister tombstones
     suppressing same-or-older registrations (W8 eclipse defense; design
@@ -371,11 +371,19 @@ def fetch_directory_multi(seeds, *, roles=None, reachability=None, auth_key=None
     honest+reachable seed restores it. Unreachable/erroring/malicious seeds are
     skipped (best-effort -> also better availability). ``seeds`` is an iterable of
     ``(host, port)`` (a trailing pinned pubkey, if present, is ignored here --
-    pinning is a transport-auth concern, not what makes the union sound). Returns
-    ``(records, seeds_answered)``.
+    pinning is a transport-auth concern, not what makes the union sound).
+
+    ``seed_quorum`` M (default 1 = pure union) keeps a record only if **>= M
+    distinct seeds** served that ``peer_id`` -- injection-resistance: a Sybil a
+    single malicious seed injects (served by 1) is dropped at M >= 2. The
+    tradeoff: an honest peer only <= M-1 seeds know is *also* dropped, so M > 1 can
+    re-introduce eclipse; use it only when you trust having >= M honest seeds.
+    Tombstones need no quorum -- a verified deregister is the peer's own signed
+    statement, so one is authoritative. Returns ``(records, seeds_answered)``.
     """
     merged: dict[str, dict] = {}    # peer_id -> freshest verified record
     tombs: dict[str, float] = {}    # peer_id -> max verified deregister issued_at
+    served: dict[str, int] = {}     # peer_id -> # distinct seeds that served it
     answered = 0
     for seed in seeds:
         addr = (seed[0], seed[1])
@@ -393,18 +401,24 @@ def fetch_directory_multi(seeds, *, roles=None, reachability=None, auth_key=None
         for pid, ts in t.items():
             if pid not in tombs or ts > tombs[pid]:
                 tombs[pid] = ts
-        for r in records:           # already verify_record-checked by the fetch
+        seen_here: set[str] = set()  # count each seed at most once toward the quorum
+        for r in records:            # already verify_record-checked by the fetch
             pid, ts = r.get("peer_id"), _record_issued_at(r)
             if not isinstance(pid, str) or ts is None:
                 continue
+            if pid not in seen_here:
+                seen_here.add(pid)
+                served[pid] = served.get(pid, 0) + 1
             cur = merged.get(pid)
             if cur is None or ts > _record_issued_at(cur):
                 merged[pid] = r
-    # A tombstone suppresses a registration at or before its issued_at, so a
+    # Keep a record iff it cleared the seed quorum AND no tombstone suppresses it.
+    # The tombstone suppresses a registration at or before its issued_at, so a
     # malicious seed can't resurrect a departed peer by replaying its still-within-
     # TTL record; a peer that left then rejoined (newer registration) survives.
     out = [r for pid, r in merged.items()
-           if pid not in tombs or _record_issued_at(r) > tombs[pid]]
+           if served[pid] >= seed_quorum
+           and (pid not in tombs or _record_issued_at(r) > tombs[pid])]
     return out, answered
 
 
