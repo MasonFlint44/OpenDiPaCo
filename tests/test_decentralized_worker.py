@@ -473,12 +473,13 @@ def test_run_decentralized_worker_bootstraps_from_all_seeds(monkeypatch):
     seen = []
     monkeypatch.setattr(
         tk, "fetch_directory_multi",
-        lambda seeds, **kw: (seen.append([tuple(s) for s in seeds]), ([], 0))[1])
+        lambda seeds, **kw: (seen.append(([tuple(s) for s in seeds], kw.get("seed_quorum"))),
+                             ([], 0))[1])
     cfg = _cfg()
     stop = threading.Event()
     th = threading.Thread(target=lambda: run_decentralized_worker(
         cfg, _diloco(), ("127.0.0.1", 59991), _corpus(cfg),
-        identity=PeerIdentity.generate(), seeds=[["127.0.0.1", 59992]],
+        identity=PeerIdentity.generate(), seeds=[["127.0.0.1", 59992]], seed_quorum=2,
         poll_interval=0.01, stop_event=stop), daemon=True)
     th.start()
     try:
@@ -489,4 +490,5 @@ def test_run_decentralized_worker_bootstraps_from_all_seeds(monkeypatch):
     finally:
         stop.set()
         th.join(timeout=5)
-    assert seen and seen[0] == [("127.0.0.1", 59991), ("127.0.0.1", 59992)]
+    # Both the union seed list AND the seed_quorum must reach fetch_directory_multi.
+    assert seen and seen[0] == ([("127.0.0.1", 59991), ("127.0.0.1", 59992)], 2)

@@ -129,6 +129,22 @@ def test_seed_quorum_drops_records_only_one_seed_serves():
         t3.shutdown()
 
 
+def test_seed_quorum_tradeoff_drops_an_honest_peer_few_seeds_know():
+    """The documented downside of M>1: an HONEST peer only one seed knows is also
+    dropped, so seed_quorum can re-introduce eclipse (it's opt-in for that reason)."""
+    t1, t2 = _tracker(), _tracker()
+    honest = PeerIdentity.generate()
+    try:
+        addrs = [_addr(t1), _addr(t2)]
+        register_peer(addrs[0], honest, roles=["owner"], reachability="public",
+                      peer_addr=("10.0.0.1", 1))         # only seed t1 knows it
+        assert {r["peer_id"] for r in fetch_directory_multi(addrs, seed_quorum=1)[0]} == {honest.peer_id}
+        assert fetch_directory_multi(addrs, seed_quorum=2)[0] == []   # dropped under M=2
+    finally:
+        t1.shutdown()
+        t2.shutdown()
+
+
 def test_seed_quorum_config_validation():
     import pytest
 
@@ -136,10 +152,17 @@ def test_seed_quorum_config_validation():
     seeds = [["h2", 6], ["h3", 7]]                          # + primary = 3 seeds total
     ok = LaunchConfig.from_dict({"tracker": {"port": 5, "seeds": seeds, "seed_quorum": 3}})
     assert ok.tracker.seed_quorum == 3
-    with pytest.raises(ValueError, match="seed_quorum"):   # > 1 + #seeds -> drops everything
+    with pytest.raises(ValueError, match="seed_quorum"):   # > #distinct seeds -> drops everything
         LaunchConfig.from_dict({"tracker": {"port": 5, "seeds": seeds, "seed_quorum": 4}})
     with pytest.raises(ValueError, match="seed_quorum"):   # < 1
         LaunchConfig.from_dict({"tracker": {"port": 5, "seed_quorum": 0}})
+    # A seed equal to the primary doesn't add reach: the quorum bound is the
+    # DISTINCT seed count the worker dedups to (else a max quorum would be
+    # unreachable at runtime -> silent self-eclipse).
+    with pytest.raises(ValueError, match="seed_quorum"):
+        LaunchConfig.from_dict({"tracker": {"connect_host": "h", "port": 5,
+                                            "seeds": [["h", 5], ["h2", 6]],
+                                            "seed_quorum": 3}})   # distinct = {h:5, h2:6} = 2
 
 
 def test_tracker_seeds_config_parses_and_validates():

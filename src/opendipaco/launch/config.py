@@ -522,13 +522,18 @@ class LaunchConfig:
                     f"pinned-pubkey element); got {e!r}") from e
             if not isinstance(host, str):
                 raise ValueError(f"tracker.seeds[{i}] host must be a string, got {host!r}")
-        # seed_quorum must be reachable: at most the seed count (primary + extras),
-        # else every record is dropped (no peer can be served by that many seeds).
-        n_seeds = 1 + len(kw["tracker"].seeds)
-        if not 1 <= kw["tracker"].seed_quorum <= n_seeds:
+        # seed_quorum must be reachable: at most the number of DISTINCT seeds the
+        # worker will actually union over (primary + extras, deduped the same way
+        # run_decentralized_worker does -- a seed equal to the primary, or a dup,
+        # doesn't add reach). A higher quorum would drop every peer -> silent
+        # self-eclipse, so reject at load.
+        t = kw["tracker"]
+        phost = t.connect_host or (t.host if t.host not in ("0.0.0.0", "::") else "127.0.0.1")
+        distinct = {(phost, t.port)} | {(s[0], int(s[1])) for s in t.seeds}
+        if not 1 <= t.seed_quorum <= len(distinct):
             raise ValueError(
-                f"tracker.seed_quorum ({kw['tracker'].seed_quorum}) must be in "
-                f"[1, {n_seeds}] (1 + #seeds); a higher quorum drops every peer")
+                f"tracker.seed_quorum ({t.seed_quorum}) must be in [1, {len(distinct)}] "
+                f"(the number of distinct seeds); a higher quorum drops every peer")
         return cls(**kw)
 
     def connect_addr(self) -> tuple[str, int]:
