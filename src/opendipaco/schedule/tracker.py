@@ -32,11 +32,12 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from .identity import PeerIdentity, sign_record, verify_record
 from .ownership import epoch_newer, verify_epoch_record
 from .reactor import DEFAULT_MAX_MSG_BYTES, _ReactorServer
-from .sharded import _ps_connect, _rpc
+from .sharded import _ps_connect, _record_issued_at, _rpc
 
 REACHABILITY = ("public", "nat")
 
@@ -348,10 +349,112 @@ def fetch_directory_and_tombstones(addr, *, roles=None, reachability=None, auth_
         tombs = [t for t in tombs if verify_record(t) and t.get("kind") == "deregister"]
     out = {}
     for t in tombs:
-        ts = t.get("issued_at")
-        if isinstance(ts, (int, float)) and not isinstance(ts, bool):
-            out[t["peer_id"]] = float(ts)
+        ts = _record_issued_at(t)
+        if ts is not None:
+            out[t["peer_id"]] = ts
     return records, out
+
+
+def dedup_seeds(primary, extras=()):
+    """Canonical multi-home tracker list: ``primary`` first, then each distinct
+    extra, every entry normalized to ``(host, int(port))``.
+
+    Dedupping by ``(host, int(port))`` is what keeps the seed set honest: the same
+    tracker named twice (or once with an int port and once with a str port) is
+    contacted once and counted once toward a ``seed_quorum`` -- otherwise it could
+    spuriously clear M-of-N on its own. Every registration / fetch / config-
+    validation path builds its seed list through here so they agree on "distinct"."""
+    out = [(primary[0], int(primary[1]))]
+    for s in (extras or []):
+        ad = (s[0], int(s[1]))
+        if ad not in out:
+            out.append(ad)
+    return out
+
+
+def fetch_directory_multi(seeds, *, roles=None, reachability=None, auth_key=None,
+                          tls=None, timeout: float = 10.0, seed_quorum: int = 1):
+    """Bootstrap the directory from **multiple seeds**, returning the **union** of
+    verified records (freshest per ``peer_id``) with verified deregister tombstones
+    suppressing same-or-older registrations (W8 eclipse defense; design
+    ``docs/w8-eclipse-sybil-design.md``).
+
+    Records are self-certifying, so the union is sound regardless of which seed
+    served them: omission-eclipse needs *every* seed to withhold a peer, and one
+    honest+reachable seed restores it. Unreachable/erroring/malicious seeds are
+    skipped (best-effort -> also better availability). ``seeds`` is an iterable of
+    ``(host, port)`` (a trailing pinned pubkey, if present, is ignored here --
+    pinning is a transport-auth concern, not what makes the union sound).
+
+    ``seed_quorum`` M (default 1 = pure union) keeps a record only if **>= M
+    distinct seeds** served that ``peer_id`` -- injection-resistance: a Sybil a
+    single malicious seed injects (served by 1) is dropped at M >= 2. The
+    tradeoff: an honest peer only <= M-1 seeds know is *also* dropped, so M > 1 can
+    re-introduce eclipse; use it only when you trust having >= M honest seeds.
+    Tombstones need no quorum -- a verified deregister is the peer's own signed
+    statement, so one is authoritative. Returns ``(records, seeds_answered)``.
+    """
+    merged: dict[str, dict] = {}    # peer_id -> (issued_at, freshest verified record)
+    tombs: dict[str, float] = {}    # peer_id -> max verified deregister issued_at
+    served: dict[str, int] = {}     # peer_id -> # distinct seeds that served it
+    answered = 0
+    # Dedup by (host, int(port)) so a duplicate seed -- or the same tracker named
+    # with a str vs int port -- isn't fetched twice or counted twice toward the
+    # quorum (a direct caller may not pre-dedup; the launch path does). A trailing
+    # pinned pubkey is ignored (transport-auth concern).
+    addrs = list(dict.fromkeys((s[0], int(s[1])) for s in seeds))
+
+    def _fetch(addr):
+        return fetch_directory_and_tombstones(
+            addr, roles=roles, reachability=reachability,
+            auth_key=auth_key, tls=tls, timeout=timeout)
+
+    # Fetch the seeds concurrently when there's more than one: a slow/down seed must
+    # not serialize behind the others on the worker's directory hot path (worst case
+    # is one ``timeout``, not N x timeout). The single-seed default skips the thread
+    # pool entirely (no per-call thread-spawn overhead). The merge below is
+    # order-independent (freshest-wins by issued_at, seed counts, max tombstone), so
+    # completion order doesn't matter. A seed is untrusted and best-effort: skip ANY
+    # failure (unreachable, or a malformed/garbage reply that escapes the codec as
+    # struct.error / AttributeError / RuntimeError, etc.) rather than let one bad
+    # seed crash the caller. Records that DO come through are verify_record'd.
+    results = []
+    if len(addrs) == 1:
+        try:
+            results.append(_fetch(addrs[0]))
+        except Exception:
+            pass
+    elif addrs:
+        with ThreadPoolExecutor(max_workers=len(addrs)) as ex:
+            for fut in [ex.submit(_fetch, a) for a in addrs]:
+                try:
+                    results.append(fut.result())
+                except Exception:
+                    continue
+    for records, t in results:
+        answered += 1
+        for pid, ts in t.items():
+            if pid not in tombs or ts > tombs[pid]:
+                tombs[pid] = ts
+        seen_here: set[str] = set()  # count each seed at most once toward the quorum
+        for r in records:            # already verify_record-checked by the fetch
+            pid, ts = r.get("peer_id"), _record_issued_at(r)
+            if not isinstance(pid, str) or ts is None:
+                continue
+            if pid not in seen_here:
+                seen_here.add(pid)
+                served[pid] = served.get(pid, 0) + 1
+            cur = merged.get(pid)        # (issued_at, record); parse ts once per record
+            if cur is None or ts > cur[0]:
+                merged[pid] = (ts, r)
+    # Keep a record iff it cleared the seed quorum AND no tombstone suppresses it.
+    # The tombstone suppresses a registration at or before its issued_at, so a
+    # malicious seed can't resurrect a departed peer by replaying its still-within-
+    # TTL record; a peer that left then rejoined (newer registration) survives.
+    out = [r for pid, (ts, r) in merged.items()
+           if served[pid] >= seed_quorum
+           and (pid not in tombs or ts > tombs[pid])]
+    return out, answered
 
 
 def import_records(addr, records, *, auth_key=None, tls=None, timeout: float = 10.0) -> dict:

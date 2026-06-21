@@ -232,7 +232,7 @@ dependencies:
   (no shard-spec materialization seam) and tolerant across very different
   numerical stacks — both noted in the design doc.
 
-### W8 · Trust beyond the current threat model · B2 · [research] · ◑ **data-poisoning part landed**
+### W8 · Trust beyond the current threat model · B2 · [research] · ◑ **poisoning + eclipse landed; incentives open**
 
 Three open trust problems; **data poisoning** is now defended
 (`docs/w8-data-poisoning-design.md`): Phase 3's robust aggregation + redundant
@@ -244,11 +244,26 @@ loss rise flags the contribution (`robustness.probe_docs`/`probe_quorum`, off by
 default; `examples/validate_poisoning.py`). It's a heuristic that raises the bar
 on crude poisoning (a targeted backdoor tuned to preserve clean-probe loss can
 evade), post-hoc like the digest audit, and its efficacy at scale rides the §0f
-run — all recorded in `remaining-gaps.md`. **Still open (research-shaped):**
-**eclipse / Sybil-at-the-tracker** (a malicious or partitioned bootstrap seed
-isolating a newcomer), and **incentives** — the reputation system tracks behavior
-but rewards nothing, and sustained volunteer participation (BOINC/Petals-style)
-needs a reason to contribute.
+run — all recorded in `remaining-gaps.md`.
+
+**Eclipse / Sybil-at-the-tracker** is now defended for the *eclipse* half
+(`docs/w8-eclipse-sybil-design.md`): a newcomer bootstraps from **multiple seeds**
+and takes the **union** of the self-certifying directory records, so a malicious or
+partitioned seed that withholds honest peers can't isolate it (one honest seed
+restores them); `seed_quorum` (M-of-N) optionally filters single-seed Sybil
+injection; `examples/validate_eclipse.py`. **The design review corrected a false
+premise here:** "control is reputation-gated" is *not* true — a fresh identity
+starts above the owner-eligibility threshold and the worker's HRW isn't
+reputation-filtered, so **fresh Sybils can become owners**. Closing that needs
+identities to be non-free (stake), which is the **incentives** problem below — so
+it's explicitly deferred there, not pretended solved.
+
+**Still open (research-shaped): incentives** — the reputation system tracks
+behavior but rewards nothing; sustained volunteer participation (BOINC/Petals-style)
+needs a reason to contribute, and a **stake** is also the only effective
+Sybil-of-control defense (enrollment breaks open volunteering; proof-of-work is a
+poor fit for a compute network). Eclipse/Sybil part-2 deliberately stopped at the
+buildable eclipse defense and handed fresh-Sybil-control to this.
 
 ---
 
@@ -270,7 +285,7 @@ needs a reason to contribute.
                                                 ▼
                   W3 VRAM fit ✅  ·  W4 churn ✅  ·  W5 task sizing ✅       (B1: "large + consumer")
                                                 ▼
-              W6 client ✅  ·  W7 data plane ✅  ·  W8 trust ◑ (poisoning ✅ / incentives ⬜)   (B2)
+          W6 client ✅  ·  W7 data plane ✅  ·  W8 trust ◑ (poisoning+eclipse ✅ / incentives ⬜)   (B2)
 ```
 
 **Bottom line:** Phases 0–4 removed what had to be *trusted* or *central*. The

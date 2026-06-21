@@ -198,6 +198,15 @@ class TrackerCfg:
     ttl: float = 30.0                  # registrations expire unless re-registered
     open_enrollment: bool = False      # True: any validly-signed record may register
     enroll_peers: list[str] = field(default_factory=list)  # pubkeys allowed to register
+    # W8 eclipse defense: extra bootstrap trackers to UNION the directory from
+    # (beyond the primary host/port) -- [[host, port], ...] (a 3rd pinned-pubkey
+    # element is tolerated for a future authenticated transport). One honest seed
+    # restores peers a malicious/partitioned seed withholds. Empty = single-seed.
+    seeds: list = field(default_factory=list)
+    # W8 injection-resistance: keep a directory record only if >= seed_quorum
+    # distinct seeds serve that peer (1 = pure union). >1 filters a Sybil one
+    # malicious seed injects but also drops an honest peer few seeds know -- opt-in.
+    seed_quorum: int = 1
 
 
 @dataclass
@@ -501,6 +510,34 @@ class LaunchConfig:
             raise ValueError(
                 "schedule.mode: decentralized requires transport.compress: none "
                 "(quorum reads need byte-exact agreement across replicas)")
+        # W8 multi-seed: validate each tracker.seeds entry is [host, port(, pubkey)]
+        # with an int-able port, so a typo fails at load (not deep in the worker).
+        for i, s in enumerate(kw["tracker"].seeds):
+            try:
+                host = s[0]
+                int(s[1])             # port must be int-able
+            except (TypeError, ValueError, IndexError) as e:
+                raise ValueError(
+                    f"tracker.seeds[{i}]={s!r} must be [host, port] (optional 3rd "
+                    f"pinned-pubkey element); got {e!r}") from e
+            if not isinstance(host, str):
+                raise ValueError(f"tracker.seeds[{i}] host must be a string, got {host!r}")
+        # seed_quorum must be reachable: at most the number of DISTINCT seeds the
+        # worker will actually union over (primary + extras). Build the distinct set
+        # through the SAME helper run_decentralized_worker uses, so load-time
+        # validation and the runtime dedup can't disagree (a seed equal to the
+        # primary, or a dup, doesn't add reach). A higher quorum would drop every
+        # peer -> silent self-eclipse, so reject at load. NB string-aliased hosts
+        # for one tracker still count as distinct here AND at runtime; that's an
+        # operator footgun the helper can't resolve without DNS.
+        from ..schedule.tracker import dedup_seeds
+        t = kw["tracker"]
+        phost = t.connect_host or (t.host if t.host not in ("0.0.0.0", "::") else "127.0.0.1")
+        distinct = dedup_seeds((phost, t.port), t.seeds)
+        if not 1 <= t.seed_quorum <= len(distinct):
+            raise ValueError(
+                f"tracker.seed_quorum ({t.seed_quorum}) must be in [1, {len(distinct)}] "
+                f"(the number of distinct seeds); a higher quorum drops every peer")
         return cls(**kw)
 
     def connect_addr(self) -> tuple[str, int]:

@@ -1,0 +1,210 @@
+# W8 (part 2) · Eclipse / Sybil-at-the-tracker
+
+Status: **design (revised after design review)**. Slices a/b/c below.
+
+Second of W8's three trust problems (data poisoning is part 1; incentives is part
+3). Efficacy at scale rides the §0f WAN run; the mechanism lands and is tested
+on-box.
+
+> **Design-review correction.** An earlier draft claimed "control is already
+> reputation-gated, so fresh Sybils can't become owners." **That is false** and is
+> the reason this doc was rescoped — see "What is *not* closed" below.
+
+## What's already closed
+
+The tracker directory is **self-certifying**: every record is an Ed25519
+`make_peer_record` signed by the peer, re-verified on fetch (`fetch_directory`
+drops anything failing `verify_record`); deregister tombstones are likewise
+peer-signed and re-verified. So a malicious tracker/relay **cannot forge** a peer
+record, fabricate liveness for an identity it doesn't hold, or forge a
+deregister. `max_peers` bounds the directory size (global cap).
+
+## What is *not* closed (the real threat surface)
+
+1. **Eclipse of a newcomer.** A cold-start peer bootstraps from a **single**
+   tracker (`tracker_connect_addr()` → one `(host, port)`; the decentralized
+   worker's `directory_fn` fetches from that one seed, sharded.py). A malicious
+   *or merely partitioned* tracker serves a **filtered** directory — omitting
+   honest peers, leaving attacker-controlled ones — and the newcomer HRW-self-
+   assigns / `derive_epoch`s over a poisoned view. A *warm* peer cross-checks via
+   gossip (it unions the seed with current epoch owners, sharded.py `_gossip_once`);
+   a **newcomer has no owners**, so its view collapses to the one tracker.
+
+2. **Fresh Sybils can become owners (the hard one — NOT closed).** The review
+   found the reputation gate does **not** prevent this:
+   - `derive_epoch`'s `is_eligible` predicate is **optional, default `None`**
+     (`ownership.py`), and the **decentralized worker loop** calls it with **no**
+     predicate (`_serve_decentralized`, sharded.py) — its HRW self-assignment runs
+     over *every* `owner_eligible` directory peer regardless of reputation.
+   - Even where `is_eligible` *is* wired (the owner-side `ParameterServer` /
+     `EpochManager`), a **fresh identity starts at the reputation floor (0.5),
+     which is above `min_owner_reputation` (0.25)** — reputation *excludes
+     proven-bad* peers, it does not *require earned* standing. So a brand-new
+     identity is owner-eligible by design.
+
+   ⟹ A Sybil-bloated directory **does** skew owner selection, and fresh Sybils
+   **can** become owners. Closing this needs identities to be non-free, which is
+   the **incentives/stake** problem (part 3) — enrollment breaks open
+   volunteering, and proof-of-work is a poor fit for a compute network (the
+   attacker already has GPUs; it just burns honest compute). **Deferred to part 3,
+   stated plainly here so we don't pretend otherwise.**
+
+## Scope of this part
+
+Build the honestly-buildable hardening; do **not** claim Sybil-of-control is solved.
+
+### Defense 1 — multi-seed bootstrap + union (self-certifying records)
+A newcomer bootstraps from **several seed addresses** and takes the **union** of
+verified records (freshest per `peer_id`). The union is sound because records are
+**self-certifying** — a malicious seed can't forge a record, only *omit* or
+*inject* real ones.
+- *Eclipse (omission):* defeated as long as ≥1 seed is honest+reachable — one
+  honest seed restores any peer the others withhold. Dead/malicious seeds are
+  skipped (best-effort → also better availability).
+- *Trust input & pinning.* The irreducible trust input is **knowing ≥1 honest
+  seed's address**; the seed *list's* provenance must come from a trusted channel,
+  **not** the W6 manifest (same provenance hole). `TrackerCfg.seeds` may carry an
+  optional `pubkey` per seed, but note: the tracker's *reply envelope* isn't
+  signed (only the records inside it are), so a pubkey pin only prevents
+  **MITM-impersonation of a seed on an authenticated transport** (TLS/libp2p) —
+  over plain TCP it's advisory. Pinning is therefore a transport-auth follow-on,
+  **not** what makes the union sound (the self-certifying records are).
+- *Union tradeoff (acknowledged):* the union is monotone — it also aggregates each
+  seed's admitted records, so a malicious pinned seed can **inject** its
+  signature-valid Sybils into the view. Union is therefore an **omission**
+  defense, not a Sybil defense (Sybil-of-control is part 3). An optional
+  `seed_quorum` (accept a record only if ≥M of N seeds serve it) trades
+  omission-resistance for injection-resistance; off by default (M=1 = pure union).
+- *Tombstones unioned too:* the multi-seed path unions verified deregister
+  tombstones and a tombstone suppresses a same-or-older registration for that
+  `peer_id` across all seeds — else a malicious seed could replay a departed
+  peer's still-within-TTL record to resurrect it.
+
+### Defense 2 — worker-side reputation filter (owed — needs a reputation source)
+The review noted the worker-side `derive_epoch` (`_serve_decentralized`) isn't
+reputation-filtered. **Build-time correction:** the worker has **no reputation
+object** — reputation is owner-hosted (computed from commit outcomes), and the
+worker only holds `directory_fn`. So this isn't a one-line "wire `is_eligible`"
+fix: the worker would need reputation *plumbed to it* (gossiped, or owner-reported)
+first. And it's an **optimization, not a security boundary** — the worker's HRW
+only chooses which owners to *route* to; write-acceptance is gated owner-side +
+by quorum (which do have reputation). So a worker routing to a debited owner is
+caught at the owner/quorum, not silently accepted. **Deferred** (needs a worker
+reputation view; ties to the part-3 Sybil work). Not in slice a.
+
+### Defense 3 — admission dampening + observability — **not built (see below)**
+The original plan (per-source registration rate-limit + a divergence flag) was
+**dropped after the design review and a build-time check**:
+- *Per-source rate-limit:* the tracker handler (`_handle(msg, nbytes, peer_id)`)
+  receives only the authenticated `peer_id` (free to generate on an open tracker
+  → a useless rate-limit key), **not** the source IP. Per-IP limiting would need a
+  cross-cutting reactor change (plumb the remote addr through every `_handle`
+  subclass), and the review showed it's weak anyway (multi-IP-bypassable, bounds
+  rate not count, and `max_peers` then becomes an honest-peer-exclusion DoS).
+  Real Sybil resistance is the stake/incentives layer (part 3); a half-measure
+  here isn't worth the reactor churn.
+- *Divergence flag:* it is observability, not a defense (blind to a targeted
+  one-peer omission), and its only consumer would be the worker's hot poll loop
+  (no operator-facing one-shot bootstrap log to surface it cleanly). Deferred
+  until there's a consumer and the targeted-omission limit is acceptable.
+
+## Slices
+
+### Slice a — multi-seed union (pinned) + tombstones
+- `tracker.fetch_directory_multi(seeds, ...)`: per seed fetch+verify, union by
+  `peer_id` keeping freshest `issued_at`, union+apply verified tombstones (a
+  tombstone suppresses a same-or-older registration for its `peer_id` across all
+  seeds), skip unreachable/erroring seeds; optional pinned-pubkey attribution.
+  Mirror the owner-side `_directory` merge.
+- `TrackerCfg.seeds: list[[host, port, pubkey]]`; `tracker_connect_seeds()`
+  returns the full pinned list (the primary + extras). One seed (default) =
+  byte-identical to today.
+- Wire the **decentralized worker** bootstrap through the union. (The scheduler's
+  `watch_tracker` stays single-seed in slice a — the *newcomer worker* is the
+  eclipse target; the operator's scheduler is less so. Scheduler multi-seed is a
+  slice-b/follow-on item.)
+- Tests: filtering seed + honest seed → union recovers omitted peers; a tombstone
+  suppresses a replayed within-TTL record; all-seeds-down → empty, no crash;
+  single-seed unchanged.
+
+### Slice b — `seed_quorum` (M-of-N injection-resistance)
+- `fetch_directory_multi(..., seed_quorum=M)`: keep a record only if ≥M distinct
+  seeds served that `peer_id` (M=1 default = pure union, byte-identical to slice
+  a). Trades omission-resistance for injection-resistance: M>1 filters a Sybil a
+  single malicious seed injects, but also **drops an honest peer only ≤M-1 seeds
+  know** — so it can *re-introduce* eclipse and is opt-in for runs that trust
+  having ≥M honest seeds. Verified tombstones still suppress with no quorum (a
+  signed deregister is the peer's own statement — one is authoritative).
+- `TrackerCfg.seed_quorum` wired worker-side; validated `1 <= seed_quorum <= 1 +
+  len(seeds)` at load (a quorum above the seed count drops *everything*).
+- (Rate-limit + divergence dropped — see Defense 3.)
+
+### Slice c — validation arm + docs — **landed**
+- `examples/validate_eclipse.py`: two honest seeds + one malicious seed (omits the
+  honest owners, injects Sybils); shows end-to-end that (1) a single-seed bootstrap
+  off the malicious seed is eclipsed, (2) the multi-seed union recovers the honest
+  owners, (3) `seed_quorum=2` filters the 1-seed Sybil injection. Carries the
+  honest caveats (≥1 honest seed; fresh-Sybil-as-owner is part 3). (The
+  debited-owner-excluded claim was dropped — Defense 2's worker-side rep filter is
+  deferred, since the worker has no reputation object.)
+- Roadmap + `remaining-gaps.md` updated (incl. the fresh-Sybil-owner → part 3).
+
+## Amendment — registration must multi-home (else the union is inert)
+The read side (`fetch_directory_multi`) is only half of the defense. A peer's
+record lives wherever it **registers**; trackers don't replicate registrations to
+each other. So if a peer heartbeats only to its primary tracker, the extra seeds
+hold *nothing* about it, and the newcomer's multi-seed union recovers nothing when
+the primary omits it — the union is inert. The fix is to **multi-home the
+registration**: an owner's `start_tracker_heartbeat(seeds=...)` and the
+decentralized worker's heartbeat both `register_peer` with *every* seed (deduped,
+primary first; a seed briefly away is skipped, not fatal). Graceful shutdown
+likewise deregisters from every seed, so a departing peer's tombstone reaches the
+union (a stale record left on one seed would otherwise defeat failover). The
+decentralized `_gossip_once` pulls from all seeds for the same reason. Without
+this, `seed_quorum>1` would also stall every quorumed worker (registrations
+served by one seed never clear M≥2).
+
+## Amendment — review hardening (untrusted-seed robustness)
+A review pass tightened the seed handling so the defense holds up against *hostile*
+seeds, not just absent ones:
+- **One `dedup_seeds(primary, extras)` helper** is the single source of truth for
+  "the distinct trackers I deal with" — used by owner heartbeat, worker
+  registration, graceful deregister, and config validation. It normalizes every
+  entry to `(host, int(port))`, so the same tracker named twice (or with a str vs
+  int port) is contacted once and counted once toward `seed_quorum` (else one
+  tracker could self-satisfy M-of-N, defeating injection-resistance). Centralizing
+  it also closes the bug class behind the multi-home amendment above: a future
+  registration path can't silently forget to dedup/multi-home.
+- **Untrusted seeds get a broad `except`.** Registration/deregistration to each
+  seed catches `Exception` (not just `OSError`/`ConnectionError`), matching
+  `fetch_directory_multi`: a seed that completes the connect then returns a garbage
+  frame raises a codec error (`struct.error`/`ValueError`/…), which must not kill
+  the heartbeat thread and drop the peer from the *healthy* seeds too. A tracker
+  that *refuses* (full / not-enrolled) returns a status dict (no raise) and is now
+  logged — under `seed_quorum>1` a silent refusal would drop the peer from quorumed
+  views. (Best-effort writes vs strict-quorum reads is still an inherent `M>1`
+  availability tradeoff; surfacing the refusal is the mitigation.)
+- **`seed_quorum` is range-checked at the `run_decentralized_worker` entry point**,
+  not only at config load — a direct/in-process caller passing a quorum above the
+  distinct-seed count now fails fast instead of returning an empty directory
+  forever (silent self-eclipse).
+- **Concurrent seed fetch.** `fetch_directory_multi` fetches multiple seeds in
+  parallel so a slow/down seed costs one `timeout`, not N×`timeout`, on the
+  worker's directory hot path (the single-seed default skips the thread pool).
+- **Known residual:** string-aliased hosts for one tracker (e.g. `localhost` vs
+  `127.0.0.1`) still count as distinct at both validation and runtime — an operator
+  footgun `dedup_seeds` can't resolve without DNS.
+
+## Honest limitations (state them)
+- **Fresh-Sybil-as-owner is NOT closed** — identities are free; the only effective
+  fix (stake) is the incentives layer (part 3). This part bounds eclipse + waste,
+  not Sybil-of-control.
+- **≥1 honest, reachable, pinned seed required** for eclipse-resistance; with all
+  seeds hostile the newcomer is eclipsed (irreducible without trusted seed
+  provenance).
+- **Union aggregates Sybils** (monotone) — `seed_quorum` trades that against
+  omission-resistance; neither is free.
+- **Rate-limit bounds rate, not count**; `max_peers` is a DoS-exclusion lever
+  under multi-source flooding.
+- **Divergence detection is observability**, blind to targeted one-peer omission.
+- **Efficacy at scale rides §0f.**

@@ -574,7 +574,7 @@ def run_parameter_server(cfg: LaunchConfig, shard_id: int = 0, *, port=None,
         ps.start_tracker_heartbeat(
             tracker_addr or cfg.tracker_connect_addr(), _advertise_host(cfg),
             interval=own.heartbeat_interval, auth_key=cfg.transport.auth_key,
-            tls=build_tls_client(cfg))
+            tls=build_tls_client(cfg), seeds=cfg.tracker.seeds)
     else:
         keys = sorted(model.build_topology().module_keys())
         assignment = assign_shards(keys, cfg.sharded.num_shards)
@@ -671,7 +671,7 @@ def run_worker_role(cfg: LaunchConfig, *, addr=None, scheduler_addr=None, max_ta
             batch_size=cfg.run.batch_size, total_rounds=cfg.run.generations,
             max_tasks=mt, heartbeat_interval=own.heartbeat_interval,
             tls=build_tls_client(cfg), stop_event=stop_event or _wait_for_signal(),
-            bucket=bucket)
+            bucket=bucket, seeds=cfg.tracker.seeds, seed_quorum=cfg.tracker.seed_quorum)
         return
     if cfg.mode == "sharded":
         target = scheduler_addr or cfg.connect_addr()
@@ -931,7 +931,8 @@ def _run_local_decentralized(cfg: LaunchConfig):
     for ps in owners:
         ps.apply_epoch(epoch0, bootstrap=True)
         ps.start_tracker_heartbeat(taddr, "127.0.0.1",
-                                   interval=own.heartbeat_interval, auth_key=auth)
+                                   interval=own.heartbeat_interval, auth_key=auth,
+                                   seeds=cfg.tracker.seeds)
 
     stop = threading.Event()
 
@@ -941,7 +942,7 @@ def _run_local_decentralized(cfg: LaunchConfig):
             device=cfg.run.device, seed=cfg.run.seed, auth_key=auth,
             k=own.k, salt=own.salt, read_quorum=cfg.schedule.read_quorum,
             lease_ttl=cfg.schedule.lease_ttl, batch_size=cfg.run.batch_size,
-            total_rounds=cfg.run.generations,
+            total_rounds=cfg.run.generations, seeds=cfg.tracker.seeds, seed_quorum=cfg.tracker.seed_quorum,
             heartbeat_interval=own.heartbeat_interval, stop_event=stop)
 
     workers = [threading.Thread(target=worker_target, daemon=True)
