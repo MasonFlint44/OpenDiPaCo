@@ -149,6 +149,21 @@ The original plan (per-source registration rate-limit + a divergence flag) was
   deferred, since the worker has no reputation object.)
 - Roadmap + `remaining-gaps.md` updated (incl. the fresh-Sybil-owner → part 3).
 
+## Amendment — registration must multi-home (else the union is inert)
+The read side (`fetch_directory_multi`) is only half of the defense. A peer's
+record lives wherever it **registers**; trackers don't replicate registrations to
+each other. So if a peer heartbeats only to its primary tracker, the extra seeds
+hold *nothing* about it, and the newcomer's multi-seed union recovers nothing when
+the primary omits it — the union is inert. The fix is to **multi-home the
+registration**: an owner's `start_tracker_heartbeat(seeds=...)` and the
+decentralized worker's heartbeat both `register_peer` with *every* seed (deduped,
+primary first; a seed briefly away is skipped, not fatal). Graceful shutdown
+likewise deregisters from every seed, so a departing peer's tombstone reaches the
+union (a stale record left on one seed would otherwise defeat failover). The
+decentralized `_gossip_once` pulls from all seeds for the same reason. Without
+this, `seed_quorum>1` would also stall every quorumed worker (registrations
+served by one seed never clear M≥2).
+
 ## Honest limitations (state them)
 - **Fresh-Sybil-as-owner is NOT closed** — identities are free; the only effective
   fix (stake) is the incentives layer (part 3). This part bounds eclipse + waste,

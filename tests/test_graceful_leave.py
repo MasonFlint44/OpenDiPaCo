@@ -260,3 +260,32 @@ def test_owner_graceful_shutdown_deregisters_and_stays_tombstoned():
         assert ident.peer_id not in {r["peer_id"] for r in tracker.records()}
     finally:
         tracker.shutdown()
+
+
+def test_owner_heartbeat_multi_homes_to_every_seed():
+    """W8 eclipse defense relies on the owner's record reaching *every* seed a
+    newcomer might bootstrap from -- otherwise the multi-seed union has nothing to
+    restore. start_tracker_heartbeat(seeds=...) must register with all of them."""
+    cfg = _cfg()
+    ident = PeerIdentity.generate()
+    primary = Tracker(host="127.0.0.1", port=0, open_enrollment=True, ttl=30.0)
+    extra = Tracker(host="127.0.0.1", port=0, open_enrollment=True, ttl=30.0)
+    primary.start()
+    extra.start()
+    ps = ParameterServer(cfg, [], DiLoCoConfig(), host="127.0.0.1", port=0,
+                         identity=ident, replicate_interval=60.0)
+    try:
+        ps.start()
+        ps.start_tracker_heartbeat(("127.0.0.1", primary.port), "127.0.0.1",
+                                   interval=0.05, seeds=[("127.0.0.1", extra.port)])
+        # The record lands on BOTH the primary and the extra seed.
+        assert _await(lambda: ident.peer_id in {r["peer_id"] for r in primary.records()}, 3)
+        assert _await(lambda: ident.peer_id in {r["peer_id"] for r in extra.records()}, 3)
+        # Graceful shutdown tombstones it on every seed (so the union sees the
+        # departure -- a stale record left on one seed would defeat the failover).
+        ps.shutdown(graceful=True)
+        assert _await(lambda: ident.peer_id in primary.tombstones(), 3)
+        assert _await(lambda: ident.peer_id in extra.tombstones(), 3)
+    finally:
+        primary.shutdown()
+        extra.shutdown()

@@ -485,6 +485,7 @@ class ParameterServer(_ReactorServer):
         self._directory: dict = {}   # peer_id -> verified peer record (TTL-pruned)
         self._self_record = None     # this owner's own peer record, gossiped onward
         self._seed_addr = None       # bootstrap tracker (gossip survives its loss)
+        self._seed_addrs: list = []  # every tracker we register with (multi-home, W8)
         self._tracker_auth = None    # tracker creds, for a graceful deregister (W4b)
         self._tracker_tls = None
         # path tuple -> [generation, opened_at] (the per-path clock + fence).
@@ -1106,20 +1107,34 @@ class ParameterServer(_ReactorServer):
 
     def start_tracker_heartbeat(self, tracker_addr, advertise_host, *, roles=("owner",),
                                 interval=30.0, capabilities=None, auth_key=None,
-                                tls=None) -> None:
-        """Register this owner with a tracker and keep the record fresh.
+                                tls=None, seeds=()) -> None:
+        """Register this owner with the tracker(s) and keep the record fresh.
 
         Registers ``(advertise_host, self.port)`` as a ``public`` peer offering
         ``roles``, then re-registers every ``interval`` seconds (keep it under
         the tracker's TTL -- liveness *is* the heartbeat). When this owner
         dies, its record expires and the scheduler's epoch manager eventually
         re-maps its keys (design D5).
+
+        ``seeds`` (W8 eclipse defense): extra trackers to **also** register with, so
+        the owner's record reaches every seed a newcomer might bootstrap from. This
+        is what makes the multi-seed union effective for *discovery* -- without it
+        the record lives on the primary only, and a malicious/partitioned primary
+        omitting it can't be overridden (the other seeds never had it).
         """
         if self.identity is None:
             raise RuntimeError("start_tracker_heartbeat needs identity=")
         from .tracker import make_peer_record, register_peer  # lazy: tracker imports this
 
         addr = tuple(tracker_addr)
+        # All trackers to register with (deduped, primary first). The primary is the
+        # gossip bootstrap seed; all are remembered for a graceful deregister.
+        addrs = [addr]
+        for s in (seeds or []):
+            sa = (s[0], int(s[1]))
+            if sa not in addrs:
+                addrs.append(sa)
+        self._seed_addrs = addrs
         # The tracker is the bootstrap seed for gossip (D7); a fresh self-record
         # is what this owner gossips onward so its membership propagates even
         # after the tracker is gone.
@@ -1136,9 +1151,13 @@ class ParameterServer(_ReactorServer):
                             self.identity, reachability="public",
                             addr=(advertise_host, self.port), roles=roles,
                             capabilities=capabilities)
-                        register_peer(addr, self.identity, reachability="public",
-                                      peer_addr=(advertise_host, self.port), roles=roles,
-                                      capabilities=capabilities, auth_key=auth_key, tls=tls)
+                        for ad in addrs:           # multi-home: register with every seed
+                            try:
+                                register_peer(ad, self.identity, reachability="public",
+                                              peer_addr=(advertise_host, self.port), roles=roles,
+                                              capabilities=capabilities, auth_key=auth_key, tls=tls)
+                            except (OSError, ConnectionError):
+                                pass  # a seed briefly away -> still registered with the rest
                     except (OSError, ConnectionError):
                         pass  # tracker briefly away; the next beat retries
                 if self._repl_stop.wait(interval):
@@ -1219,15 +1238,21 @@ class ParameterServer(_ReactorServer):
             # (epoch not yet bumped), push our latest state to each key's rank-1
             # successor, so a promoted backup holds the last accepted push (W4c).
             self._drain_to_backups()
-            if self.identity is not None and self._seed_addr is not None:
-                try:
-                    from .tracker import deregister_peer  # lazy: tracker imports this
-                    # Short timeout: a closing node (laptop lid) must not block on
-                    # a slow/absent tracker -- past the budget, fall back to grace.
-                    deregister_peer(self._seed_addr, self.identity, timeout=3.0,
-                                    auth_key=self._tracker_auth, tls=self._tracker_tls)
-                except (OSError, ConnectionError):
-                    pass  # tracker away -> fall back to TTL+grace expiry
+            dereg_addrs = self._seed_addrs or (
+                [self._seed_addr] if self._seed_addr is not None else [])
+            if self.identity is not None and dereg_addrs:
+                from .tracker import deregister_peer  # lazy: tracker imports this
+                # Deregister from *every* seed we multi-homed to, so a newcomer's
+                # multi-seed union sees the tombstone and fails us over immediately
+                # (W8) -- a stale record on a single seed would defeat the union.
+                for ad in dereg_addrs:
+                    try:
+                        # Short timeout: a closing node (laptop lid) must not block on
+                        # a slow/absent tracker -- past the budget, fall back to grace.
+                        deregister_peer(ad, self.identity, timeout=3.0,
+                                        auth_key=self._tracker_auth, tls=self._tracker_tls)
+                    except (OSError, ConnectionError):
+                        pass  # tracker away -> fall back to TTL+grace expiry
         with self._lock:
             self._flush_all_buffers_locked()  # don't drop accepted-but-buffered work
         for s in self._peer_conns.values():
@@ -1483,7 +1508,8 @@ class ParameterServer(_ReactorServer):
         if self.schedule_mode != "decentralized" or self.peer_id is None:
             return
         with self._lock:
-            addrs = {self._seed_addr} if self._seed_addr else set()
+            addrs = set(self._seed_addrs) or (
+                {self._seed_addr} if self._seed_addr else set())
             self_addr = None if self._self_record is None else tuple(self._self_record["addr"])
             if self._epoch is not None:
                 for o in self._epoch["owners"]:
@@ -3439,9 +3465,24 @@ def run_decentralized_worker(config, diloco, tracker_addr, corpus, *, identity,
     state = {"done": 0}
     warm: set = set()
 
+    # Union over the primary + any extra seeds (deduped, primary first): the worker
+    # both REGISTERS with all of them and bootstraps the directory from their union.
+    # Multi-homing registration is what makes the union effective -- otherwise a
+    # peer's record lives on one seed only, so a malicious/partitioned primary that
+    # omits it can't be overridden (the other seeds never had it).
+    all_seeds = [tuple(tracker_addr)]
+    for s in (seeds or []):
+        addr = (s[0], int(s[1]))
+        if addr not in all_seeds:
+            all_seeds.append(addr)
+
     def _register():
-        register_peer(tracker_addr, identity, reachability=reachability,
-                      roles=("worker",), auth_key=auth_key, tls=tls)
+        for ad in all_seeds:                 # multi-home: heartbeat to every seed
+            try:
+                register_peer(ad, identity, reachability=reachability,
+                              roles=("worker",), auth_key=auth_key, tls=tls)
+            except (OSError, ConnectionError):
+                pass  # a seed briefly away -> still registered with the others
 
     stop_beat = threading.Event()
 
@@ -3460,14 +3501,6 @@ def run_decentralized_worker(config, diloco, tracker_addr, corpus, *, identity,
                 pass
     beat = threading.Thread(target=_beat, daemon=True)
     beat.start()
-
-    # Union over the primary + any extra seeds (deduped, primary first): omission-
-    # eclipse needs every seed to withhold a peer, so one honest seed restores it.
-    all_seeds = [tuple(tracker_addr)]
-    for s in (seeds or []):
-        addr = (s[0], int(s[1]))
-        if addr not in all_seeds:
-            all_seeds.append(addr)
 
     def directory_fn():
         # fetch_directory_multi skips erroring seeds (best-effort) and returns the

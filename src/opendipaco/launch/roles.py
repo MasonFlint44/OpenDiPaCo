@@ -574,7 +574,7 @@ def run_parameter_server(cfg: LaunchConfig, shard_id: int = 0, *, port=None,
         ps.start_tracker_heartbeat(
             tracker_addr or cfg.tracker_connect_addr(), _advertise_host(cfg),
             interval=own.heartbeat_interval, auth_key=cfg.transport.auth_key,
-            tls=build_tls_client(cfg))
+            tls=build_tls_client(cfg), seeds=cfg.tracker.seeds)
     else:
         keys = sorted(model.build_topology().module_keys())
         assignment = assign_shards(keys, cfg.sharded.num_shards)
@@ -931,7 +931,8 @@ def _run_local_decentralized(cfg: LaunchConfig):
     for ps in owners:
         ps.apply_epoch(epoch0, bootstrap=True)
         ps.start_tracker_heartbeat(taddr, "127.0.0.1",
-                                   interval=own.heartbeat_interval, auth_key=auth)
+                                   interval=own.heartbeat_interval, auth_key=auth,
+                                   seeds=cfg.tracker.seeds)
 
     stop = threading.Event()
 

@@ -385,8 +385,11 @@ def fetch_directory_multi(seeds, *, roles=None, reachability=None, auth_key=None
     tombs: dict[str, float] = {}    # peer_id -> max verified deregister issued_at
     served: dict[str, int] = {}     # peer_id -> # distinct seeds that served it
     answered = 0
-    for seed in seeds:
-        addr = (seed[0], seed[1])
+    # Dedup by (host, port) so a duplicate seed isn't fetched twice or counted
+    # twice toward the quorum (a direct caller may not pre-dedup; the launch path
+    # does). A trailing pinned pubkey is ignored (transport-auth concern).
+    addrs = list(dict.fromkeys((s[0], s[1]) for s in seeds))
+    for addr in addrs:
         try:
             records, t = fetch_directory_and_tombstones(
                 addr, roles=roles, reachability=reachability,
