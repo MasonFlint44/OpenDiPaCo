@@ -176,3 +176,55 @@ def test_tracker_seeds_config_parses_and_validates():
         LaunchConfig.from_dict({"tracker": {"seeds": [["h2"]]}})          # missing port
     with pytest.raises(ValueError, match="tracker.seeds"):
         LaunchConfig.from_dict({"tracker": {"seeds": [["h2", "bad"]]}})   # non-int port
+
+
+def test_dedup_seeds_canonicalizes_primary_first_and_int_ports():
+    """The one helper every seed path goes through: primary first, distinct extras,
+    every entry (host, int(port)) -- so a str vs int port for one tracker collapses."""
+    from opendipaco.schedule.tracker import dedup_seeds
+    # primary first; a dup of the primary and a str-port alias of an extra collapse.
+    out = dedup_seeds(("p", "5"), [["p", 5], ["h2", "6"], ["h2", 6], ["h3", 7]])
+    assert out == [("p", 5), ("h2", 6), ("h3", 7)]
+
+
+def test_fetch_directory_multi_counts_an_aliased_seed_once():
+    """One physical tracker named twice (int vs str port) must count ONCE toward the
+    quorum -- else a single tracker could self-satisfy seed_quorum=2, defeating the
+    injection-resistance the quorum exists to provide."""
+    t = _tracker()
+    a = PeerIdentity.generate()
+    try:
+        host, port = _addr(t)
+        register_peer((host, port), a, roles=["worker"])
+        # Same tracker, two spellings of the port. With per-(host,port) dedup that
+        # coerces the port, this is ONE distinct seed -> served once -> dropped at M=2.
+        aliased = [(host, port), (host, str(port))]
+        assert {r["peer_id"] for r in fetch_directory_multi(aliased, seed_quorum=1)[0]} == {a.peer_id}
+        assert fetch_directory_multi(aliased, seed_quorum=2)[0] == []   # not 2 distinct seeds
+    finally:
+        t.shutdown()
+
+
+def test_multi_home_register_tolerates_a_garbage_or_refusing_seed(monkeypatch):
+    """A seed returning a garbage frame raises a non-OSError (struct.error/ValueError
+    from the codec); it must NOT abort registration with the healthy seeds (one bad
+    seed can't kill the heartbeat thread and drop the peer everywhere). A tracker that
+    *refuses* returns a status dict (no raise) and is logged, not silently lost."""
+    from opendipaco.schedule import tracker as tk
+    from opendipaco.schedule.sharded import _multi_home_register
+    called = []
+
+    def fake_register(addr, identity, **kw):
+        called.append(addr)
+        if addr == ("bad", 1):
+            raise ValueError("garbage frame")              # non-OSError, as from the wire codec
+        if addr == ("full", 2):
+            return {"type": "refused", "reason": "directory full"}
+        return {"type": "ok"}
+
+    monkeypatch.setattr(tk, "register_peer", fake_register)
+    _multi_home_register([("bad", 1), ("full", 2), ("good", 3)], PeerIdentity.generate(),
+                         reachability="public", peer_addr=None, roles=("worker",),
+                         capabilities=None, auth_key=None, tls=None)
+    # All three attempted in order -- the garbage seed didn't short-circuit the loop.
+    assert called == [("bad", 1), ("full", 2), ("good", 3)]

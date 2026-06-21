@@ -523,13 +523,17 @@ class LaunchConfig:
             if not isinstance(host, str):
                 raise ValueError(f"tracker.seeds[{i}] host must be a string, got {host!r}")
         # seed_quorum must be reachable: at most the number of DISTINCT seeds the
-        # worker will actually union over (primary + extras, deduped the same way
-        # run_decentralized_worker does -- a seed equal to the primary, or a dup,
-        # doesn't add reach). A higher quorum would drop every peer -> silent
-        # self-eclipse, so reject at load.
+        # worker will actually union over (primary + extras). Build the distinct set
+        # through the SAME helper run_decentralized_worker uses, so load-time
+        # validation and the runtime dedup can't disagree (a seed equal to the
+        # primary, or a dup, doesn't add reach). A higher quorum would drop every
+        # peer -> silent self-eclipse, so reject at load. NB string-aliased hosts
+        # for one tracker still count as distinct here AND at runtime; that's an
+        # operator footgun the helper can't resolve without DNS.
+        from ..schedule.tracker import dedup_seeds
         t = kw["tracker"]
         phost = t.connect_host or (t.host if t.host not in ("0.0.0.0", "::") else "127.0.0.1")
-        distinct = {(phost, t.port)} | {(s[0], int(s[1])) for s in t.seeds}
+        distinct = dedup_seeds((phost, t.port), t.seeds)
         if not 1 <= t.seed_quorum <= len(distinct):
             raise ValueError(
                 f"tracker.seed_quorum ({t.seed_quorum}) must be in [1, {len(distinct)}] "

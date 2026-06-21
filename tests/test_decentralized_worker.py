@@ -492,3 +492,15 @@ def test_run_decentralized_worker_bootstraps_from_all_seeds(monkeypatch):
         th.join(timeout=5)
     # Both the union seed list AND the seed_quorum must reach fetch_directory_multi.
     assert seen and seen[0] == ([("127.0.0.1", 59991), ("127.0.0.1", 59992)], 2)
+
+
+def test_run_decentralized_worker_rejects_unreachable_seed_quorum():
+    """seed_quorum above the distinct-seed count would make directory_fn return []
+    forever (registered but self-assigns nothing -- silent self-eclipse). The public
+    entry point must reject it up front, not just LaunchConfig (which a direct/in-
+    process caller bypasses)."""
+    cfg = _cfg()
+    with pytest.raises(ValueError, match="seed_quorum"):
+        run_decentralized_worker(                       # seed_quorum=2 but only 1 seed
+            cfg, _diloco(), ("127.0.0.1", 59991), _corpus(cfg),
+            identity=PeerIdentity.generate(), seed_quorum=2)

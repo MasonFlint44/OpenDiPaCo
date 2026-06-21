@@ -164,6 +164,37 @@ decentralized `_gossip_once` pulls from all seeds for the same reason. Without
 this, `seed_quorum>1` would also stall every quorumed worker (registrations
 served by one seed never clear M≥2).
 
+## Amendment — review hardening (untrusted-seed robustness)
+A review pass tightened the seed handling so the defense holds up against *hostile*
+seeds, not just absent ones:
+- **One `dedup_seeds(primary, extras)` helper** is the single source of truth for
+  "the distinct trackers I deal with" — used by owner heartbeat, worker
+  registration, graceful deregister, and config validation. It normalizes every
+  entry to `(host, int(port))`, so the same tracker named twice (or with a str vs
+  int port) is contacted once and counted once toward `seed_quorum` (else one
+  tracker could self-satisfy M-of-N, defeating injection-resistance). Centralizing
+  it also closes the bug class behind the multi-home amendment above: a future
+  registration path can't silently forget to dedup/multi-home.
+- **Untrusted seeds get a broad `except`.** Registration/deregistration to each
+  seed catches `Exception` (not just `OSError`/`ConnectionError`), matching
+  `fetch_directory_multi`: a seed that completes the connect then returns a garbage
+  frame raises a codec error (`struct.error`/`ValueError`/…), which must not kill
+  the heartbeat thread and drop the peer from the *healthy* seeds too. A tracker
+  that *refuses* (full / not-enrolled) returns a status dict (no raise) and is now
+  logged — under `seed_quorum>1` a silent refusal would drop the peer from quorumed
+  views. (Best-effort writes vs strict-quorum reads is still an inherent `M>1`
+  availability tradeoff; surfacing the refusal is the mitigation.)
+- **`seed_quorum` is range-checked at the `run_decentralized_worker` entry point**,
+  not only at config load — a direct/in-process caller passing a quorum above the
+  distinct-seed count now fails fast instead of returning an empty directory
+  forever (silent self-eclipse).
+- **Concurrent seed fetch.** `fetch_directory_multi` fetches multiple seeds in
+  parallel so a slow/down seed costs one `timeout`, not N×`timeout`, on the
+  worker's directory hot path (the single-seed default skips the thread pool).
+- **Known residual:** string-aliased hosts for one tracker (e.g. `localhost` vs
+  `127.0.0.1`) still count as distinct at both validation and runtime — an operator
+  footgun `dedup_seeds` can't resolve without DNS.
+
 ## Honest limitations (state them)
 - **Fresh-Sybil-as-owner is NOT closed** — identities are free; the only effective
   fix (stake) is the incentives layer (part 3). This part bounds eclipse + waste,
